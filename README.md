@@ -1,5 +1,7 @@
 # ProcAgen3D
 
+**Version:** 0.0.1
+
 Code-native generation of programmable 3D assets, implemented as an agent
 skill for Claude Code, Codex, and compatible runtimes. Based on
 **ProcAgen3D: Code-Native Generation of Programmable 3D Assets**
