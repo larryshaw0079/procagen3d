@@ -32,9 +32,9 @@ git clone https://github.com/larryshaw0079/procagen3d.git ~/.claude/skills/proca
 
 Representative reference-conditioned results selected from successful
 `procagen3d_out/` runs. Each pair shows the closest available source-image
-angle on the left and the generated render on the right. Every model starts as
-an executable Blender Python program and is compiled to a portable GLB by the
-ProcAgen3D pipeline.
+angle on the left and a clean Blender render of the exported `model.glb` on the
+right. Every model starts as an executable Blender Python program and is
+compiled to a portable GLB by the ProcAgen3D pipeline.
 
 <table>
   <tr>
@@ -43,9 +43,9 @@ ProcAgen3D pipeline.
         <img src="assets/showcase/audi-sport-quattro-s1-reference.png" width="205" alt="Reference image of an Audi Sport Quattro S1 rally car">
       </a>
       <a href="assets/showcase/audi-sport-quattro-s1.png">
-        <img src="assets/showcase/audi-sport-quattro-s1.png" width="205" alt="ProcAgen3D render of an Audi Sport Quattro S1 rally car">
+        <img src="assets/showcase/audi-sport-quattro-s1.png" width="205" alt="ProcAgen3D GLB render of an Audi Sport Quattro S1 rally car">
       </a><br>
-      <sub>Reference → ProcAgen3D</sub><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
       <strong>Audi Sport Quattro S1</strong>
     </td>
     <td align="center">
@@ -53,9 +53,9 @@ ProcAgen3D pipeline.
         <img src="assets/showcase/china-pavilion-reference.png" width="205" alt="Reference image of a traditional Chinese pavilion">
       </a>
       <a href="assets/showcase/china-pavilion.png">
-        <img src="assets/showcase/china-pavilion.png" width="205" alt="ProcAgen3D render of a traditional Chinese pavilion">
+        <img src="assets/showcase/china-pavilion.png" width="205" alt="ProcAgen3D GLB render of a traditional Chinese pavilion">
       </a><br>
-      <sub>Reference → ProcAgen3D</sub><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
       <strong>Traditional Chinese Pavilion</strong>
     </td>
   </tr>
@@ -65,9 +65,9 @@ ProcAgen3D pipeline.
         <img src="assets/showcase/benben-robot-reference.png" width="205" alt="Reference image of the Benben robot">
       </a>
       <a href="assets/showcase/benben-robot.png">
-        <img src="assets/showcase/benben-robot.png" width="205" alt="ProcAgen3D render of the Benben robot">
+        <img src="assets/showcase/benben-robot.png" width="205" alt="ProcAgen3D GLB render of the Benben robot">
       </a><br>
-      <sub>Reference → ProcAgen3D</sub><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
       <strong>Benben Robot</strong>
     </td>
     <td align="center">
@@ -75,9 +75,9 @@ ProcAgen3D pipeline.
         <img src="assets/showcase/nissan-skyline-super-silhouette-reference.png" width="205" alt="Reference image of a Nissan Skyline Super Silhouette race car">
       </a>
       <a href="assets/showcase/nissan-skyline-super-silhouette.png">
-        <img src="assets/showcase/nissan-skyline-super-silhouette.png" width="205" alt="ProcAgen3D render of a Nissan Skyline Super Silhouette race car">
+        <img src="assets/showcase/nissan-skyline-super-silhouette.png" width="205" alt="ProcAgen3D GLB render of a Nissan Skyline Super Silhouette race car">
       </a><br>
-      <sub>Reference → ProcAgen3D</sub><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
       <strong>Nissan Skyline Super Silhouette</strong>
     </td>
   </tr>
@@ -87,9 +87,9 @@ ProcAgen3D pipeline.
         <img src="assets/showcase/pagani-huayra-r-reference.png" width="205" alt="Reference image of a Pagani Huayra R">
       </a>
       <a href="assets/showcase/pagani-huayra-r.png">
-        <img src="assets/showcase/pagani-huayra-r.png" width="205" alt="ProcAgen3D render of a Pagani Huayra R">
+        <img src="assets/showcase/pagani-huayra-r.png" width="205" alt="ProcAgen3D GLB render of a Pagani Huayra R">
       </a><br>
-      <sub>Reference → ProcAgen3D</sub><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
       <strong>Pagani Huayra R</strong>
     </td>
     <td align="center">
@@ -97,9 +97,9 @@ ProcAgen3D pipeline.
         <img src="assets/showcase/toyota-sr5-reference.png" width="205" alt="Reference image of a Toyota SR5 pickup with its hood open">
       </a>
       <a href="assets/showcase/toyota-sr5.png">
-        <img src="assets/showcase/toyota-sr5.png" width="205" alt="ProcAgen3D render of a Toyota SR5 pickup with its hood open">
+        <img src="assets/showcase/toyota-sr5.png" width="205" alt="ProcAgen3D GLB render of a Toyota SR5 pickup with its hood open">
       </a><br>
-      <sub>Reference → ProcAgen3D</sub><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
       <strong>Toyota SR5</strong>
     </td>
   </tr>
