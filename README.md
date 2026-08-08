@@ -14,6 +14,20 @@ Blender compiles it to a GLB. The program is the asset; the GLB is a
 derivative artifact. Because the asset is source code, it stays editable:
 "make the handlebar wider" is a minimal, gated source edit, not a remodel.
 
+## Install
+
+Install the skill for Codex:
+
+```sh
+git clone https://github.com/larryshaw0079/procagen3d.git ~/.codex/skills/procagen3d
+```
+
+Install the skill for Claude Code:
+
+```sh
+git clone https://github.com/larryshaw0079/procagen3d.git ~/.claude/skills/procagen3d
+```
+
 ## Showcase
 
 Representative reference-conditioned results selected from successful
@@ -128,20 +142,6 @@ procagen3d/
   `$PROCAGEN3D_BLENDER` → PATH → `~/.cache/procagen3d/*/blender`.
 - **Python 3.10+**. No pip packages — the harness is stdlib only, and
   Blender stages run under Blender's bundled Python.
-
-## Install
-
-Install the skill for Codex:
-
-```sh
-git clone https://github.com/larryshaw0079/procagen3d.git ~/.codex/skills/procagen3d
-```
-
-Install the skill for Claude Code:
-
-```sh
-git clone https://github.com/larryshaw0079/procagen3d.git ~/.claude/skills/procagen3d
-```
 
 ## Quick start
 
