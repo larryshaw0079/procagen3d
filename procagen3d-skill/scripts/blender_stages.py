@@ -64,7 +64,11 @@ def depsgraph():
 
 
 def mesh_objects():
-    return [o for o in bpy.context.scene.objects if o.type == "MESH"]
+    # Hidden Boolean cutters and construction helpers are not part of the
+    # judged/export-facing asset. They must not inflate totals, form envelopes,
+    # collision sets, or the camera framing used for proof renders.
+    return [o for o in bpy.context.scene.objects
+            if o.type == "MESH" and not o.hide_render]
 
 
 def world_bbox(obj, dg):
@@ -83,6 +87,29 @@ def union_bbox(objs, dg):
         lo = Vector((min(lo[i], blo[i]) for i in range(3)))
         hi = Vector((max(hi[i], bhi[i]) for i in range(3)))
     return lo, hi
+
+
+def base_axis_plane_counts(mesh):
+    """Count normalized coordinate planes in the authored (pre-modifier) cage.
+
+    Normalizing each axis to 0..1 makes the diagnostic scale-independent.  A
+    cube or eight-vertex tapered box stays at only a few planes even when a
+    Bevel modifier inflates its evaluated triangle count; a real loft, sweep,
+    lathe, or surface grid normally has many authored planes on two or more
+    axes.
+    """
+    if not mesh.vertices:
+        return [0, 0, 0]
+    counts = []
+    for axis in range(3):
+        values = [v.co[axis] for v in mesh.vertices]
+        lo, hi = min(values), max(values)
+        span = hi - lo
+        if span <= 1e-9:
+            counts.append(1)
+            continue
+        counts.append(len({round((value - lo) / span, 3) for value in values}))
+    return counts
 
 
 def descendants(obj):
@@ -122,13 +149,18 @@ def collect_scene_graph():
     dg = depsgraph()
     objects = []
     total_tris = 0
-    for obj in bpy.context.scene.objects:
-        if obj.type in ("CAMERA", "LIGHT"):
-            continue
+    graph_objects = [
+        obj for obj in bpy.context.scene.objects
+        if obj.type not in ("CAMERA", "LIGHT")
+        and not (obj.type == "MESH" and obj.hide_render)
+    ]
+    graph_names = {obj.name for obj in graph_objects}
+    for obj in graph_objects:
         entry = {
             "name": obj.name,
             "type": obj.type,
-            "parent": obj.parent.name if obj.parent else None,
+            "parent": (obj.parent.name
+                       if obj.parent and obj.parent.name in graph_names else None),
             "location": [round(v, 6) for v in obj.location],
             "scale": [round(v, 6) for v in obj.scale],
             "origin_world": [round(v, 6) for v in obj.matrix_world.translation],
@@ -147,6 +179,10 @@ def collect_scene_graph():
                     "vertex_count": len(me.vertices),
                     "poly_count": len(me.polygons),
                     "triangle_count": tris,
+                    "base_vertex_count": len(obj.data.vertices),
+                    "base_poly_count": len(obj.data.polygons),
+                    "base_axis_plane_counts": base_axis_plane_counts(obj.data),
+                    "modifiers": [modifier.type for modifier in obj.modifiers],
                     "materials": [m.name for m in obj.data.materials if m],
                 }
             )
@@ -163,11 +199,11 @@ def collect_scene_graph():
 
     meshes = mesh_objects()
     graph = {
-        "procagen3d_version": "0.1",
+        "procagen3d_version": "0.2",
         "blender_version": bpy.app.version_string,
         "objects": objects,
-        "roots": [o.name for o in bpy.context.scene.objects
-                  if o.parent is None and o.type not in ("CAMERA", "LIGHT")],
+        "roots": [o.name for o in graph_objects
+                  if o.parent is None or o.parent.name not in graph_names],
         "joints": [joint_record(j, dg) for j in joint_empties()],
         "totals": {
             "objects": len(objects),
@@ -217,7 +253,68 @@ def setup_engine(scene, engine):
         scene.cycles.device = "CPU"
 
 
-def render_views(out_dir, size, engine):
+def setup_form_engine(scene):
+    """Neutral clay diagnostic: expose surface flow without material camouflage."""
+    scene.render.engine = "BLENDER_WORKBENCH"
+    sh = scene.display.shading
+    sh.light = "STUDIO"
+    sh.color_type = "SINGLE"
+    sh.single_color = (0.46, 0.49, 0.53)
+    sh.show_object_outline = False
+    sh.show_shadows = True
+    sh.show_cavity = True
+    sh.cavity_type = "WORLD"
+    sh.show_specular_highlight = True
+    sh.background_type = "VIEWPORT"
+    sh.background_color = (0.92, 0.92, 0.92)
+    scene.display.render_aa = "8"
+
+
+def reference_camera_contract(scene, discard_invalid=False):
+    """Read the first valid root reference-camera contract."""
+    key = "procagen3d_reference_camera"
+    projection_key = "procagen3d_reference_projection"
+    selected = None
+    for obj in scene.objects:
+        if obj.parent is not None or key not in obj:
+            continue
+        candidate = None
+        try:
+            values = [float(v) for v in obj[key]]
+            if len(values) == 3:
+                azimuth, elevation, framing = values
+                raw_projection = obj.get(projection_key, "perspective")
+                projection = (raw_projection.lower()
+                              if isinstance(raw_projection, str) else None)
+                framing_valid = (
+                    5.0 <= framing <= 120.0 if projection == "perspective"
+                    else 1e-5 <= framing <= 1e6
+                    if projection == "orthographic" else False
+                )
+                if (all(math.isfinite(value) for value in values)
+                        and -360.0 <= azimuth <= 360.0
+                        and -89.0 < elevation < 89.0 and framing_valid):
+                    candidate = (projection, azimuth, elevation, framing)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if candidate is not None:
+            if selected is None:
+                selected = candidate
+            if not discard_invalid:
+                return selected
+            continue
+        print(f"{WARN}:REFERENCE_CAMERA] invalid reference projection/camera "
+              f"contract on {obj.name}: projection="
+              f"{obj.get(projection_key, 'perspective')!r}, "
+              f"camera={obj.get(key)!r}")
+        if discard_invalid:
+            del obj[key]
+            if projection_key in obj:
+                del obj[projection_key]
+    return selected
+
+
+def render_views(out_dir, size, engine, form_diagnostics=False):
     scene = bpy.context.scene
     meshes = mesh_objects()
     if not meshes:
@@ -242,13 +339,23 @@ def render_views(out_dir, size, engine):
 
     renders_dir = Path(out_dir) / "renders"
     renders_dir.mkdir(parents=True, exist_ok=True)
+    # These products are conditional. Clear exact known paths before each
+    # render so a removed/invalid camera contract or disabled form pass cannot
+    # leave evidence from an older scene in the inspection directory.
+    optional_paths = [renders_dir / "reference_match.png",
+                      renders_dir / "form_sheet.png"]
+    optional_paths.extend(renders_dir / f"form_{view}.png"
+                          for view in VIEW_ORDER)
+    for stale_path in optional_paths:
+        stale_path.unlink(missing_ok=True)
     written = []
-    for view in VIEW_ORDER:
+
+    def position_canonical(view):
         if view == "iso":
             cam_data.type = "PERSP"
             cam_data.angle = math.radians(40)
             direction = Vector((1.0, -1.0, 0.75)).normalized()
-            dist = radius / math.tan(cam_data.angle / 2) * 1.25
+            dist = radius / math.sin(cam_data.angle / 2) * 1.15
         else:
             cam_data.type = "ORTHO"
             # shared ortho scale = scale normalization across canonical views
@@ -258,20 +365,72 @@ def render_views(out_dir, size, engine):
         cam.location = center + direction * dist
         look = (center - cam.location).normalized()
         cam.rotation_euler = look.to_track_quat("-Z", "Y").to_euler()
+        cam_data.clip_start = max(
+            1e-5, min(0.1, max(dist - radius, 1e-4) * 0.25))
         cam_data.clip_end = max(100.0, dist * 4)
-        path = renders_dir / f"{view}.png"
-        scene.render.filepath = str(path)
-        bpy.ops.render.render(write_still=True)
-        written.append(path)
-        print(f"{OK} rendered {view} -> {path}")
 
+    def render_canonical_set(prefix=""):
+        paths = []
+        for view in VIEW_ORDER:
+            position_canonical(view)
+            path = renders_dir / f"{prefix}{view}.png"
+            scene.render.filepath = str(path)
+            bpy.ops.render.render(write_still=True)
+            paths.append(path)
+            print(f"{OK} rendered {prefix}{view} -> {path}")
+        return paths
+
+    written.extend(render_canonical_set())
     sheet = make_contact_sheet(renders_dir, size)
     if sheet:
         written.append(sheet)
+
+    # Optional reference-camera contract on the root object. The third value
+    # is vertical FOV degrees for perspective (default), or vertical world
+    # scale when procagen3d_reference_projection == "orthographic". Azimuth 0
+    # is canonical front (-Y); positive azimuth turns toward +X.
+    camera_contract = reference_camera_contract(scene)
+    if camera_contract:
+        projection, azimuth, elevation, framing = camera_contract
+        az = math.radians(azimuth)
+        el = math.radians(elevation)
+        direction = Vector((math.sin(az) * math.cos(el),
+                            -math.cos(az) * math.cos(el),
+                            math.sin(el))).normalized()
+        if projection == "orthographic":
+            cam_data.type = "ORTHO"
+            cam_data.ortho_scale = framing
+            dist = radius * 3 + 1.0
+        else:
+            cam_data.type = "PERSP"
+            cam_data.angle = math.radians(framing)
+            # Fit the entire bounding sphere. tan() assumes a flat subject and
+            # can put wide-FOV cameras inside long/round geometry; angular
+            # radius is asin(radius / distance), hence the sin() denominator.
+            dist = radius / math.sin(cam_data.angle / 2) * 1.15
+        cam.location = center + direction * dist
+        look = (center - cam.location).normalized()
+        cam.rotation_euler = look.to_track_quat("-Z", "Y").to_euler()
+        cam_data.clip_start = max(
+            1e-5, min(0.1, max(dist - radius, 1e-4) * 0.25))
+        cam_data.clip_end = max(100.0, dist * 4)
+        path = renders_dir / "reference_match.png"
+        scene.render.filepath = str(path)
+        bpy.ops.render.render(write_still=True)
+        written.append(path)
+        print(f"{OK} rendered reference camera -> {path}")
+
+    if form_diagnostics:
+        setup_form_engine(scene)
+        written.extend(render_canonical_set("form_"))
+        form_sheet = make_contact_sheet(
+            renders_dir, size, prefix="form_", output_name="form_sheet.png")
+        if form_sheet:
+            written.append(form_sheet)
     return written
 
 
-def make_contact_sheet(renders_dir, size):
+def make_contact_sheet(renders_dir, size, prefix="", output_name="sheet.png"):
     try:
         import numpy as np
     except ImportError:
@@ -280,7 +439,7 @@ def make_contact_sheet(renders_dir, size):
     bg = np.array([0.92, 0.92, 0.92], dtype=np.float32)
     tiles = []
     for view in VIEW_ORDER:
-        path = renders_dir / f"{view}.png"
+        path = renders_dir / f"{prefix}{view}.png"
         img = bpy.data.images.load(str(path))
         px = np.array(img.pixels[:], dtype=np.float32).reshape(size, size, 4)
         alpha = px[..., 3:4]
@@ -295,9 +454,10 @@ def make_contact_sheet(renders_dir, size):
     bottom = np.concatenate(tiles[3:6], axis=1)
     sheet_px = np.concatenate([bottom, top], axis=0)
     h, w = sheet_px.shape[0], sheet_px.shape[1]
-    sheet = bpy.data.images.new("ProcAgen3D_Sheet", width=w, height=h, alpha=True)
+    image_name = "ProcAgen3D_" + output_name.replace(".png", "")
+    sheet = bpy.data.images.new(image_name, width=w, height=h, alpha=True)
     sheet.pixels = sheet_px.ravel().tolist()
-    sheet_path = renders_dir / "sheet.png"
+    sheet_path = renders_dir / output_name
     sheet.filepath_raw = str(sheet_path)
     sheet.file_format = "PNG"
     sheet.save()
@@ -351,6 +511,11 @@ def stage_build(args):
         print(tb)
         finish(1)
 
+    # Invalid/non-finite camera metadata would make export_extras emit
+    # non-compliant JSON. Keep the geometry build usable, warn, and omit only
+    # the invalid optional contract from derivative artifacts.
+    reference_camera_contract(bpy.context.scene, discard_invalid=True)
+
     graph = collect_scene_graph()
     if graph["totals"]["meshes"] == 0:
         diag["error"] = "build() produced no mesh objects"
@@ -373,11 +538,12 @@ def stage_build(args):
         export_format="GLB",
         export_extras=True,
         export_apply=True,
+        use_renderable=True,
     )
     bpy.ops.wm.save_as_mainfile(filepath=str(out_dir / "scene.blend"))
 
     if not args.no_render:
-        render_views(out_dir, args.size, args.engine)
+        render_views(out_dir, args.size, args.engine, args.form_diagnostics)
 
     diag["build_ok"] = True
     diag["stats"] = graph["totals"]
@@ -398,7 +564,7 @@ def stage_render(args):
         print(f"{FAIL}:NO_SCENE] {blend} not found (run build first)")
         finish(1)
     bpy.ops.wm.open_mainfile(filepath=str(blend))
-    render_views(out_dir, args.size, args.engine)
+    render_views(out_dir, args.size, args.engine, args.form_diagnostics)
     finish(0)
 
 
@@ -459,7 +625,8 @@ def stage_joints(args):
             continue
         child_rest[child.name] = child.matrix_world.copy()
 
-        moving = [o for o in [child] + descendants(child) if o.type == "MESH"]
+        moving = [o for o in [child] + descendants(child)
+                  if o.type == "MESH" and not o.hide_render]
         checks["child_has_geometry"] = bool(moving)
 
         if jtype == "fixed":
@@ -595,12 +762,14 @@ def main():
     p_build.add_argument("--engine", default="workbench",
                          choices=["workbench", "eevee", "cycles"])
     p_build.add_argument("--no-render", action="store_true")
+    p_build.add_argument("--form-diagnostics", action="store_true")
 
     p_render = sub.add_parser("render")
     p_render.add_argument("--out", required=True)
     p_render.add_argument("--size", type=int, default=512)
     p_render.add_argument("--engine", default="workbench",
                           choices=["workbench", "eevee", "cycles"])
+    p_render.add_argument("--form-diagnostics", action="store_true")
 
     p_joints = sub.add_parser("joints")
     p_joints.add_argument("--out", required=True)

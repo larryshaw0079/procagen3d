@@ -23,6 +23,8 @@ procagen3d-skill/
 ├── references/               # routed depth, read on demand from SKILL.md
 │   ├── doctrine.md           # representation doctrine + canonical helpers
 │   ├── image-analysis.md     # agent-vision perception stage
+│   ├── complex-forms.md      # loft/sweep/shell routing + shape-first probe
+│   ├── detail.md             # tier floors + decomposition recipes
 │   ├── articulation.md       # joint schema + validator semantics
 │   ├── constraints.md        # spec.yaml format + scorer
 │   ├── local-edits.md        # source-level edit protocol + gates
@@ -57,8 +59,8 @@ point the agent at `SKILL.md`.
 ## CLI (used by the agent, usable by hand)
 
 ```sh
-python3 scripts/procagen3d.py build program.py --out out/   # compile + render
-python3 scripts/procagen3d.py check out/                    # deterministic gates
+python3 scripts/procagen3d.py build program.py --out out/ --form-diagnostics  # curved/mixed
+python3 scripts/procagen3d.py check out/ --tier showcase --form auto
 python3 scripts/procagen3d.py joints out/                   # articulation validation
 python3 scripts/procagen3d.py score out/ --spec spec.yaml   # constraint scoring
 python3 scripts/procagen3d.py guard old.py new.py           # repair doctrine guard
@@ -69,17 +71,23 @@ python3 scripts/procagen3d.py render out/ --engine eevee    # re-render (beauty 
 Exit 0 = pass, 1 = failure with printed `[PROCAGEN3D:FAIL:*]` reasons.
 Image-conditioned runs also retain each used input at the output root as
 `reference_01.<ext>`, `reference_02.<ext>`, etc., with provenance recorded in
-`priors.md`.
+`priors.md`. Curved/mixed runs add a neutral clay `form_sheet.png`, may emit a
+declared-camera `reference_match.png`, and use a shape-only probe before the
+full detail build.
 
 ## Design notes
 
-Structural patterns borrowed from two prior agent skills:
+Structural patterns adapted from prior agent projects:
 [img2threejs](https://github.com/img2threejs/img2threejs) ("scripts do
 enforcement, agent vision does judgment"; bounded correction loops; one
 contact sheet per review) and
 [opentopos](https://github.com/gaoypeng/opentopos) (failure-mode-first
 reference docs with drop-in code; grep-able WARN tags; dual-runtime symlink
-install). Perception is agent vision by design — the paper's learned
-depth/normal/edge priors are replaced by a structured image-analysis
-checklist (`references/image-analysis.md`), keeping the skill offline and
-dependency-free.
+install). The curved-form route also adapts img2threejs's topology-before-
+primitive and anti-cardboard lessons plus
+[build-web-3d-models](https://github.com/giraffe-tree/build-web-3d-models)'
+form-first loft/sweep/surface practice. The implementation is original Blender
+Python rather than copied project code. Perception is agent vision by design —
+the paper's learned depth/normal/edge priors are replaced by a structured
+image-analysis checklist (`references/image-analysis.md`), keeping the skill
+offline and dependency-free.

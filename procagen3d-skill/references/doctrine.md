@@ -184,12 +184,16 @@ if __name__ == "__main__":
 Prefer constructive solid modeling with primitives, arrays of instances,
 booleans (bmesh or modifier), bevels, and simple bmesh extrusions. A shape
 you can name (flange, strut, rim, shell) should come from a parameterized
-builder function, not from magic vertex lists. Hollow containers: build wall
+builder function, not from magic vertex dumps. Compact, semantic control
+arrays—profile points, section rings, sweep spines, and surface-grid
+parameters—are explicitly constructive and preferred when primitives cannot
+represent the form. Hollow containers: build wall
 panels or use a boolean cavity cut — then verify wall presence in the top
 view of the sheet. Curved masses (body panels, fenders, revolved forms) are
-buildable with these same tools — segment floors, the bevel rule, and the
-per-part recipes live in `references/detail.md`; reserve the "stylized"
-disclaimer for genuinely organic subjects (faces, animals, cloth).
+buildable with these tools — route compound/changing-section forms through
+`references/complex-forms.md`, and use the segment/detail rules in
+`references/detail.md`; reserve the "stylized" disclaimer for genuinely
+organic subjects (faces, animals, cloth).
 
 ## Repair doctrine
 
@@ -204,6 +208,8 @@ Renames/merges that are genuinely intended: pass `--allow-drop <name>` /
 - [ ] constants block, meters, z=0 ground, front faces -Y
 - [ ] detail tier declared; standard+: part table decomposed to the
       detail.md ladder, floors met by design not by hope
+- [ ] form profile declared; curved/mixed: form blueprint + probe passed,
+      structural macro/meso meshes tagged with compatible role/topology/method
 - [ ] every part has a semantic PascalCase name, instances numbered
 - [ ] one root empty; groups for real sub-assemblies; keep-world parenting
 - [ ] movable parts: origin at pivot, joint declared via `add_joint`

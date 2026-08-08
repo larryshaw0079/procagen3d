@@ -20,7 +20,8 @@ The agent supplies design judgment and visual review; a deterministic,
 stdlib-only harness enforces the paper's pipeline around it:
 
 ```
-design → synthesize program → build (headless Blender) → deterministic gates
+design → curved/mixed shape probe → synthesize program
+→ build (headless Blender) → deterministic gates
 → canonical renders → agent-vision inspection → guarded repair loop (≤3)
 → articulation validation → constraint scoring → deliver
 ```
@@ -79,7 +80,7 @@ The harness is also usable by hand:
 
 ```sh
 python3 procagen3d-skill/scripts/procagen3d.py build program.py --out out/
-python3 procagen3d-skill/scripts/procagen3d.py check out/
+python3 procagen3d-skill/scripts/procagen3d.py check out/ --tier showcase --form auto
 python3 procagen3d-skill/scripts/procagen3d.py joints out/
 python3 procagen3d-skill/scripts/procagen3d.py score out/ --spec spec.yaml
 ```

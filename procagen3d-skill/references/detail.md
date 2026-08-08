@@ -19,7 +19,9 @@ the `check` gate warns against (`--tier`).
 
 Tris up to ~150k build and render fine headless — never "optimize" below the
 tier floor. A showcase asset that comes back under floor is unfinished, not
-efficient.
+efficient. These floors measure secondary construction/detail coverage, not
+the quality of a primary surface: never fragment one coherent body shell into
+box/ellipsoid patches just to raise mesh count.
 
 ## The decomposition ladder
 
@@ -32,7 +34,9 @@ dimension (a door handle on a car, a knob on an amp). Four levels, all named:
 If you can name a sub-feature, it gets its own `build_*` call and mesh.
 Repetition is always an **array of numbered instances** (tread lugs, grille
 slats, bed grooves, coil rings, spokes, vents) — count them in the reference,
-place them with a loop.
+place them with a loop. Keep a continuous primary mass continuous; panel gaps,
+trim, and attached shells may be separate, but the surface beneath them must
+not become a collage of independently beveled primitives.
 
 ## Recipes (patterns, not just vehicles)
 
@@ -61,7 +65,12 @@ place them with a loop.
 
 ## Curvature and form
 
-Constructive modeling handles curved masses fine — build them, don't hedge:
+For compound curvature, changing cross-sections, streamlined bodies, or
+irregular armor, MUST read `complex-forms.md` and pass its shape-first probe.
+Choose topology before helper: `continuous` → loft/sweep/revolve/subdivision;
+`shell` → surface patch/loft + thickness; deliberately faceted `assembled`
+parts → profile extrusion/CSG. A Bevel modifier changes edge treatment, not
+the underlying form family.
 
 - **Segment floors**: silhouette-defining radii ≥ 48 segments; mid-size
   (fists to plates) ≥ 24; bolt-scale ≥ 12. Never leave a default 32-seg
@@ -70,14 +79,14 @@ Constructive modeling handles curved masses fine — build them, don't hedge:
   0.5–2 % of the part's major dimension, 2–3 segments. A raw
   `primitive_cube_add` edge is the single strongest "toy" tell. (Remember
   the transform_apply trap: bake modifiers via the harness, not by hand.)
-- **Body masses**: box → bevel → taper/shear via direct vertex transforms or
-  Simple Deform; wedge cuts and window openings via boolean; wheel-arch
-  openings: boolean cylinder cut, then a **flare** (torus segment or swept
-  arc) proud around the opening.
-- **Revolved forms** (bottles, hubs, bells): spin/lathe a profile or stack
-  primitives; **lofted panels** (fenders, hulls): bezier profile + skin, or
-  subdivided box with proportional-edit displacement. Say "stylized" only
-  when the request is genuinely organic (faces, animals, cloth).
+- **Body masses**: author measured section/spine/grid controls; use booleans
+  only after the envelope passes. Cut a real wheel-arch opening, then add a
+  conforming flare or swept lip around it.
+- **Revolved forms** (bottles, hubs, bells): spin/lathe an explicit profile;
+  do not approximate a visible S-curve with stacked cylinders.
+- **Topology budget**: spend control loops at silhouette extrema, changing
+  curvature, hard creases, openings, and attachment roots. Uniform density
+  and high evaluated triangle count are not evidence of designed form.
 
 ## Materials
 

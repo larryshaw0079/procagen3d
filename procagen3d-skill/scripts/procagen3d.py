@@ -89,12 +89,17 @@ def cmd_build(args):
              "--size", str(args.size), "--engine", args.engine]
     if args.no_render:
         stage.append("--no-render")
+    if args.form_diagnostics:
+        stage.append("--form-diagnostics")
     return run_blender(stage, args.blender)
 
 
 def cmd_render(args):
-    return run_blender(["render", "--out", args.dir, "--size", str(args.size),
-                        "--engine", args.engine], args.blender)
+    stage = ["render", "--out", args.dir, "--size", str(args.size),
+             "--engine", args.engine]
+    if args.form_diagnostics:
+        stage.append("--form-diagnostics")
+    return run_blender(stage, args.blender)
 
 
 def cmd_joints(args):
@@ -146,6 +151,60 @@ DEFAULT_NAME_RE = re.compile(
     r"(\.\d+)?$")
 DUPE_SUFFIX_RE = re.compile(r"\.\d{3}$")
 JOINT_TYPES = ("revolute", "prismatic", "fixed")
+FORM_TOPOLOGIES = {"continuous", "shell", "assembled", "strand", "relief"}
+FORM_METHODS = {
+    "loft", "sweep", "revolve", "subdivision", "surface-grid", "nurbs",
+    "curve", "solidify", "profile-extrude", "primitive-csg", "boolean",
+    "decal",
+}
+TOPOLOGY_METHODS = {
+    "continuous": {"loft", "sweep", "revolve", "subdivision",
+                   "surface-grid", "nurbs"},
+    "shell": {"loft", "sweep", "subdivision", "surface-grid", "nurbs",
+              "solidify"},
+    "assembled": {"primitive-csg", "profile-extrude", "boolean", "revolve"},
+    "strand": {"sweep", "curve", "nurbs"},
+    "relief": {"curve", "profile-extrude", "primitive-csg", "boolean",
+               "decal"},
+}
+
+
+def form_prop(obj, name):
+    props = obj.get("custom_props")
+    return props.get(name) if isinstance(props, dict) else None
+
+
+def mesh_count(obj, base_name, evaluated_name):
+    value = obj.get(base_name, obj.get(evaluated_name))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def is_shallow_form_cage(obj):
+    """Return true for a box-scale authored cage, with a profile-lathe exception."""
+    base_vertices = mesh_count(obj, "base_vertex_count", "vertex_count")
+    base_polys = mesh_count(obj, "base_poly_count", "poly_count")
+    method = form_prop(obj, "procagen3d_form_method")
+    modifiers = obj.get("modifiers") or []
+    # A Screw lathe legitimately begins as an open 2D mesh profile: it has no
+    # faces until evaluation, but enough profile samples to control curvature.
+    profile_lathe = (method == "revolve" and "SCREW" in modifiers
+                     and base_vertices is not None and base_vertices >= 5
+                     and base_polys == 0)
+    if profile_lathe:
+        return False
+    return ((base_vertices is not None and base_vertices <= 8)
+            or (base_polys is not None and base_polys <= 6))
+
+
+def bbox_proxy_volume(obj):
+    dims = obj.get("dimensions")
+    if (not isinstance(dims, list) or len(dims) < 3
+            or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                       for v in dims[:3])):
+        return 0.0
+    return max(0.0, dims[0]) * max(0.0, dims[1]) * max(0.0, dims[2])
 
 
 def cmd_check(args):
@@ -153,6 +212,46 @@ def cmd_check(args):
     objs = graph["objects"]
     meshes = [o for o in objs if o["type"] == "MESH"]
     failures = 0
+
+    root_names = set(graph.get("roots") or [])
+    if not root_names:
+        root_names = {o["name"] for o in objs if o.get("parent") is None}
+    root_objs = [o for o in objs if o["name"] in root_names]
+    profile_values = [form_prop(o, "procagen3d_form_profile")
+                      for o in root_objs]
+    profile_values = [value for value in profile_values if value is not None]
+    child_profiles = [
+        (o["name"], form_prop(o, "procagen3d_form_profile"))
+        for o in objs if o["name"] not in root_names
+        and form_prop(o, "procagen3d_form_profile") is not None
+    ]
+    if child_profiles:
+        if profile_values:
+            warn("FORM_PROFILE_SCOPE", "ignoring non-root form profiles: "
+                 f"{child_profiles[:6]}")
+        else:
+            failures += 1
+            fail("FORM_PROFILE_SCOPE", "form profile must be declared on a "
+                 f"root object, not only on children: {child_profiles[:6]}")
+    invalid_profiles = [value for value in profile_values
+                        if not isinstance(value, str)
+                        or value not in {"rectilinear", "curved", "mixed"}]
+    declared_profiles = {value for value in profile_values
+                         if isinstance(value, str)
+                         and value in {"rectilinear", "curved", "mixed"}}
+    if invalid_profiles or len(declared_profiles) > 1:
+        failures += 1
+        fail("FORM_PROFILE", f"invalid/conflicting root form profiles: "
+             f"{sorted(str(value) for value in profile_values)}")
+    declared_profile = (next(iter(declared_profiles))
+                        if len(declared_profiles) == 1 else None)
+    form_profile = (declared_profile
+                    if args.form == "auto" and declared_profile else args.form)
+    if (args.form != "auto" and declared_profile is not None
+            and args.form != declared_profile):
+        failures += 1
+        fail("FORM_PROFILE", f"CLI --form {args.form} conflicts with declared "
+             f"root profile {declared_profile}")
 
     if not meshes:
         fail("NO_MESHES", "scene contains no mesh objects")
@@ -216,9 +315,10 @@ def cmd_check(args):
     mats = set()
     for o in meshes:
         mats.update(o.get("materials") or [])
-    # unbeveled-box tell: only structural masses count — trim strips, tread
-    # lugs, seams, thin glass panes etc. are legitimately plain boxes. A
-    # mass has real thickness (min dim) and a real footprint (middle dim).
+    # Structural masses exclude trim strips, tread lugs, seams, and thin glass.
+    # Authored/base topology is recorded separately from evaluated topology.
+    # The general detail floor tolerates intentionally beveled solids; the
+    # curved-form primitive-cage gate below does not let Bevel hide them.
     world_size = graph.get("world_bbox", {}).get("size", [1, 1, 1])
     major_dim = max(s for s in world_size if isinstance(s, (int, float)))
     structural = []
@@ -226,8 +326,128 @@ def cmd_check(args):
         dims = sorted(o.get("dimensions", [0, 0, 0]))
         if dims[0] >= 0.01 * major_dim and dims[1] >= 0.06 * major_dim:
             structural.append(o)
-    boxy = [o["name"] for o in structural if o.get("poly_count", 0) <= 6]
+    boxy = [o["name"] for o in structural
+            if o.get("base_poly_count", o.get("poly_count", 0)) <= 6
+            and ("BEVEL" not in o.get("modifiers", [])
+                 or o.get("poly_count", 0)
+                 <= o.get("base_poly_count", o.get("poly_count", 0)))]
     boxy_ratio = len(boxy) / len(structural) if structural else 0.0
+    primitive_cages = [o["name"] for o in structural
+                       if o.get("base_vertex_count", o.get("vertex_count", 0)) <= 8
+                       and o.get("base_poly_count", o.get("poly_count", 0)) <= 6]
+    primitive_cage_ratio = (len(primitive_cages) / len(structural)
+                            if structural else 0.0)
+
+    # Semantic form contract.  Geometry helpers set these custom properties on
+    # silhouette-bearing masses; the checker rejects incompatible topology /
+    # construction pairs instead of trying to infer intent from triangle count.
+    tagged = [o for o in meshes if any(form_prop(o, key) is not None for key in (
+        "procagen3d_form_role", "procagen3d_topology",
+        "procagen3d_form_method"))]
+    valid_contract_names = set()
+    for obj in tagged:
+        role = form_prop(obj, "procagen3d_form_role")
+        topology = form_prop(obj, "procagen3d_topology")
+        method = form_prop(obj, "procagen3d_form_method")
+        if (not isinstance(role, str) or not isinstance(topology, str)
+                or not isinstance(method, str)
+                or role not in ("primary", "secondary")
+                or topology not in FORM_TOPOLOGIES or method not in FORM_METHODS):
+            failures += 1
+            fail("FORM_TAG", f"{obj['name']}: invalid/incomplete form contract "
+                 f"role={role!r}, topology={topology!r}, method={method!r}")
+        elif method not in TOPOLOGY_METHODS[topology]:
+            failures += 1
+            fail("FORM_METHOD", f"{obj['name']}: topology '{topology}' cannot "
+                 f"use '{method}' — choose a compatible representation "
+                 "(references/complex-forms.md)")
+        else:
+            valid_contract_names.add(obj["name"])
+
+    primary = [o for o in meshes
+               if form_prop(o, "procagen3d_form_role") == "primary"]
+    if form_profile in ("curved", "mixed"):
+        macro = sorted(
+            structural,
+            key=bbox_proxy_volume,
+            reverse=True,
+        )[:12]
+        contracted_macro = [o for o in macro if o["name"] in valid_contract_names]
+        contract_ratio = len(contracted_macro) / len(macro) if macro else 1.0
+        required_contract_ratio = 0.75 if form_profile == "curved" else 0.60
+        if contract_ratio < required_contract_ratio:
+            failures += 1
+            untagged = [o["name"] for o in macro
+                        if o["name"] not in valid_contract_names]
+            fail("FORM_TAG_COVERAGE", f"only {len(contracted_macro)}/{len(macro)} "
+                 f"largest structural masses have valid form contracts "
+                 f"(need {required_contract_ratio:.0%}); untagged: {untagged[:8]}")
+        macro_shaped = [
+            o for o in macro
+            if o["name"] in valid_contract_names
+            and form_prop(o, "procagen3d_topology") in ("continuous", "shell")
+            and not is_shallow_form_cage(o)
+        ]
+        macro_volume = sum(bbox_proxy_volume(o) for o in macro)
+        shaped_volume = sum(bbox_proxy_volume(o) for o in macro_shaped)
+        macro_shaped_ratio = shaped_volume / macro_volume if macro_volume else 1.0
+        required_macro_shaped = 0.50 if form_profile == "curved" else 0.30
+        if macro_shaped_ratio < required_macro_shaped:
+            failures += 1
+            fail("FORM_MACRO_COVERAGE", f"genuine continuous/shell forms cover "
+                 f"only {macro_shaped_ratio:.0%} of the top structural envelope "
+                 f"(need {required_macro_shaped:.0%}; {len(macro_shaped)}/"
+                 f"{len(macro)} masses); a small token loft cannot excuse a "
+                 "box-built body")
+        if not primary:
+            failures += 1
+            fail("FORM_CONTRACT", f"--form {form_profile} requires primary masses "
+                 "tagged with procagen3d_form_role/topology/form_method; rebuild "
+                 "from references/complex-forms.md")
+        else:
+            shaped = [o for o in primary
+                      if form_prop(o, "procagen3d_topology") in
+                      ("continuous", "shell")]
+            shaped_ratio = len(shaped) / len(primary)
+            required = 0.50 if form_profile == "curved" else 0.30
+            if shaped_ratio < required:
+                failures += 1
+                fail("FORM_COVERAGE", f"{form_profile} target has only "
+                     f"{len(shaped)}/{len(primary)} ({shaped_ratio:.0%}) primary "
+                     "masses routed as continuous/shell forms")
+
+            shallow = []
+            weak_sections = []
+            for obj in primary:
+                topology = form_prop(obj, "procagen3d_topology")
+                if topology not in ("continuous", "shell"):
+                    continue
+                if is_shallow_form_cage(obj):
+                    shallow.append(obj["name"])
+                method = form_prop(obj, "procagen3d_form_method")
+                section_count = form_prop(obj, "procagen3d_section_count")
+                if method in ("loft", "sweep") and (
+                        not isinstance(section_count, int) or section_count < 4):
+                    weak_sections.append(
+                        f"{obj['name']} section_count={section_count!r}")
+                planes = obj.get("base_axis_plane_counts")
+                if planes and sum(count >= 5 for count in planes) < 2:
+                    weak_sections.append(
+                        f"{obj['name']} planes={planes}")
+            if shallow:
+                failures += 1
+                fail("FORM_SHALLOW", "continuous/shell primary masses still use an "
+                     f"eight-vertex/six-face cage: {shallow[:8]}")
+            if weak_sections:
+                warn("FORM_SECTIONS", "continuous forms have weak authored "
+                     f"cross-section variation: {weak_sections[:6]}")
+
+        primitive_limit = 0.35 if form_profile == "curved" else 0.45
+        if primitive_cage_ratio > primitive_limit:
+            warn("FORM_PRIMITIVES", f"{primitive_cage_ratio:.0%} of structural "
+                 f"meshes are eight-vertex/six-face cages (limit "
+                 f"{primitive_limit:.0%}; e.g. {primitive_cages[:6]})")
+
     floors = {"standard": (40, 8000, 6), "showcase": (150, 25000, 12)}
     if args.tier in floors:
         mesh_floor, tri_floor, mat_floor = floors[args.tier]
@@ -244,8 +464,8 @@ def cmd_check(args):
         if misses:
             warn("LOW_DETAIL", f"{args.tier} floors not met: "
                  + "; ".join(misses)
-                 + " — decompose further, bevel, split materials "
-                 "(references/detail.md)")
+                 + " — fix the named form/detail deficit "
+                 "(references/detail.md; references/complex-forms.md)")
 
     world = graph.get("world_bbox", {}).get("size", ["?"] * 3)
     print(f"{OK if not failures else '[PROCAGEN3D:SUMMARY]'} {totals['meshes']} meshes, "
@@ -663,6 +883,8 @@ def main():
     p.add_argument("--engine", default="workbench",
                    choices=["workbench", "eevee", "cycles"])
     p.add_argument("--no-render", action="store_true")
+    p.add_argument("--form-diagnostics", action="store_true",
+                   help="also render a neutral clay six-view form sheet")
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("render", help="re-render canonical views")
@@ -670,6 +892,8 @@ def main():
     p.add_argument("--size", type=int, default=512)
     p.add_argument("--engine", default="workbench",
                    choices=["workbench", "eevee", "cycles"])
+    p.add_argument("--form-diagnostics", action="store_true",
+                   help="also render a neutral clay six-view form sheet")
     p.set_defaults(func=cmd_render)
 
     p = sub.add_parser("check", help="deterministic scene-graph gates")
@@ -677,6 +901,9 @@ def main():
     p.add_argument("--tier", choices=["quick", "standard", "showcase"],
                    default="standard",
                    help="detail-floor tier (references/detail.md)")
+    p.add_argument("--form", choices=["auto", "rectilinear", "curved", "mixed"],
+                   default="auto",
+                   help="primary-form profile (references/complex-forms.md)")
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("joints", help="validate articulation")

@@ -86,7 +86,9 @@ bpy.data.objects.remove(cutter, do_unlink=True)       # remove the cutter after
 Leaving the cutter in the scene adds a phantom part that fails part-coverage
 inspection. Alternatively leave modifiers unapplied — the harness exports
 with modifiers applied — but then vertex counts in `scene_graph.json` are
-evaluated counts, and the cutter must still be removed or hidden.
+evaluated counts. Remove the cutter, or set `cutter.hide_render = True`; the
+harness excludes non-renderable helpers from graphs, proof framing, joint
+checks, and GLB export.
 
 ## Trap 8 — orientation conventions
 

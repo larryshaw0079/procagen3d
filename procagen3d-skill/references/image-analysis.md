@@ -45,6 +45,32 @@ visible view in words ("side view: two equal circles, centers ~1.6 wheel
 diameters apart; seat above rear wheel center"). Note characteristic angles
 (fork rake, roof slope, leg splay) in degrees.
 
+## 3b. Form blueprint (curved or mixed targets)
+
+Classify the overall form profile as `rectilinear | curved | mixed`. If it is
+`curved` or `mixed`, read `complex-forms.md` now and make primary geometry
+measurable before choosing helpers:
+
+- Estimate the reference camera as projection plus azimuth/elevation and
+  FOV (perspective) or vertical world scale (orthographic); distinguish
+  perspective convergence from real taper. Mark every camera value
+  approximate unless calibrated.
+- Name 3–5 **macro identity forms** (continuous roof arc, rear-haunch swell,
+  thigh-to-knee pinch) separately from badges/colors in §7.
+- Trace 6–12 normalized `(u,v)` landmarks along each visible identity contour
+  and state the image-to-world mapping used.
+- For each primary mass, declare `topology`, `method`, longitudinal axis, and
+  5–12 cross-section/spine stations. Each station records center, width,
+  bottom/top or depth, twist, evidence view, and confidence.
+- List negative spaces and surface relationships: openings, undercuts, limb
+  gaps, parent surface, attachment band, smooth transition versus hard seam.
+- Mark hidden sections `inferred`; constrain them by symmetry/class priors
+  without claiming reference verification.
+
+A varying-section target built from a deformed box or overlapping ellipsoids
+is a representation error, not an acceptable blockout. The form blueprint is
+the ground truth for the shape-first probe.
+
 ## 4. Symmetry and structure
 
 Declare the symmetry the build should exploit: bilateral (vehicles,
@@ -91,6 +117,8 @@ inspection even when every global verdict passes.
 # Priors — <object>
 scale anchor: <part> = <value> m (<reason>)
 overall: H x W x D ≈ <..> m (front faces -Y)
+form profile: <rectilinear | curved | mixed>
+reference camera: <projection; azimuth, elevation; FOV or ortho-scale estimate>
 
 ## references
 | saved copy | original source | notes |
@@ -106,6 +134,15 @@ overall: H x W x D ≈ <..> m (front faces -Y)
 ## proportions & silhouette
 - side: <...>  front: <...>
 - symmetry: bilateral (x=0); bolt circle radial x8
+
+## form blueprint (curved/mixed)
+macro identity forms: <3-5 bullets>
+
+| primary mass | topology / method | axis | stations or outline | evidence / confidence |
+|--------------|-------------------|------|---------------------|-----------------------|
+| BodyShell | continuous / loft | Y | t=0: center,width,bottom,crown; ... | ref 01 side+top / medium |
+
+negative spaces & transitions: <openings, undercuts, attachment bands, seams>
 
 ## materials
 | family | rgb | rough/metal | applies to |
