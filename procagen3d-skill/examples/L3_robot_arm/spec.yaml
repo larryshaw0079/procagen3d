@@ -1,0 +1,40 @@
+# Ground truth — do not read before generating (bench protocol)
+object: robot_arm
+units: meters
+constraints:
+  - id: bolt_count
+    measure: count
+    pattern: "Bolt_*"
+    equals: 8
+  - id: base_flange_diameter
+    measure: dimension
+    pattern: "Base_Flange"
+    metric: diameter_xy
+    value: 0.34
+    tolerance: 5%
+  - id: shoulder_pivot_height
+    measure: dimension
+    pattern: "Joint_Shoulder"
+    metric: origin_z
+    value: 0.405
+    tolerance: 5%
+  - id: elbow_pivot_height
+    measure: dimension
+    pattern: "Joint_Elbow"
+    metric: origin_z
+    value: 0.865
+    tolerance: 5%
+  - id: revolute_joints
+    measure: joint
+    pattern: "Joint_*"
+    type: revolute
+    min_count: 3
+  - id: gripper_fingers
+    measure: count
+    pattern: "Finger_*"
+    equals: 2
+  - id: overall_height_sane
+    measure: dimension
+    pattern: "*"
+    metric: height
+    range: [0.9, 1.8]

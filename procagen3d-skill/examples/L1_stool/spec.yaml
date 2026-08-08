@@ -1,0 +1,29 @@
+# Ground truth — do not read before generating (bench protocol)
+object: three_legged_stool
+units: meters
+constraints:
+  - id: leg_count
+    measure: count
+    pattern: "Leg_*"
+    equals: 3
+  - id: seat_height
+    measure: dimension
+    pattern: "Seat"
+    metric: top_z
+    value: 0.45
+    tolerance: 10%
+  - id: seat_diameter
+    measure: dimension
+    pattern: "Seat"
+    metric: diameter_xy
+    value: 0.32
+    tolerance: 10%
+  - id: footprint_sane
+    measure: dimension
+    pattern: "Stool"
+    metric: extent_max
+    range: [0.25, 0.60]
+  - id: no_joints
+    measure: joint
+    pattern: "*"
+    equals: 0

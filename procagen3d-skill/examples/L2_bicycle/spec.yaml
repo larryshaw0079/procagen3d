@@ -1,0 +1,41 @@
+# Ground truth — do not read before generating (bench protocol)
+object: city_bicycle
+units: meters
+constraints:
+  - id: wheel_count
+    measure: count
+    pattern: "Wheel_*"
+    equals: 2
+  - id: front_wheel_diameter
+    measure: dimension
+    pattern: "Wheel_Front"
+    metric: extent_max
+    value: 0.66
+    tolerance: 10%
+  - id: rear_wheel_diameter
+    measure: dimension
+    pattern: "Wheel_Rear"
+    metric: extent_max
+    value: 0.66
+    tolerance: 10%
+  - id: fender_count
+    measure: count
+    pattern: "Fender_*"
+    equals: 2
+  - id: saddle_height
+    measure: dimension
+    pattern: "Saddle"
+    metric: top_z
+    range: [0.85, 1.10]
+  - id: steering_joint
+    measure: joint
+    pattern: "Joint_Steer*"
+    type: revolute
+  - id: kickstand_exists
+    measure: exists
+    pattern: "Kickstand*"
+  - id: grip_symmetry
+    measure: symmetry
+    pair: ["Grip_L", "Grip_R"]
+    plane: x
+    tolerance: 0.02
