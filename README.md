@@ -51,19 +51,25 @@ procagen3d/
 - **Python 3.10+**. No pip packages — the harness is stdlib only, and
   Blender stages run under Blender's bundled Python.
 
-## Quick start
+## Install
 
-Symlink the skill into your runtime's skill directory:
+Install the skill for Codex:
 
 ```sh
-cd procagen3d-skill
-ln -s "$(pwd)" ~/.claude/skills/procagen3d   # Claude Code
-ln -s "$(pwd)" ~/.codex/skills/procagen3d    # Codex CLI
+git clone https://github.com/larryshaw0079/procagen3d.git ~/.codex/skills/procagen3d
 ```
 
+Install the skill for Claude Code:
+
+```sh
+git clone https://github.com/larryshaw0079/procagen3d.git ~/.claude/skills/procagen3d
+```
+
+## Quick start
+
 Then ask naturally ("generate a GLB of a wheelbarrow with a rotating
-wheel", "rebuild this car from these photos") or invoke `/procagen3d`
-explicitly in Claude Code. Outputs land in `./procagen3d_out/<slug>/`:
+wheel", "rebuild this car from these photos") or invoke `$procagen3d`
+explicitly in Codex. Outputs land in `./procagen3d_out/<slug>/`:
 `program.py` (the deliverable), `model.glb`, `scene.blend`, diagnostics,
 and a six-view render sheet. Image-conditioned runs also save unchanged copies
 of the used inputs there as `reference_01.<ext>`, `reference_02.<ext>`, etc.,
