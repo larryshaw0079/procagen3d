@@ -1,7 +1,6 @@
 ---
 name: procagen3d
 description: Generate 3D assets as executable Blender Python programs compiled to GLB — named parts, assembly hierarchy, articulated joints with limits, and machine-checkable dimensional constraints (ProcAgen3D, arXiv:2607.22738). Use for text-to-3D or image-to-3D object generation, articulated/jointed models, parametric GLB/glTF assets, Blender procedural modeling, and source-level local edits of previously generated ProcAgen3D assets.
-version: 0.1.0
 ---
 
 # ProcAgen3D — code-native generation of programmable 3D assets
@@ -34,7 +33,10 @@ renders.
 Per asset, one directory (default `./procagen3d_out/<slug>/`, or where the user
 asks): `program.py` (the deliverable), `model.glb`, `scene.blend`,
 `scene_graph.json`, `diagnostics.json`, `renders/` (six canonical views +
-`sheet.png`), and when applicable `joints_report.json`, `score_report.json`.
+`sheet.png`), and when applicable `spec.yaml`, `joints_report.json`,
+`score_report.json`. Image-conditioned assets also contain `priors.md` and an
+unaltered copy of every reference image used, named `reference_01.<ext>`,
+`reference_02.<ext>`, etc. in input order.
 
 ## The Loop
 
@@ -46,10 +48,16 @@ Declare the **detail tier** (`quick | standard | showcase`, see
 read `references/detail.md` before Design. If the request states any
 measurable requirement (counts, dimensions, symmetry, required joints),
 author `spec.yaml` now — MUST read `references/constraints.md` first. If a
-reference image is given, MUST read `references/image-analysis.md`, then
-Read the image and write structured priors to `<out>/priors.md` before any
-code (showcase: including the §7 detail inventory + identity features). Do
-not skip priors: they are the perception stage.
+reference image is used, MUST read `references/image-analysis.md`. Before
+analysis or code, create `<out>` and copy every used input image byte-for-byte
+to `<out>/reference_01.<ext>`, `<out>/reference_02.<ext>`, etc. in the order
+supplied, preserving each format/extension. Record the mapping from saved path
+to original filename, URL, or attachment label in `<out>/priors.md`; then Read
+the saved copies and complete the structured priors (showcase: including the
+§7 detail inventory + identity features). If the runtime cannot expose the
+original bytes, save the highest-resolution representation available and mark
+that substitution in `priors.md`. Do not skip the copies or priors: together
+they are the reproducible perception input and stage.
 
 **1 — Design.** Decide before coding, and record as the program's header
 comment: the constants block (real-world meters), the part table (PascalCase
@@ -136,16 +144,18 @@ faithfully from this input" is a valid outcome — say it instead of faking.
 
 ## Gates (do not skip)
 
-1. `build` exit 0 before anything else proceeds.
-2. `check --tier <tier>` exit 0 before visual inspection; a
+1. Image-conditioned: every reference image actually used is present at the
+   output root as `reference_NN.<ext>` and mapped in `priors.md` before code.
+2. `build` exit 0 before anything else proceeds.
+3. `check --tier <tier>` exit 0 before visual inspection; a
    `WARN:LOW_DETAIL` at showcase is repair input, not acceptable residue.
-3. `guard` pass between every repair iteration — no exceptions.
-4. `sheet.png` actually Read before any quality claim.
-5. `joints` exit 0 whenever the design table declares a joint.
-6. `score` output quoted verbatim whenever a spec exists.
-7. Repair ceiling of 3 — on exhaustion, deliver best intermediate + honest
+4. `guard` pass between every repair iteration — no exceptions.
+5. `sheet.png` actually Read before any quality claim.
+6. `joints` exit 0 whenever the design table declares a joint.
+7. `score` output quoted verbatim whenever a spec exists.
+8. Repair ceiling of 3 — on exhaustion, deliver best intermediate + honest
    residuals, never a silent extra loop.
-8. Repairs preserve what passes: list the passing verdicts in the repair
+9. Repairs preserve what passes: list the passing verdicts in the repair
    note and do not regress them while fixing the failing one — a repair
    that trades a pass for a pass is a regression, revert it.
 

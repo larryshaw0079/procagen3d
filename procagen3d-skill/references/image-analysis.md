@@ -2,9 +2,24 @@
 
 ProcAgen3D's perception stages (depth/normal/edge priors, ViT features, material
 verification) are replaced in this skill by *your* structured reading of the
-reference image. The output is `<out>/priors.md`, written **before any
+reference image. The outputs are unchanged copies of the used references at
+`<out>/reference_NN.<ext>` plus `<out>/priors.md`, all written **before any
 code**. Unstructured glancing produces fused parts and wrong proportions —
-the checklist below is the stage; do it in order, against the actual image.
+the checklist below is the stage; do it in order, against the saved copies.
+
+## 0. Preserve the inputs
+
+Create `<out>` and copy every image used to inform the asset byte-for-byte to
+the output root. Name the copies `reference_01.<ext>`, `reference_02.<ext>`,
+etc. in the order supplied, preserving each image's format and extension.
+Record the original filename, URL, or attachment label for every saved copy in
+the `references` table in `priors.md`. Analyze these saved copies from this
+point onward so the asset remains reproducible when the original prompt or
+attachment is unavailable.
+
+If the runtime exposes only a decoded or resized representation rather than
+the original bytes, save the highest-resolution representation available with
+the correct extension and disclose the substitution in the table's notes.
 
 ## 1. Identity and scale anchor
 
@@ -76,6 +91,11 @@ inspection even when every global verdict passes.
 # Priors — <object>
 scale anchor: <part> = <value> m (<reason>)
 overall: H x W x D ≈ <..> m (front faces -Y)
+
+## references
+| saved copy | original source | notes |
+|------------|-----------------|-------|
+| reference_01.jpg | <filename, URL, or attachment label> | exact copy |
 
 ## parts
 | part | count | key dims (m) | notes |

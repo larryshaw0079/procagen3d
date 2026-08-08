@@ -67,6 +67,9 @@ python3 scripts/procagen3d.py render out/ --engine eevee    # re-render (beauty 
 ```
 
 Exit 0 = pass, 1 = failure with printed `[PROCAGEN3D:FAIL:*]` reasons.
+Image-conditioned runs also retain each used input at the output root as
+`reference_01.<ext>`, `reference_02.<ext>`, etc., with provenance recorded in
+`priors.md`.
 
 ## Design notes
 

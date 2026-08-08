@@ -3,9 +3,9 @@
 **Version:** 0.0.1
 
 Code-native generation of programmable 3D assets, implemented as an agent
-skill for Claude Code, Codex, and compatible runtimes. Based on
-**ProcAgen3D: Code-Native Generation of Programmable 3D Assets**
-([arXiv:2607.22738](https://arxiv.org/abs/2607.22738)).
+skill for Claude Code, Codex, and compatible runtimes.
+
+![ProcAgen3D teaser](assets/teaser.png)
 
 Instead of sculpting meshes or emitting vertex soup, the agent writes an
 executable **Blender Python program** — named parts, a real transform tree,
@@ -41,8 +41,7 @@ procagen3d/
 │   ├── scripts/          # driver + Blender-side stages
 │   ├── references/       # routed depth docs (doctrine, joints, edits, …)
 │   └── examples/         # bench-style items: L1_stool, L2_bicycle, L3_robot_arm
-└── assets/               # local test material (gitignored): reference
-                          # images and generated GLBs, not part of the repo
+└── assets/               # tracked teaser + gitignored local test material
 ```
 
 ## Requirements
@@ -66,7 +65,9 @@ Then ask naturally ("generate a GLB of a wheelbarrow with a rotating
 wheel", "rebuild this car from these photos") or invoke `/procagen3d`
 explicitly in Claude Code. Outputs land in `./procagen3d_out/<slug>/`:
 `program.py` (the deliverable), `model.glb`, `scene.blend`, diagnostics,
-and a six-view render sheet.
+and a six-view render sheet. Image-conditioned runs also save unchanged copies
+of the used inputs there as `reference_01.<ext>`, `reference_02.<ext>`, etc.,
+with their provenance recorded in `priors.md`.
 
 The harness is also usable by hand:
 

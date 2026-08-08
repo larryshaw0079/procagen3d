@@ -13,4 +13,5 @@ uv.lock
 
 # ProcAgen3D skill outputs
 procagen3d_out/
-assets/
+assets/*
+!assets/teaser.png
