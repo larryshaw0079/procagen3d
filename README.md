@@ -14,6 +14,83 @@ Blender compiles it to a GLB. The program is the asset; the GLB is a
 derivative artifact. Because the asset is source code, it stays editable:
 "make the handlebar wider" is a minimal, gated source edit, not a remodel.
 
+## Showcase
+
+Representative reference-conditioned results selected from successful
+`procagen3d_out/` runs. Each pair shows the closest available source-image
+angle on the left and the generated render on the right. Every model starts as
+an executable Blender Python program and is compiled to a portable GLB by the
+ProcAgen3D pipeline.
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="assets/showcase/audi-sport-quattro-s1-reference.png">
+        <img src="assets/showcase/audi-sport-quattro-s1-reference.png" width="205" alt="Reference image of an Audi Sport Quattro S1 rally car">
+      </a>
+      <a href="assets/showcase/audi-sport-quattro-s1.png">
+        <img src="assets/showcase/audi-sport-quattro-s1.png" width="205" alt="ProcAgen3D render of an Audi Sport Quattro S1 rally car">
+      </a><br>
+      <sub>Reference → ProcAgen3D</sub><br>
+      <strong>Audi Sport Quattro S1</strong>
+    </td>
+    <td align="center">
+      <a href="assets/showcase/china-pavilion-reference.png">
+        <img src="assets/showcase/china-pavilion-reference.png" width="205" alt="Reference image of a traditional Chinese pavilion">
+      </a>
+      <a href="assets/showcase/china-pavilion.png">
+        <img src="assets/showcase/china-pavilion.png" width="205" alt="ProcAgen3D render of a traditional Chinese pavilion">
+      </a><br>
+      <sub>Reference → ProcAgen3D</sub><br>
+      <strong>Traditional Chinese Pavilion</strong>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="assets/showcase/benben-robot-reference.png">
+        <img src="assets/showcase/benben-robot-reference.png" width="205" alt="Reference image of the Benben robot">
+      </a>
+      <a href="assets/showcase/benben-robot.png">
+        <img src="assets/showcase/benben-robot.png" width="205" alt="ProcAgen3D render of the Benben robot">
+      </a><br>
+      <sub>Reference → ProcAgen3D</sub><br>
+      <strong>Benben Robot</strong>
+    </td>
+    <td align="center">
+      <a href="assets/showcase/nissan-skyline-super-silhouette-reference.png">
+        <img src="assets/showcase/nissan-skyline-super-silhouette-reference.png" width="205" alt="Reference image of a Nissan Skyline Super Silhouette race car">
+      </a>
+      <a href="assets/showcase/nissan-skyline-super-silhouette.png">
+        <img src="assets/showcase/nissan-skyline-super-silhouette.png" width="205" alt="ProcAgen3D render of a Nissan Skyline Super Silhouette race car">
+      </a><br>
+      <sub>Reference → ProcAgen3D</sub><br>
+      <strong>Nissan Skyline Super Silhouette</strong>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="assets/showcase/pagani-huayra-r-reference.png">
+        <img src="assets/showcase/pagani-huayra-r-reference.png" width="205" alt="Reference image of a Pagani Huayra R">
+      </a>
+      <a href="assets/showcase/pagani-huayra-r.png">
+        <img src="assets/showcase/pagani-huayra-r.png" width="205" alt="ProcAgen3D render of a Pagani Huayra R">
+      </a><br>
+      <sub>Reference → ProcAgen3D</sub><br>
+      <strong>Pagani Huayra R</strong>
+    </td>
+    <td align="center">
+      <a href="assets/showcase/toyota-sr5-reference.png">
+        <img src="assets/showcase/toyota-sr5-reference.png" width="205" alt="Reference image of a Toyota SR5 pickup with its hood open">
+      </a>
+      <a href="assets/showcase/toyota-sr5.png">
+        <img src="assets/showcase/toyota-sr5.png" width="205" alt="ProcAgen3D render of a Toyota SR5 pickup with its hood open">
+      </a><br>
+      <sub>Reference → ProcAgen3D</sub><br>
+      <strong>Toyota SR5</strong>
+    </td>
+  </tr>
+</table>
+
 ## How it works
 
 The agent supplies design judgment and visual review; a deterministic,
@@ -42,7 +119,7 @@ procagen3d/
 │   ├── scripts/          # driver + Blender-side stages
 │   ├── references/       # routed depth docs (doctrine, joints, edits, …)
 │   └── examples/         # bench-style items: L1_stool, L2_bicycle, L3_robot_arm
-└── assets/               # tracked teaser + gitignored local test material
+└── assets/               # tracked teaser/showcase + gitignored test material
 ```
 
 ## Requirements
