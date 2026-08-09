@@ -32,8 +32,8 @@ git clone https://github.com/larryshaw0079/procagen3d.git ~/.claude/skills/proca
 
 Representative reference-conditioned results selected from successful
 `procagen3d_out/` runs. Each pair shows the closest available source-image
-angle on the left and a clean Blender render of the exported `model.glb` on the
-right. Every model starts as an executable Blender Python program and is
+angle on the left and a studio-lit Eevee render of the exported `model.glb` on
+the right. Every model starts as an executable Blender Python program and is
 compiled to a portable GLB by the ProcAgen3D pipeline.
 
 <table>
