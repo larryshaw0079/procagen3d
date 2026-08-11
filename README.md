@@ -1,6 +1,6 @@
 # ProcAgen3D
 
-**Version:** 0.0.1
+**Version:** 0.1.0
 
 Code-native generation of programmable 3D assets, implemented as an agent
 skill for Claude Code, Codex, and compatible runtimes.
@@ -112,17 +112,19 @@ stdlib-only harness enforces the paper's pipeline around it:
 
 ```
 design → curved/mixed shape probe → synthesize program
-→ build (headless Blender) → deterministic gates
-→ canonical renders → agent-vision inspection → guarded repair loop (≤3)
+→ build + canonical renders (headless Blender)
+→ registered image fit (image-conditioned) → deterministic checks
+→ agent-vision inspection → guarded repair loop (≤3)
 → articulation validation → constraint scoring → deliver
 ```
 
 Every stage is a CLI command with exit codes and grep-able
 `[PROCAGEN3D:OK|WARN|FAIL]` tags, so nothing depends on the agent's honesty:
-build errors, doctrine violations, broken joints, and failed dimensional
-constraints are all caught mechanically. Perception is agent vision by
-design — no learned depth/normal/edge models — which keeps the skill fully
-offline and dependency-free.
+build errors, doctrine violations, broken joints, failed reference fits, and
+failed dimensional constraints are all caught mechanically. Semantic
+perception is agent vision by design — no learned depth/normal/edge models —
+while registered camera, mask, landmark, ratio, and layout gates verify visible
+projection offline.
 
 ## Repository layout
 
@@ -143,34 +145,24 @@ procagen3d/
 - **Python 3.10+**. No pip packages — the harness is stdlib only, and
   Blender stages run under Blender's bundled Python.
 
-## Quick start
+## Update log
 
-Then ask naturally ("generate a GLB of a wheelbarrow with a rotating
-wheel", "rebuild this car from these photos") or invoke `$procagen3d`
-explicitly in Codex. Outputs land in `./procagen3d_out/<slug>/`:
-`program.py` (the deliverable), `model.glb`, `scene.blend`, diagnostics,
-and a six-view render sheet. Image-conditioned runs also save unchanged copies
-of the used inputs there as `reference_01.<ext>`, `reference_02.<ext>`, etc.,
-with their provenance recorded in `priors.md`.
+Entries are newest first.
 
-The harness is also usable by hand:
+### 0.1.0 — 2026-08-11
 
-```sh
-python3 procagen3d-skill/scripts/procagen3d.py build program.py --out out/
-python3 procagen3d-skill/scripts/procagen3d.py check out/ --tier showcase --form auto
-python3 procagen3d-skill/scripts/procagen3d.py joints out/
-python3 procagen3d-skill/scripts/procagen3d.py score out/ --spec spec.yaml
-```
+- Added the versioned `fit_spec.json` contract for registered cameras, masks,
+  landmarks, ratios, scene instances, and spatial relations.
+- Added `procagen3d fit`, exact reference-resolution rendering, overlays,
+  scored masks, and a machine-readable `fit_report.json`.
+- Added deterministic fit gates and hash-based freshness checks. Image-based
+  outputs now fail `check` when fit evidence is missing, failed, or stale;
+  text-only outputs remain unaffected.
+- Added explicit README release tracking and documented the registered-fit
+  workflow throughout the skill.
 
-See [`procagen3d-skill/README.md`](procagen3d-skill/README.md) for the full
-CLI, install notes, and design rationale, and
-[`procagen3d-skill/SKILL.md`](procagen3d-skill/SKILL.md) for the pipeline
-the agent actually follows.
+### 0.0.1 — 2026-08-08
 
-## Bench examples
-
-`procagen3d-skill/examples/` holds three ProcAgen3D-Bench-style items
-(`L1_stool`, `L2_bicycle`, `L3_robot_arm`), each with a `manifest.txt`
-prompt and a `spec.yaml` ground truth. Protocol, same as the paper:
-generate from the manifest only, then score the exported asset against the
-spec — the spec is never opened during generation.
+- Published the initial code-native Blender generation workflow with build,
+  render, checks, articulation validation, constraint scoring, guarded repair,
+  and local-edit gates.
