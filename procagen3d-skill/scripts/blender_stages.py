@@ -9,6 +9,7 @@ Stages:
     build   Execute a ProcAgen3D program, dump scene_graph.json, export GLB,
             save scene.blend, render canonical views + contact sheet.
     render  Re-render canonical views from an existing scene.blend.
+    fit     Render a registered reference view and score image-fit gates.
     joints  Validate articulation (pivot placement, axis, limits, sweep
             collisions, rest-pose restore) against an existing scene.blend.
 
@@ -18,6 +19,8 @@ Blender's own exit-code quirks.
 """
 
 import argparse
+import fnmatch
+import hashlib
 import json
 import math
 import sys
@@ -26,7 +29,8 @@ import traceback
 from pathlib import Path
 
 import bpy
-from mathutils import Matrix, Vector
+from bpy_extras.object_utils import world_to_camera_view
+from mathutils import Matrix, Quaternion, Vector
 from mathutils.bvhtree import BVHTree
 
 OK = "[PROCAGEN3D:OK]"
@@ -465,6 +469,777 @@ def make_contact_sheet(renders_dir, size, prefix="", output_name="sheet.png"):
     return sheet_path
 
 
+# ---------------------------------------------------------------- image-fit stage
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fit_path(out_dir, value, label):
+    """Resolve a fit artifact inside the asset output directory."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty path string")
+    root = Path(out_dir).resolve()
+    candidate = (root / value).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError(f"{label} must stay inside {root}: {value!r}")
+    if not candidate.is_file():
+        raise ValueError(f"{label} not found: {candidate}")
+    return candidate
+
+
+def finite_values(value, count, label):
+    if not isinstance(value, (list, tuple)) or len(value) != count:
+        raise ValueError(f"{label} must contain {count} numbers")
+    try:
+        values = [float(item) for item in value]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} must contain {count} numbers") from exc
+    if not all(math.isfinite(item) for item in values):
+        raise ValueError(f"{label} must contain finite numbers")
+    return values
+
+
+def load_rgba(path):
+    """Load an image as a top-down float RGBA numpy array."""
+    import numpy as np
+
+    image = bpy.data.images.load(str(path), check_existing=False)
+    try:
+        width, height = (int(value) for value in image.size)
+        if width <= 0 or height <= 0:
+            raise ValueError(f"image has invalid dimensions: {path}")
+        pixels = np.array(image.pixels[:], dtype=np.float32)
+        rgba = pixels.reshape(height, width, 4)
+        return np.flipud(rgba).copy()
+    finally:
+        bpy.data.images.remove(image)
+
+
+def save_rgba(path, rgba):
+    """Save a top-down float RGBA numpy array without external imaging deps."""
+    import numpy as np
+
+    height, width, channels = rgba.shape
+    if channels != 4:
+        raise ValueError("save_rgba expects HxWx4 pixels")
+    image = bpy.data.images.new(
+        "ProcAgen3D_" + Path(path).stem, width=width, height=height, alpha=True)
+    try:
+        stored = np.flipud(np.clip(rgba, 0.0, 1.0)).astype(np.float32)
+        image.pixels = stored.ravel().tolist()
+        image.filepath_raw = str(path)
+        image.file_format = "PNG"
+        image.save()
+    finally:
+        bpy.data.images.remove(image)
+
+
+def save_mask(path, mask):
+    import numpy as np
+
+    value = mask.astype(np.float32)
+    rgba = np.empty((*value.shape, 4), dtype=np.float32)
+    rgba[..., :3] = value[..., None]
+    rgba[..., 3] = 1.0
+    save_rgba(path, rgba)
+
+
+def reference_mask(reference_rgba, config, out_dir):
+    """Return a foreground mask from alpha, a supplied mask, or border color."""
+    import numpy as np
+
+    source = str(config.get("source", "auto")).lower()
+    alpha_threshold = float(config.get("alpha_threshold", 0.5))
+    if not 0.0 <= alpha_threshold <= 1.0:
+        raise ValueError("mask.alpha_threshold must be within [0, 1]")
+    alpha = reference_rgba[..., 3]
+    has_transparency = bool(np.any(alpha < 0.98) and np.any(alpha > alpha_threshold))
+    if source == "auto":
+        source = "alpha" if has_transparency else "border"
+
+    if source == "alpha":
+        if not has_transparency:
+            raise ValueError(
+                "mask.source='alpha' requested but the reference has no useful alpha")
+        mask = alpha > alpha_threshold
+    elif source == "file":
+        mask_path = fit_path(out_dir, config.get("path"), "mask.path")
+        supplied = load_rgba(mask_path)
+        if supplied.shape[:2] != reference_rgba.shape[:2]:
+            raise ValueError(
+                f"mask dimensions {supplied.shape[1]}x{supplied.shape[0]} do not "
+                f"match reference {reference_rgba.shape[1]}x{reference_rgba.shape[0]}")
+        supplied_alpha = supplied[..., 3]
+        if np.any(supplied_alpha < 0.98):
+            mask = supplied_alpha > alpha_threshold
+        else:
+            luminance = supplied[..., :3].mean(axis=2)
+            mask = luminance > float(config.get("value_threshold", 0.5))
+    elif source == "border":
+        rgb = reference_rgba[..., :3]
+        height, width = rgb.shape[:2]
+        band = max(1, int(round(min(height, width) * 0.02)))
+        border = np.concatenate((
+            rgb[:band].reshape(-1, 3),
+            rgb[-band:].reshape(-1, 3),
+            rgb[:, :band].reshape(-1, 3),
+            rgb[:, -band:].reshape(-1, 3),
+        ), axis=0)
+        background = np.median(border, axis=0)
+        threshold = float(config.get("color_threshold", 0.08))
+        if not 0.0 < threshold <= math.sqrt(3.0):
+            raise ValueError("mask.color_threshold must be within (0, sqrt(3)]")
+        mask = np.linalg.norm(rgb - background, axis=2) > threshold
+    else:
+        raise ValueError("mask.source must be auto, alpha, border, or file")
+
+    if bool(config.get("invert", False)):
+        mask = ~mask
+    if not np.any(mask):
+        raise ValueError("reference foreground mask is empty")
+    if np.all(mask):
+        raise ValueError("reference foreground mask covers the entire image")
+    return mask, source
+
+
+def mask_observation(mask):
+    import numpy as np
+
+    ys, xs = np.nonzero(mask)
+    if not len(xs):
+        raise ValueError("foreground mask is empty")
+    height, width = mask.shape
+    bbox = [
+        float(xs.min()) / width,
+        float(ys.min()) / height,
+        float(xs.max() + 1) / width,
+        float(ys.max() + 1) / height,
+    ]
+    centroid = [
+        float((xs.astype(np.float64) + 0.5).mean()) / width,
+        float((ys.astype(np.float64) + 0.5).mean()) / height,
+    ]
+    return {
+        "bbox_uv": bbox,
+        "centroid_uv": centroid,
+        "area_fraction": float(mask.mean()),
+    }
+
+
+def bbox_iou(a, b):
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    inter = max(0.0, right - left) * max(0.0, bottom - top)
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 1e-12 else 0.0
+
+
+def fit_camera(scene, camera_config, width, height):
+    projection = str(camera_config.get("projection", "perspective")).lower()
+    if projection not in ("perspective", "orthographic"):
+        raise ValueError("camera.projection must be perspective or orthographic")
+    target = Vector(finite_values(
+        camera_config.get("target_m", [0, 0, 0]), 3, "camera.target_m"))
+    roll = float(camera_config.get("roll_deg", 0.0))
+    if not math.isfinite(roll):
+        raise ValueError("camera.roll_deg must be finite")
+
+    if "location_m" in camera_config:
+        location = Vector(finite_values(
+            camera_config["location_m"], 3, "camera.location_m"))
+        direction = location - target
+        distance = direction.length
+        if distance <= 1e-6:
+            raise ValueError("camera.location_m must differ from camera.target_m")
+        direction.normalize()
+    else:
+        azimuth = float(camera_config.get("azimuth_deg", 0.0))
+        elevation = float(camera_config.get("elevation_deg", 0.0))
+        distance = float(camera_config.get("distance_m", 0.0))
+        if not all(math.isfinite(value) for value in (azimuth, elevation, distance)):
+            raise ValueError("camera azimuth/elevation/distance must be finite")
+        if not -89.0 < elevation < 89.0:
+            raise ValueError("camera.elevation_deg must be within (-89, 89)")
+        if distance <= 0.0:
+            raise ValueError("camera.distance_m must be positive")
+        azimuth = math.radians(azimuth)
+        elevation = math.radians(elevation)
+        direction = Vector((
+            math.sin(azimuth) * math.cos(elevation),
+            -math.cos(azimuth) * math.cos(elevation),
+            math.sin(elevation),
+        )).normalized()
+        location = target + direction * distance
+
+    data = bpy.data.cameras.new("ProcAgen3D_FitCam")
+    camera = bpy.data.objects.new("ProcAgen3D_FitCam", data)
+    scene.collection.objects.link(camera)
+    scene.camera = camera
+    data.sensor_fit = "VERTICAL"
+    if projection == "perspective":
+        fov = float(camera_config.get("fov_y_deg", 0.0))
+        if not math.isfinite(fov) or not 5.0 <= fov <= 120.0:
+            raise ValueError("camera.fov_y_deg must be within [5, 120]")
+        data.type = "PERSP"
+        data.angle = math.radians(fov)
+    else:
+        scale = float(camera_config.get("ortho_scale_m", 0.0))
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("camera.ortho_scale_m must be positive")
+        data.type = "ORTHO"
+        data.ortho_scale = scale
+
+    data.shift_x = float(camera_config.get("shift_x", 0.0))
+    data.shift_y = float(camera_config.get("shift_y", 0.0))
+    if not all(math.isfinite(value) for value in (data.shift_x, data.shift_y)):
+        raise ValueError("camera shift values must be finite")
+    camera.location = location
+    look = (target - location).normalized()
+    base_rotation = look.to_track_quat("-Z", "Y")
+    roll_rotation = Quaternion(look, math.radians(roll))
+    camera.rotation_euler = (roll_rotation @ base_rotation).to_euler()
+    data.clip_start = max(1e-5, min(0.1, distance * 0.01))
+    data.clip_end = max(100.0, distance * 10.0)
+
+    scene.render.resolution_x = width
+    scene.render.resolution_y = height
+    scene.render.resolution_percentage = 100
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.film_transparent = True
+    scene.render.pixel_aspect_x = 1.0
+    scene.render.pixel_aspect_y = 1.0
+    return camera, {
+        "projection": projection,
+        "location_m": [float(value) for value in location],
+        "target_m": [float(value) for value in target],
+        "roll_deg": roll,
+        "shift_x": float(data.shift_x),
+        "shift_y": float(data.shift_y),
+        "resolution_px": [width, height],
+        **({"fov_y_deg": float(camera_config["fov_y_deg"])}
+           if projection == "perspective" else
+           {"ortho_scale_m": float(camera_config["ortho_scale_m"])}),
+    }
+
+
+def matched_geometry(scene, pattern):
+    matched = [obj for obj in scene.objects
+               if fnmatch.fnmatchcase(obj.name, pattern)]
+    if not matched:
+        raise ValueError(f"no object matches {pattern!r}")
+    meshes = []
+    seen = set()
+    stack = list(matched)
+    while stack:
+        obj = stack.pop()
+        if obj.name in seen:
+            continue
+        seen.add(obj.name)
+        if obj.type == "MESH" and not obj.hide_render:
+            meshes.append(obj)
+        stack.extend(obj.children)
+    return matched, meshes
+
+
+def project_world(scene, camera, point):
+    projected = world_to_camera_view(scene, camera, Vector(point))
+    return [float(projected.x), float(1.0 - projected.y)], float(projected.z)
+
+
+def projected_instance(scene, camera, dg, pattern):
+    matched, meshes = matched_geometry(scene, pattern)
+    if not meshes:
+        raise ValueError(f"{pattern!r} matches no renderable mesh geometry")
+    uv_points = []
+    world_lo, world_hi = union_bbox(meshes, dg)
+    for obj in meshes:
+        evaluated = obj.evaluated_get(dg)
+        mesh = evaluated.to_mesh()
+        try:
+            matrix = evaluated.matrix_world
+            for vertex in mesh.vertices:
+                uv, depth = project_world(scene, camera, matrix @ vertex.co)
+                if depth > 0.0:
+                    uv_points.append(uv)
+        finally:
+            evaluated.to_mesh_clear()
+    if not uv_points:
+        raise ValueError(f"{pattern!r} projects entirely behind the camera")
+    left = min(point[0] for point in uv_points)
+    top = min(point[1] for point in uv_points)
+    right = max(point[0] for point in uv_points)
+    bottom = max(point[1] for point in uv_points)
+    center_world = (world_lo + world_hi) / 2.0
+    center_uv, center_depth = project_world(scene, camera, center_world)
+    return {
+        "pattern": pattern,
+        "matches": [obj.name for obj in matched],
+        "bbox_uv": [left, top, right, bottom],
+        "centroid_uv": center_uv,
+        "camera_depth_m": center_depth,
+    }
+
+
+def bbox_anchor(bbox, anchor):
+    left, top, right, bottom = bbox
+    center_x, center_y = (left + right) / 2.0, (top + bottom) / 2.0
+    anchors = {
+        "bbox_center": [center_x, center_y],
+        "bbox_left": [left, center_y],
+        "bbox_right": [right, center_y],
+        "bbox_top": [center_x, top],
+        "bbox_bottom": [center_x, bottom],
+        "bbox_top_left": [left, top],
+        "bbox_top_right": [right, top],
+        "bbox_bottom_left": [left, bottom],
+        "bbox_bottom_right": [right, bottom],
+    }
+    if anchor not in anchors:
+        raise ValueError(
+            "landmark.anchor must be origin or bbox_center/left/right/top/bottom/corner")
+    return anchors[anchor]
+
+
+def landmark_uv(scene, camera, dg, entry):
+    if "world_point_m" in entry:
+        uv, depth = project_world(scene, camera, finite_values(
+            entry["world_point_m"], 3, "landmark.world_point_m"))
+        if depth <= 0.0:
+            raise ValueError("landmark.world_point_m projects behind the camera")
+        return uv
+    pattern = entry.get("pattern")
+    if not isinstance(pattern, str) or not pattern:
+        raise ValueError("landmark requires pattern or world_point_m")
+    anchor = str(entry.get("anchor", "origin"))
+    if anchor == "origin":
+        matched, _ = matched_geometry(scene, pattern)
+        if len(matched) != 1:
+            raise ValueError(
+                f"origin landmark pattern {pattern!r} matches {len(matched)} objects")
+        uv, depth = project_world(scene, camera, matched[0].matrix_world.translation)
+        if depth <= 0.0:
+            raise ValueError(f"landmark {pattern!r} projects behind the camera")
+        return uv
+    observation = projected_instance(scene, camera, dg, pattern)
+    return bbox_anchor(observation["bbox_uv"], anchor)
+
+
+def uv_distance(a, b, axis):
+    if axis == "x":
+        return abs(a[0] - b[0])
+    if axis == "y":
+        return abs(a[1] - b[1])
+    if axis != "distance":
+        raise ValueError("ratio.axis must be distance, x, or y")
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def fit_gate(gates, gate_id, kind, target, measured, passed, note=""):
+    gates.append({
+        "id": str(gate_id),
+        "kind": kind,
+        "target": target,
+        "measured": measured,
+        "pass": bool(passed),
+        "note": note,
+    })
+
+
+def draw_cross(image, uv, color, radius=4):
+    height, width = image.shape[:2]
+    x = int(round(uv[0] * (width - 1)))
+    y = int(round(uv[1] * (height - 1)))
+    if not (0 <= x < width and 0 <= y < height):
+        return
+    x0, x1 = max(0, x - radius), min(width, x + radius + 1)
+    y0, y1 = max(0, y - radius), min(height, y + radius + 1)
+    image[y, x0:x1, :3] = color
+    image[y0:y1, x, :3] = color
+
+
+def stage_fit(args):
+    import numpy as np
+
+    out_dir = Path(args.out).resolve()
+    blend = out_dir / "scene.blend"
+    spec_path = Path(args.spec).resolve()
+    renders_dir = out_dir / "renders"
+    renders_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / "fit_report.json"
+    artifact_names = (
+        "reference_match.png", "reference_overlay.png",
+        "reference_mask.png", "render_mask.png",
+    )
+    report_path.unlink(missing_ok=True)
+    for name in artifact_names:
+        (renders_dir / name).unlink(missing_ok=True)
+
+    base_report = {
+        "procagen3d_fit_version": 1,
+        "fit_spec": spec_path.name,
+        "passed": False,
+        "gates": [],
+    }
+    try:
+        if not blend.is_file():
+            raise ValueError(f"{blend} not found (run build first)")
+        if not spec_path.is_file():
+            raise ValueError(f"fit spec not found: {spec_path}")
+        spec = json.loads(spec_path.read_text())
+        if not isinstance(spec, dict) or spec.get("version") != 1:
+            raise ValueError("fit spec must be a JSON object with version: 1")
+        reference_path = fit_path(
+            out_dir, spec.get("reference_image"), "reference_image")
+        reference_rgba = load_rgba(reference_path)
+        height, width = reference_rgba.shape[:2]
+        input_hashes = {
+            "fit_spec_sha256": sha256_file(spec_path),
+            "reference_sha256": sha256_file(reference_path),
+            "scene_graph_sha256": sha256_file(out_dir / "scene_graph.json"),
+            "scene_blend_sha256": sha256_file(blend),
+        }
+
+        bpy.ops.wm.open_mainfile(filepath=str(blend))
+        setup_engine(bpy.context.scene, args.engine)
+        camera, normalized_camera = fit_camera(
+            bpy.context.scene, spec.get("camera", {}), width, height)
+        render_path = renders_dir / "reference_match.png"
+        bpy.context.scene.render.filepath = str(render_path)
+        bpy.ops.render.render(write_still=True)
+        rendered_rgba = load_rgba(render_path)
+        if rendered_rgba.shape[:2] != reference_rgba.shape[:2]:
+            raise ValueError("registered render dimensions do not match reference")
+
+        thresholds = spec.get("thresholds", {})
+        if not isinstance(thresholds, dict):
+            raise ValueError("thresholds must be an object")
+        gates = []
+        mask_config = spec.get("mask")
+        reference_fg = None
+        render_fg = rendered_rgba[..., 3] > 0.5
+        overlay = reference_rgba.copy()
+        overlay[..., 3] = 1.0
+        if mask_config is not None:
+            if not isinstance(mask_config, dict):
+                raise ValueError("mask must be an object")
+            reference_fg, mask_source = reference_mask(
+                reference_rgba, mask_config, out_dir)
+            if not np.any(render_fg):
+                raise ValueError("registered render mask is empty")
+            ref_obs = mask_observation(reference_fg)
+            render_obs = mask_observation(render_fg)
+            intersection = np.logical_and(reference_fg, render_fg).sum()
+            union = np.logical_or(reference_fg, render_fg).sum()
+            iou = float(intersection / union) if union else 0.0
+            bbox_error = max(abs(a - b) for a, b in zip(
+                ref_obs["bbox_uv"], render_obs["bbox_uv"]))
+            centroid_error = math.hypot(*(
+                ref_obs["centroid_uv"][index] - render_obs["centroid_uv"][index]
+                for index in range(2)))
+            area_ratio_error = abs(
+                render_obs["area_fraction"] / ref_obs["area_fraction"] - 1.0)
+            min_iou = float(mask_config.get(
+                "min_iou", thresholds.get("mask_min_iou", 0.70)))
+            max_bbox = float(mask_config.get(
+                "max_bbox_error", thresholds.get("bbox_max_error", 0.05)))
+            max_centroid = float(mask_config.get(
+                "max_centroid_error", thresholds.get("centroid_max_error", 0.04)))
+            max_area = float(mask_config.get(
+                "max_area_ratio_error", thresholds.get("area_ratio_max_error", 0.25)))
+            fit_gate(gates, "mask_iou", "mask", f">= {min_iou:.4f}",
+                     round(iou, 6), iou >= min_iou)
+            fit_gate(gates, "mask_bbox", "mask", f"<= {max_bbox:.4f}",
+                     round(bbox_error, 6), bbox_error <= max_bbox)
+            fit_gate(gates, "mask_centroid", "mask", f"<= {max_centroid:.4f}",
+                     round(centroid_error, 6), centroid_error <= max_centroid)
+            fit_gate(gates, "mask_area_ratio", "mask", f"<= {max_area:.4f}",
+                     round(area_ratio_error, 6), area_ratio_error <= max_area)
+            save_mask(renders_dir / "reference_mask.png", reference_fg)
+            save_mask(renders_dir / "render_mask.png", render_fg)
+            overlap = np.logical_and(reference_fg, render_fg)
+            reference_only = np.logical_and(reference_fg, ~render_fg)
+            render_only = np.logical_and(render_fg, ~reference_fg)
+            overlay[overlap, :3] = 0.45 * overlay[overlap, :3] + np.array(
+                [0.1, 0.9, 0.2], dtype=np.float32) * 0.55
+            overlay[reference_only, :3] = 0.35 * overlay[reference_only, :3] + np.array(
+                [1.0, 0.1, 0.1], dtype=np.float32) * 0.65
+            overlay[render_only, :3] = 0.35 * overlay[render_only, :3] + np.array(
+                [0.1, 0.35, 1.0], dtype=np.float32) * 0.65
+            base_report["mask"] = {
+                "source": mask_source,
+                "reference": ref_obs,
+                "render": render_obs,
+            }
+            if mask_source == "file":
+                supplied_mask_path = fit_path(
+                    out_dir, mask_config.get("path"), "mask.path")
+                input_hashes["mask_sha256"] = sha256_file(supplied_mask_path)
+                base_report["mask"]["path"] = supplied_mask_path.name
+
+        dg = depsgraph()
+        landmark_records = []
+        landmark_map = {}
+        default_landmark_error = float(thresholds.get("landmark_max_error", 0.04))
+        landmarks = spec.get("landmarks", [])
+        if not isinstance(landmarks, list):
+            raise ValueError("landmarks must be a list")
+        for index, entry in enumerate(landmarks):
+            if not isinstance(entry, dict):
+                raise ValueError(f"landmarks[{index}] must be an object")
+            landmark_id = str(entry.get("id", f"landmark_{index + 1}"))
+            if landmark_id in landmark_map:
+                raise ValueError(f"duplicate landmark id: {landmark_id}")
+            reference_uv = finite_values(
+                entry.get("reference_uv"), 2, f"landmark {landmark_id}.reference_uv")
+            try:
+                render_uv = landmark_uv(bpy.context.scene, camera, dg, entry)
+                error = math.hypot(
+                    reference_uv[0] - render_uv[0], reference_uv[1] - render_uv[1])
+                record = {
+                    "id": landmark_id,
+                    "reference_uv": reference_uv,
+                    "render_uv": render_uv,
+                    "error": error,
+                }
+                landmark_map[landmark_id] = record
+                if bool(entry.get("gate", True)):
+                    maximum = float(entry.get("max_error", default_landmark_error))
+                    fit_gate(gates, landmark_id, "landmark", f"<= {maximum:.4f}",
+                             round(error, 6), error <= maximum)
+                draw_cross(overlay, reference_uv, (1.0, 0.85, 0.05))
+                draw_cross(overlay, render_uv, (0.0, 0.95, 1.0))
+            except ValueError as exc:
+                record = {"id": landmark_id, "reference_uv": reference_uv,
+                          "error": str(exc)}
+                fit_gate(gates, landmark_id, "landmark", "resolvable",
+                         "unmeasurable", False, str(exc))
+            landmark_records.append(record)
+        base_report["landmarks"] = landmark_records
+
+        ratio_records = []
+        ratios = spec.get("ratios", [])
+        if not isinstance(ratios, list):
+            raise ValueError("ratios must be a list")
+        for index, entry in enumerate(ratios):
+            if not isinstance(entry, dict):
+                raise ValueError(f"ratios[{index}] must be an object")
+            ratio_id = str(entry.get("id", f"ratio_{index + 1}"))
+            numerator = entry.get("numerator")
+            denominator = entry.get("denominator")
+            try:
+                if (not isinstance(numerator, list) or len(numerator) != 2
+                        or not isinstance(denominator, list) or len(denominator) != 2):
+                    raise ValueError("numerator and denominator need two landmark ids")
+                points = [landmark_map.get(str(item))
+                          for item in numerator + denominator]
+                if any(point is None for point in points):
+                    raise ValueError("ratio references an unresolved landmark")
+                axis = str(entry.get("axis", "distance"))
+                ref_num = uv_distance(points[0]["reference_uv"],
+                                      points[1]["reference_uv"], axis)
+                ref_den = uv_distance(points[2]["reference_uv"],
+                                      points[3]["reference_uv"], axis)
+                got_num = uv_distance(points[0]["render_uv"],
+                                      points[1]["render_uv"], axis)
+                got_den = uv_distance(points[2]["render_uv"],
+                                      points[3]["render_uv"], axis)
+                if ref_den <= 1e-9 or got_den <= 1e-9 or ref_num <= 1e-9:
+                    raise ValueError("ratio contains a zero-length segment")
+                target_ratio = ref_num / ref_den
+                measured_ratio = got_num / got_den
+                relative_error = abs(measured_ratio / target_ratio - 1.0)
+                maximum = float(entry.get(
+                    "max_relative_error", thresholds.get("ratio_max_relative_error", 0.10)))
+                record = {
+                    "id": ratio_id,
+                    "target": target_ratio,
+                    "measured": measured_ratio,
+                    "relative_error": relative_error,
+                }
+                fit_gate(gates, ratio_id, "ratio", f"relative error <= {maximum:.4f}",
+                         round(relative_error, 6), relative_error <= maximum,
+                         f"target={target_ratio:.4f}, measured={measured_ratio:.4f}")
+            except ValueError as exc:
+                record = {"id": ratio_id, "error": str(exc)}
+                fit_gate(gates, ratio_id, "ratio", "measurable", "unmeasurable",
+                         False, str(exc))
+            ratio_records.append(record)
+        base_report["ratios"] = ratio_records
+
+        instance_records = []
+        instance_map = {}
+        instances = spec.get("instances", [])
+        if not isinstance(instances, list):
+            raise ValueError("instances must be a list")
+        for index, entry in enumerate(instances):
+            if not isinstance(entry, dict):
+                raise ValueError(f"instances[{index}] must be an object")
+            instance_id = str(entry.get("id", f"instance_{index + 1}"))
+            if instance_id in instance_map:
+                raise ValueError(f"duplicate instance id: {instance_id}")
+            pattern = entry.get("pattern")
+            reference_bbox = finite_values(
+                entry.get("reference_bbox_uv"), 4,
+                f"instance {instance_id}.reference_bbox_uv")
+            if reference_bbox[0] >= reference_bbox[2] or reference_bbox[1] >= reference_bbox[3]:
+                raise ValueError(f"instance {instance_id} has an invalid reference bbox")
+            reference_centroid = finite_values(
+                entry.get("reference_centroid_uv", [
+                    (reference_bbox[0] + reference_bbox[2]) / 2.0,
+                    (reference_bbox[1] + reference_bbox[3]) / 2.0,
+                ]), 2, f"instance {instance_id}.reference_centroid_uv")
+            try:
+                observation = projected_instance(
+                    bpy.context.scene, camera, dg, str(pattern))
+                observation.update({
+                    "id": instance_id,
+                    "reference_bbox_uv": reference_bbox,
+                    "reference_centroid_uv": reference_centroid,
+                })
+                bbox_error = max(abs(a - b) for a, b in zip(
+                    reference_bbox, observation["bbox_uv"]))
+                centroid_error = math.hypot(
+                    reference_centroid[0] - observation["centroid_uv"][0],
+                    reference_centroid[1] - observation["centroid_uv"][1])
+                observation["bbox_error"] = bbox_error
+                observation["centroid_error"] = centroid_error
+                max_bbox = float(entry.get(
+                    "max_bbox_error", thresholds.get("instance_bbox_max_error", 0.05)))
+                max_centroid = float(entry.get(
+                    "max_centroid_error", thresholds.get(
+                        "instance_centroid_max_error", 0.04)))
+                fit_gate(gates, f"{instance_id}.bbox", "instance",
+                         f"<= {max_bbox:.4f}", round(bbox_error, 6),
+                         bbox_error <= max_bbox)
+                fit_gate(gates, f"{instance_id}.centroid", "instance",
+                         f"<= {max_centroid:.4f}", round(centroid_error, 6),
+                         centroid_error <= max_centroid)
+                instance_map[instance_id] = observation
+            except ValueError as exc:
+                observation = {"id": instance_id, "pattern": pattern,
+                               "reference_bbox_uv": reference_bbox,
+                               "reference_centroid_uv": reference_centroid,
+                               "error": str(exc)}
+                fit_gate(gates, instance_id, "instance", "resolvable",
+                         "unmeasurable", False, str(exc))
+            instance_records.append(observation)
+        base_report["instances"] = instance_records
+
+        relation_records = []
+        relations = spec.get("relations", [])
+        if not isinstance(relations, list):
+            raise ValueError("relations must be a list")
+        for index, entry in enumerate(relations):
+            if not isinstance(entry, dict):
+                raise ValueError(f"relations[{index}] must be an object")
+            relation_id = str(entry.get("id", f"relation_{index + 1}"))
+            relation_type = str(entry.get("type", "relative_position"))
+            try:
+                if relation_type == "depth_order":
+                    front_id, behind_id = str(entry.get("front")), str(entry.get("behind"))
+                    front = instance_map.get(front_id)
+                    behind = instance_map.get(behind_id)
+                    if front is None or behind is None:
+                        raise ValueError("depth_order references an unresolved instance")
+                    margin = float(entry.get("min_margin_m", 0.0))
+                    measured = behind["camera_depth_m"] - front["camera_depth_m"]
+                    passed = measured > margin
+                    target = f"> {margin:.4f} m"
+                    note = f"{front_id} in front of {behind_id}"
+                else:
+                    a_id, b_id = str(entry.get("a")), str(entry.get("b"))
+                    a = instance_map.get(a_id)
+                    b = instance_map.get(b_id)
+                    if a is None or b is None:
+                        raise ValueError("relation references an unresolved instance")
+                    maximum = float(entry.get(
+                        "max_error", thresholds.get("relation_max_error", 0.05)))
+                    if relation_type == "relative_position":
+                        target_delta = [
+                            b["reference_centroid_uv"][axis]
+                            - a["reference_centroid_uv"][axis] for axis in range(2)]
+                        render_delta = [
+                            b["centroid_uv"][axis] - a["centroid_uv"][axis]
+                            for axis in range(2)]
+                        measured = math.hypot(
+                            target_delta[0] - render_delta[0],
+                            target_delta[1] - render_delta[1])
+                        note = f"target_delta={target_delta}, render_delta={render_delta}"
+                    elif relation_type == "bbox_iou":
+                        target_iou = bbox_iou(
+                            a["reference_bbox_uv"], b["reference_bbox_uv"])
+                        render_iou = bbox_iou(a["bbox_uv"], b["bbox_uv"])
+                        measured = abs(target_iou - render_iou)
+                        note = f"target_iou={target_iou:.4f}, render_iou={render_iou:.4f}"
+                    else:
+                        raise ValueError(
+                            "relation.type must be relative_position, bbox_iou, or depth_order")
+                    passed = measured <= maximum
+                    target = f"error <= {maximum:.4f}"
+                record = {
+                    "id": relation_id,
+                    "type": relation_type,
+                    "measured": measured,
+                    "pass": passed,
+                    "note": note,
+                }
+                fit_gate(gates, relation_id, "relation", target,
+                         round(measured, 6), passed, note)
+            except ValueError as exc:
+                record = {"id": relation_id, "type": relation_type,
+                          "error": str(exc)}
+                fit_gate(gates, relation_id, "relation", "measurable",
+                         "unmeasurable", False, str(exc))
+            relation_records.append(record)
+        base_report["relations"] = relation_records
+
+        if not gates:
+            raise ValueError(
+                "fit spec defines no gates; add mask, landmarks, instances, or relations")
+        save_rgba(renders_dir / "reference_overlay.png", overlay)
+        passed_count = sum(1 for gate in gates if gate["pass"])
+        base_report.update({
+            "reference_image": reference_path.name,
+            "camera": normalized_camera,
+            "gates": gates,
+            "summary": {
+                "passed": passed_count,
+                "total": len(gates),
+                "failures": len(gates) - passed_count,
+            },
+            "passed": passed_count == len(gates),
+            "inputs": input_hashes,
+        })
+        report_path.write_text(json.dumps(base_report, indent=2))
+        print(f"ProcAgen3D fit — {reference_path.name}")
+        for gate in gates:
+            verdict = "PASS" if gate["pass"] else "FAIL"
+            note = f"  ({gate['note']})" if gate.get("note") else ""
+            print(f"  {gate['id']:<28} target {str(gate['target']):<24} "
+                  f"measured {str(gate['measured']):>12}  {verdict}{note}")
+        print(f"  -> {passed_count}/{len(gates)} fit gates passed")
+        if passed_count != len(gates):
+            print(f"{FAIL}:REFERENCE_FIT] {len(gates) - passed_count} fit gate(s) failed")
+            finish(1)
+        print(f"{OK} registered reference fit passed; overlay -> "
+              f"{renders_dir / 'reference_overlay.png'}")
+        finish(0)
+    except Exception as exc:
+        base_report["error"] = str(exc)
+        report_path.write_text(json.dumps(base_report, indent=2))
+        print(f"{FAIL}:FIT_SPEC] {exc}")
+        finish(1)
+
+
 # ---------------------------------------------------------------- build stage
 
 BANNED_PATTERNS = [
@@ -771,12 +1546,19 @@ def main():
                           choices=["workbench", "eevee", "cycles"])
     p_render.add_argument("--form-diagnostics", action="store_true")
 
+    p_fit = sub.add_parser("fit")
+    p_fit.add_argument("--out", required=True)
+    p_fit.add_argument("--spec", required=True)
+    p_fit.add_argument("--engine", default="workbench",
+                       choices=["workbench", "eevee", "cycles"])
+
     p_joints = sub.add_parser("joints")
     p_joints.add_argument("--out", required=True)
     p_joints.add_argument("--strict", action="store_true")
 
     args = parser.parse_args(script_args())
-    {"build": stage_build, "render": stage_render, "joints": stage_joints}[args.stage](args)
+    {"build": stage_build, "render": stage_render, "fit": stage_fit,
+     "joints": stage_joints}[args.stage](args)
 
 
 if __name__ == "__main__":

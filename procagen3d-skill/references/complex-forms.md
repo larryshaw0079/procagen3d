@@ -69,8 +69,10 @@ mechanisms remain valid `assembled` structure in a mixed target.
 Do not infer a curve from adjectives. Measure a compact guide from the saved
 reference:
 
-1. Estimate the reference camera: projection, azimuth, elevation, and framing.
-   Put the projection and camera contract on the root:
+1. Estimate and register the full reference camera in `fit_spec.json` as
+   required by `image-fit.md`: projection, position/target (or
+   azimuth/elevation/distance), roll, FOV or orthographic scale, and image
+   shift. Optionally put the coarse three-value preview contract on the root:
 
    ```python
    root["procagen3d_reference_projection"] = "perspective"
@@ -78,10 +80,10 @@ reference:
    # Or: "orthographic" with [azimuth_deg, elevation_deg, ortho_scale_m].
    ```
 
-   Perspective is the default for backward compatibility. Azimuth must be
-   finite and within `[-360, 360]`, elevation within `(-89, 89)`, and FOV
-   within `[5, 120]`; orthographic scale must be positive. The harness emits
-   `renders/reference_match.png`. Mark the estimate approximate.
+   Treat that root property as a backward-compatible preview only: it
+   auto-centers the asset and cannot prove registration. Run `procagen3d fit`
+   for the scored `renders/reference_match.png`. Mark estimates approximate
+   until the registered mask/landmark gates pass.
 2. Trace 6–12 normalized `(u, v)` landmarks along each identity-bearing
    contour. Convert them to meters with one explicit image-to-world mapping.
 3. For a loft, choose a longitudinal axis and 5–12 stations. At each station

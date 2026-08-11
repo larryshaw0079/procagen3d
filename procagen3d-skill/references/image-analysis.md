@@ -1,11 +1,12 @@
 # Image analysis — agent-vision perception stage
 
-ProcAgen3D's perception stages (depth/normal/edge priors, ViT features, material
-verification) are replaced in this skill by *your* structured reading of the
-reference image. The outputs are unchanged copies of the used references at
-`<out>/reference_NN.<ext>` plus `<out>/priors.md`, all written **before any
-code**. Unstructured glancing produces fused parts and wrong proportions —
-the checklist below is the stage; do it in order, against the saved copies.
+Use structured agent vision for semantic judgment and registered image-fit
+gates for numeric projection evidence. Write unchanged reference copies,
+`<out>/priors.md`, and `<out>/fit_spec.json` **before any code**. Read
+`image-fit.md` completely and measure against the saved copies. Optional learned
+depth/normal/feature priors may supplement this stage later; they never replace
+the registered mask, landmark, ratio, and layout contract. Unstructured
+glancing produces fused parts and wrong proportions.
 
 ## 0. Preserve the inputs
 
@@ -43,7 +44,14 @@ Measure ratios off the image, not from memory: total height : width : depth;
 each major part's extent relative to the anchor. Describe the silhouette per
 visible view in words ("side view: two equal circles, centers ~1.6 wheel
 diameters apart; seat above rear wheel center"). Note characteristic angles
-(fork rake, roof slope, leg splay) in degrees.
+(fork rake, roof slope, leg splay) in degrees. Put 6–12 identity-bearing
+landmarks and the ratios between them in `fit_spec.json`; prose alone is not a
+measured prior.
+
+For a multi-object reference, add an instance table with normalized image
+bboxes/centroids and pairwise layout/depth relations. Do not collapse a scene
+to one overall bounding box or give every independent object the same facing
+direction. Details and schema: `image-fit.md`.
 
 ## 3b. Form blueprint (curved or mixed targets)
 
@@ -119,6 +127,7 @@ scale anchor: <part> = <value> m (<reason>)
 overall: H x W x D ≈ <..> m (front faces -Y)
 form profile: <rectilinear | curved | mixed>
 reference camera: <projection; azimuth, elevation; FOV or ortho-scale estimate>
+fit contract: fit_spec.json (registered camera, mask, landmarks/ratios, instances)
 
 ## references
 | saved copy | original source | notes |

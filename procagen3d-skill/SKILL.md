@@ -35,9 +35,11 @@ renders.
 Per asset, one directory (default `./procagen3d_out/<slug>/`, or where the user
 asks): `program.py` (the deliverable), `model.glb`, `scene.blend`,
 `scene_graph.json`, `diagnostics.json`, `renders/` (six canonical views +
-`sheet.png`; curved/mixed also `form_sheet.png` and optional
-`reference_match.png`), and when applicable `form_probe/`, `spec.yaml`, `joints_report.json`,
-`score_report.json`. Image-conditioned assets also contain `priors.md` and an
+`sheet.png`; curved/mixed also `form_sheet.png`), and when applicable
+`form_probe/`, `spec.yaml`, `joints_report.json`,
+`score_report.json`. Image-conditioned assets also contain `priors.md`,
+`fit_spec.json`, `fit_report.json`, registered `reference_match.png` and
+`reference_overlay.png`, scored reference/render masks, and an
 unaltered copy of every reference image used, named `reference_01.<ext>`,
 `reference_02.<ext>`, etc. in input order.
 
@@ -56,14 +58,17 @@ and block-built masses. Curved/mixed MUST read
 hard-surface object may still be form-dominant. If the request states any
 measurable requirement (counts, dimensions, symmetry, required joints),
 author `spec.yaml` now — MUST read `references/constraints.md` first. If a
-reference image is used, MUST read `references/image-analysis.md`. Before
+reference image is used, MUST read `references/image-analysis.md` and
+`references/image-fit.md`. Before
 analysis or code, create `<out>` and copy every used input image byte-for-byte
 to `<out>/reference_01.<ext>`, `<out>/reference_02.<ext>`, etc. in the order
 supplied, preserving each format/extension. Record the mapping from saved path
 to original filename, URL, or attachment label in `<out>/priors.md`; then Read
 the saved copies and complete the structured priors (showcase: including the
 §7 detail inventory + identity features; curved/mixed: the form blueprint and
-macro identity forms). If the runtime cannot expose the
+macro identity forms), then author `<out>/fit_spec.json` with the registered
+camera, whole-frame mask, 6–12 semantic landmarks and important ratios; add
+per-instance boxes and relations for multi-object references. If the runtime cannot expose the
 original bytes, save the highest-resolution representation available and mark
 that substitution in `priors.md`. Do not skip the copies or priors: together
 they are the reproducible perception input and stage.
@@ -90,6 +95,10 @@ identity/silhouette masses, `secondary` for supports and deliberately
 assembled structure), and set
 `root["procagen3d_form_profile"]`. A `continuous` mass may not route to a box,
 deformed box, or straight extrusion.
+Image-conditioned programs must also create semantic empty markers for
+identity landmarks whose part-bbox anchors are insufficient; marker names must
+match `fit_spec.json`, derive from the same named dimension constants as the
+geometry, and remain parented to the relevant assembly.
 
 **2 — Form gate (curved/mixed only).** Write `<out>/form_probe.py` with only
 primary masses, ground/contact parts, joint-center markers, and negative-space
@@ -127,6 +136,14 @@ count. Detail cannot be retrofitted through the repair budget.
 traceback, fix the program, and rebuild. Persistent same-error after two
 attempts → reconsider the approach instead of patching the same line again.
 
+**4a — Registered image fit (image-conditioned).** Run
+`procagen3d fit <out> --spec <out>/fit_spec.json`. It renders at the reference's
+exact resolution/aspect and declared camera, then scores mask IoU,
+bbox/centroid alignment, landmarks/ratios, and declared instance relations.
+Every fit gate MUST pass. Read `reference_overlay.png`, both masks, and
+`fit_report.json`; fix camera before geometry, then lock it. Never proceed on
+the legacy auto-centered preview alone.
+
 **5 — Deterministic gates.** Run
 `procagen3d check <out> --tier <tier> --form <profile>`. FAILs are doctrine or
 form-contract violations (unnamed parts, duplicate `.001` names, incompatible
@@ -136,11 +153,14 @@ or carry a one-line reason. `LOW_DETAIL`, `FORM_SECTIONS`, and
 `FORM_PRIMITIVES` are repair input at showcase and during the form probe;
 `FORM_MACRO_COVERAGE` is the hard gate against a token loft hiding a box-built
 body.
+For image-conditioned outputs, `check` also fails when fit evidence is missing,
+failed, or stale relative to the reference, fit spec, or scene graph.
 
 **6 — Inspect (your judgment).** Read `<out>/renders/sheet.png` — top row
 `front | right | iso`, bottom row `left | back | top`. Curved/mixed MUST also
 read `form_sheet.png`; image-conditioned runs with a camera contract MUST read
-`reference_match.png`. Write one line per aspect before deciding:
+`reference_match.png`, `reference_overlay.png`, and `fit_report.json`. Write one
+line per aspect before deciding:
 
 - **shape** — silhouette and construction correct in every useful view (not
   just front); watch for parts that only look right from one angle;
@@ -172,6 +192,8 @@ program as `<out>/program.iter<N>.py`, then run
 The guard MUST pass before rebuilding from step 4. Hard ceiling: **3 repair
 iterations** (build-error fixes included). If exhausted, keep the best
 successful intermediate and report honestly what remains wrong.
+Image-conditioned repairs must rerun `fit` after every rebuild; an older passing
+report is invalidated by the new scene graph.
 
 **8 — Articulation.** If the asset has joints: `procagen3d joints <out>`
 FAILs (bad type, missing child, pivot off the moving part, rest-pose drift)
@@ -193,21 +215,24 @@ faithfully from this input" is a valid outcome — say it instead of faking.
 ## Gates (do not skip)
 
 1. Image-conditioned: every reference image actually used is present at the
-   output root as `reference_NN.<ext>` and mapped in `priors.md` before code.
+   output root as `reference_NN.<ext>`, mapped in `priors.md`, and measured in
+   `fit_spec.json` before code.
 2. Curved/mixed: tagged form probe passes `check --form <profile>` and both
    probe sheets are Read before full synthesis; resolve `FORM_*` warnings and
    add no detail before form pass.
 3. Full `build` exit 0 before anything else proceeds.
-4. `check --tier <tier> --form <profile>` exit 0 before visual inspection;
+4. Image-conditioned: registered `fit` exit 0 after every full build; Read its
+   overlay, scored masks, and report.
+5. `check --tier <tier> --form <profile>` exit 0 before visual inspection;
    form/detail WARNs at showcase are repair input, not acceptable residue.
-5. `guard` pass between every full-program repair iteration — no exceptions.
-6. `sheet.png` actually Read; curved/mixed also `form_sheet.png`, and use
+6. `guard` pass between every full-program repair iteration — no exceptions.
+7. `sheet.png` actually Read; curved/mixed also `form_sheet.png`, and use
    `reference_match.png` whenever emitted.
-7. `joints` exit 0 whenever the design table declares a joint.
-8. `score` output quoted verbatim whenever a spec exists.
-9. Repair ceiling of 3 — on exhaustion, deliver best intermediate + honest
+8. `joints` exit 0 whenever the design table declares a joint.
+9. `score` output quoted verbatim whenever a spec exists.
+10. Repair ceiling of 3 — on exhaustion, deliver best intermediate + honest
    residuals, never a silent extra loop.
-10. Repairs preserve what passes: list the passing verdicts in the repair
+11. Repairs preserve what passes: list the passing verdicts in the repair
    note and do not regress them while fixing the failing one — a repair
    that trades a pass for a pass is a regression, revert it.
 

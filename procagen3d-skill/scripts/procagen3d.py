@@ -8,6 +8,7 @@ blender_stages.py running under Blender's bundled Python; everything else
 Subcommands:
     build      <program.py> --out DIR    build, export GLB, render views
     render     <dir>                     re-render canonical views
+    fit        <dir> --spec FILE         registered image-fit gates
     check      <dir>                     deterministic scene-graph gates
     joints     <dir>                     validate articulation (Blender)
     score      <dir> --spec FILE         measure constraints against spec
@@ -21,6 +22,7 @@ Exit code 0 = pass, 1 = at least one failure (read the printed reasons).
 import argparse
 import difflib
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -102,6 +104,21 @@ def cmd_render(args):
     return run_blender(stage, args.blender)
 
 
+def cmd_fit(args):
+    source = Path(args.spec)
+    if not source.is_file():
+        sys.exit(f"ProcAgen3D: fit spec not found: {source}")
+    out = Path(args.dir)
+    if not (out / "scene.blend").is_file():
+        sys.exit(f"ProcAgen3D: {out / 'scene.blend'} not found (run build first)")
+    kept = out / "fit_spec.json"
+    if source.resolve() != kept.resolve():
+        shutil.copyfile(source, kept)
+    stage = ["fit", "--out", str(out), "--spec", str(kept),
+             "--engine", args.engine]
+    return run_blender(stage, args.blender)
+
+
 def cmd_joints(args):
     stage = ["joints", "--out", args.dir]
     if args.strict:
@@ -116,6 +133,68 @@ def load_graph(dir_path):
     if not path.exists():
         sys.exit(f"ProcAgen3D: {path} not found (run build first)")
     return json.loads(path.read_text())
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def image_fit_errors(dir_path):
+    """Validate required, passing, hash-bound fit evidence for image inputs."""
+    root = Path(dir_path)
+    references = sorted(root.glob("reference_[0-9][0-9].*"))
+    if not references:
+        return []
+    spec_path = root / "fit_spec.json"
+    report_path = root / "fit_report.json"
+    errors = []
+    if not spec_path.is_file():
+        errors.append("fit_spec.json missing")
+    if not report_path.is_file():
+        errors.append("fit_report.json missing (run `procagen3d fit`)")
+    if errors:
+        return errors
+    try:
+        spec = json.loads(spec_path.read_text())
+        report = json.loads(report_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"invalid fit evidence JSON: {exc}"]
+    reference_name = spec.get("reference_image")
+    reference_path = root / reference_name if isinstance(reference_name, str) else None
+    if reference_path is None or not reference_path.is_file():
+        errors.append(f"fit reference is missing: {reference_name!r}")
+    if not report.get("passed"):
+        summary = report.get("summary", {})
+        errors.append(
+            f"registered fit did not pass ({summary.get('passed', 0)}/"
+            f"{summary.get('total', '?')} gates)")
+    inputs = report.get("inputs")
+    if not isinstance(inputs, dict):
+        errors.append("fit report has no input hashes")
+        return errors
+    expected = {
+        "fit_spec_sha256": spec_path,
+        "scene_graph_sha256": root / "scene_graph.json",
+        "scene_blend_sha256": root / "scene.blend",
+    }
+    if reference_path is not None and reference_path.is_file():
+        expected["reference_sha256"] = reference_path
+    mask = spec.get("mask")
+    if isinstance(mask, dict) and str(mask.get("source", "auto")).lower() == "file":
+        mask_name = mask.get("path")
+        mask_path = root / mask_name if isinstance(mask_name, str) else None
+        if mask_path is None or not mask_path.is_file():
+            errors.append(f"fit mask is missing: {mask_name!r}")
+        else:
+            expected["mask_sha256"] = mask_path
+    for key, path in expected.items():
+        if inputs.get(key) != sha256_file(path):
+            errors.append(f"stale fit evidence: {key} does not match {path.name}")
+    return errors
 
 
 def children_map(graph):
@@ -212,6 +291,11 @@ def cmd_check(args):
     objs = graph["objects"]
     meshes = [o for o in objs if o["type"] == "MESH"]
     failures = 0
+
+    fit_errors = image_fit_errors(args.dir)
+    if fit_errors:
+        failures += 1
+        fail("REFERENCE_FIT", "; ".join(fit_errors))
 
     root_names = set(graph.get("roots") or [])
     if not root_names:
@@ -895,6 +979,14 @@ def main():
     p.add_argument("--form-diagnostics", action="store_true",
                    help="also render a neutral clay six-view form sheet")
     p.set_defaults(func=cmd_render)
+
+    p = sub.add_parser("fit", help="render and score a registered reference fit")
+    p.add_argument("dir")
+    p.add_argument("--spec", required=True,
+                   help="fit_spec.json (copied into the asset directory)")
+    p.add_argument("--engine", default="workbench",
+                   choices=["workbench", "eevee", "cycles"])
+    p.set_defaults(func=cmd_fit)
 
     p = sub.add_parser("check", help="deterministic scene-graph gates")
     p.add_argument("dir")

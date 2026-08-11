@@ -7,8 +7,9 @@ Claude Code, Codex, and compatible agent runtimes.
 The agent plays the paper's generator ℳθ: it writes an executable Blender
 Python program (named parts, real transform tree, joints with limits,
 dimensions as constants); headless Blender compiles it to a GLB. A
-deterministic harness enforces the paper's pipeline — build → gates →
-canonical renders → agent-vision inspection → guarded repair loop (≤3) →
+deterministic harness enforces the paper's pipeline — build + canonical
+renders → registered image-fit gates → deterministic checks → agent-vision
+inspection → guarded repair loop (≤3) →
 articulation validation → constraint scoring — while the agent's judgment
 does design and visual review.
 
@@ -18,11 +19,12 @@ does design and visual review.
 procagen3d-skill/
 ├── SKILL.md                  # entry point — the staged loop and gates
 ├── scripts/
-│   ├── procagen3d.py             # driver + stdlib gates (check/score/guard/edit-gates)
-│   └── blender_stages.py     # bpy-side: build, render, joints (runs inside Blender)
+│   ├── procagen3d.py         # driver + stdlib gates (fit/check/score/guard/edit-gates)
+│   └── blender_stages.py     # bpy-side: build, render, fit, joints (runs inside Blender)
 ├── references/               # routed depth, read on demand from SKILL.md
 │   ├── doctrine.md           # representation doctrine + canonical helpers
 │   ├── image-analysis.md     # agent-vision perception stage
+│   ├── image-fit.md          # registered camera/mask/landmark/layout contract
 │   ├── complex-forms.md      # loft/sweep/shell routing + shape-first probe
 │   ├── detail.md             # tier floors + decomposition recipes
 │   ├── articulation.md       # joint schema + validator semantics
@@ -60,6 +62,7 @@ point the agent at `SKILL.md`.
 
 ```sh
 python3 scripts/procagen3d.py build program.py --out out/ --form-diagnostics  # curved/mixed
+python3 scripts/procagen3d.py fit out/ --spec out/fit_spec.json               # image-conditioned
 python3 scripts/procagen3d.py check out/ --tier showcase --form auto
 python3 scripts/procagen3d.py joints out/                   # articulation validation
 python3 scripts/procagen3d.py score out/ --spec spec.yaml   # constraint scoring
@@ -71,9 +74,9 @@ python3 scripts/procagen3d.py render out/ --engine eevee    # re-render (beauty 
 Exit 0 = pass, 1 = failure with printed `[PROCAGEN3D:FAIL:*]` reasons.
 Image-conditioned runs also retain each used input at the output root as
 `reference_01.<ext>`, `reference_02.<ext>`, etc., with provenance recorded in
-`priors.md`. Curved/mixed runs add a neutral clay `form_sheet.png`, may emit a
-declared-camera `reference_match.png`, and use a shape-only probe before the
-full detail build.
+`priors.md`. They also retain `fit_spec.json`, a hash-bound `fit_report.json`,
+registered reference render/overlay, and scored masks. Curved/mixed runs add a
+neutral clay `form_sheet.png` and use a shape-only probe before the full build.
 
 ## Design notes
 
@@ -87,7 +90,6 @@ install). The curved-form route also adapts img2threejs's topology-before-
 primitive and anti-cardboard lessons plus
 [build-web-3d-models](https://github.com/giraffe-tree/build-web-3d-models)'
 form-first loft/sweep/surface practice. The implementation is original Blender
-Python rather than copied project code. Perception is agent vision by design —
-the paper's learned depth/normal/edge priors are replaced by a structured
-image-analysis checklist (`references/image-analysis.md`), keeping the skill
-offline and dependency-free.
+Python rather than copied project code. Semantic perception remains agent
+vision, while visible projection is enforced by the dependency-free registered
+camera, mask, landmark, ratio, and layout gates in `references/image-fit.md`.
