@@ -1,4 +1,4 @@
-# Blender pitfalls — headless bpy traps (Blender 4.x)
+# Blender pitfalls — headless bpy traps (Blender 4.5 / 5.2)
 
 Every trap below is from a real failure mode. Read before writing bpy code;
 revisit when a build error or a weird render doesn't make sense.
@@ -25,23 +25,33 @@ widths, exports). Size via op parameters (`radius=`, `depth=`) or set
 
 ```python
 obj.dimensions = (0.4, 0.3, 0.25)
-bpy.ops.object.transform_apply(scale=True)   # acts on selected+active: do it right after add
+apply_transform(obj, location=False, rotation=False, scale=True)
 ```
 
-`check` warns `UNAPPLIED_SCALE` on |scale−1| > 1e-3.
+Import `apply_transform` from `procagen3d_runtime`. If a direct operator call
+is genuinely needed, spell every channel explicitly:
+
+```python
+bpy.ops.object.transform_apply(
+    location=False,
+    rotation=False,
+    scale=True,
+)
+```
+
+`procagen3d lint` and `build` fail before Blender starts when a direct call
+omits any of those flags. `check` warns `UNAPPLIED_SCALE` on |scale−1| >
+1e-3.
 
 ## Trap 3 — naive parenting moves the child
 
 `child.parent = p` keeps the child's *local* matrix, so it jumps by p's
-transform. Always use the doctrine helper:
+transform. Import and use the canonical runtime helper:
 
 ```python
-def reparent_keep_world(obj, new_parent):
-    bpy.context.view_layer.update()
-    mw = obj.matrix_world.copy()
-    obj.parent = new_parent
-    bpy.context.view_layer.update()
-    obj.matrix_world = mw
+from procagen3d_runtime import reparent_keep_world
+
+reparent_keep_world(child, parent)
 ```
 
 ## Trap 4 — stale matrix_world

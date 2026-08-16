@@ -44,13 +44,9 @@ volume, and identity forms; use `secondary` for supports, contacts, and
 deliberately assembled structure:
 
 ```python
-def mark_form(obj, role, topology, method, section_count=None):
-    obj["procagen3d_form_role"] = role          # primary | secondary
-    obj["procagen3d_topology"] = topology      # table above
-    obj["procagen3d_form_method"] = method     # checker vocabulary below
-    if section_count is not None:
-        obj["procagen3d_section_count"] = int(section_count)
-    return obj
+from procagen3d_runtime import mark_form
+
+mark_form(body, "primary", "continuous", "loft", section_count=8)
 ```
 
 Use these exact method values: `loft`, `sweep`, `revolve`, `subdivision`,
@@ -143,6 +139,11 @@ Prefer compact parametric rings, profiles, and grids. Keep ring point counts
 consistent and winding consistent. Inspect cap winding, outward normals,
 non-manifold edges, and end seams in the first probe.
 
+Import `loft_rings`, `sweep_profile`, and `revolve_profile` from
+`procagen3d_runtime`; do not copy or improvise their mesh-construction bodies.
+The build freezes the tested implementation into the delivered `program.py`.
+The asset source should contain only the semantic control points and calls.
+
 ### Variable-section loft
 
 Use for bodies, hulls, fairings, fenders, torsos, thighs, shins, forearms, and
@@ -150,44 +151,16 @@ asymmetric housings. Supply equal-count closed rings in world/local XYZ,
 ordered consistently around the section.
 
 ```python
-def loft_rings(name, rings, mat, *, cap=True, subdivision=0,
-               role="primary", topology="continuous"):
-    rings = [[Vector(point) for point in ring] for ring in rings]
-    if len(rings) < 2 or len(rings[0]) < 3:
-        raise ValueError("loft needs at least 2 rings with 3 points each")
-    ring_size = len(rings[0])
-    if any(len(ring) != ring_size for ring in rings):
-        raise ValueError("all loft rings must have equal point counts")
+from procagen3d_runtime import loft_rings
 
-    verts = [tuple(point) for ring in rings for point in ring]
-    faces = []
-    for row in range(len(rings) - 1):
-        a0, b0 = row * ring_size, (row + 1) * ring_size
-        for col in range(ring_size):
-            nxt = (col + 1) % ring_size
-            faces.append((a0 + col, a0 + nxt, b0 + nxt, b0 + col))
-    if cap:
-        faces.append(tuple(reversed(range(ring_size))))
-        last = (len(rings) - 1) * ring_size
-        faces.append(tuple(last + col for col in range(ring_size)))
-
-    mesh = bpy.data.meshes.new(name + "_Mesh")
-    mesh.from_pydata(verts, [], faces)
-    mesh.validate(verbose=True)
-    mesh.update(calc_edges=True)
-    obj = bpy.data.objects.new(name, mesh)
-    bpy.context.scene.collection.objects.link(obj)
-    obj.data.materials.append(mat)
-    for polygon in mesh.polygons:
-        polygon.use_smooth = True
-    if subdivision:
-        mod = obj.modifiers.new("Form_Subdivision", "SUBSURF")
-        mod.subdivision_type = "CATMULL_CLARK"
-        mod.levels = subdivision
-        mod.render_levels = subdivision
-    mark_form(obj, role, topology, "loft", len(rings))
-    obj["procagen3d_ring_points"] = ring_size
-    return obj
+body = loft_rings(
+    "Body",
+    BODY_RINGS,
+    body_material,
+    subdivision=1,
+    role="primary",
+    topology="continuous",
+)
 ```
 
 Start with 5–12 rings and 8–24 points per ring. Add support rings near a hard
@@ -198,38 +171,21 @@ place the authored cage to compensate, or use denser interpolated rings with
 ### Varying-profile sweep
 
 Use for a horn, intake lip, curved rail, tapered cable, organic limb core, or
-other form organized around a spine. Reuse `loft_rings` after constructing a
-parallel-transport frame; do not use a constant circular bevel for a section
-that visibly changes.
+other form organized around a spine. The runtime constructs a
+parallel-transport frame and reuses its tested loft implementation; do not use
+a constant circular bevel for a section that visibly changes.
 
 ```python
-def sweep_profile(name, spine, profile, scales, mat, *, role="primary"):
-    spine = [Vector(point) for point in spine]
-    if len(spine) < 2 or len(scales) != len(spine):
-        raise ValueError("sweep needs matching spine and scale stations")
-    tangents = []
-    for i in range(len(spine)):
-        before = spine[max(0, i - 1)]
-        after = spine[min(len(spine) - 1, i + 1)]
-        tangents.append((after - before).normalized())
+from procagen3d_runtime import sweep_profile
 
-    reference = Vector((0, 0, 1))
-    if abs(tangents[0].dot(reference)) > 0.95:
-        reference = Vector((1, 0, 0))
-    normal = (reference - tangents[0] * reference.dot(tangents[0])).normalized()
-    rings = []
-    previous = tangents[0]
-    for center, tangent, scale in zip(spine, tangents, scales):
-        normal = previous.rotation_difference(tangent) @ normal
-        normal = (normal - tangent * normal.dot(tangent)).normalized()
-        binormal = tangent.cross(normal).normalized()
-        sx, sy = ((scale, scale) if isinstance(scale, (int, float)) else scale)
-        rings.append([center + normal * (u * sx) + binormal * (v * sy)
-                      for u, v in profile])
-        previous = tangent
-    obj = loft_rings(name, rings, mat, role=role, topology="continuous")
-    mark_form(obj, role, "continuous", "sweep", len(rings))
-    return obj
+horn = sweep_profile(
+    "Horn",
+    HORN_SPINE,
+    HORN_PROFILE,
+    HORN_SCALES,
+    horn_material,
+    role="primary",
+)
 ```
 
 Order `profile` consistently; use 8–16 points for visible oval/polygon

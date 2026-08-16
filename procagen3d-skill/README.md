@@ -1,6 +1,6 @@
 # procagen3d-skill
 
-**Version:** 0.1.0 — see the repository [update log](../README.md#update-log).
+**Version:** 0.1.1 — see the repository [update log](../README.md#update-log).
 
 An agent skill implementing **ProcAgen3D: Code-Native Generation of Programmable
 3D Assets** ([arXiv:2607.22738](https://arxiv.org/abs/2607.22738)) for
@@ -20,13 +20,15 @@ does design and visual review.
 ```
 procagen3d-skill/
 ├── SKILL.md                  # entry point — the staged loop and gates
+├── runtime/
+│   └── procagen3d_runtime.py # versioned API vendored into program.py
 ├── scripts/
 │   ├── procagen3d.py         # CLI entry: argparse + dispatch
 │   ├── blender_stages.py     # Blender entry: invoked by the driver
-│   ├── harness/              # stdlib gates (check, score, guard, edit-gates, …)
+│   ├── harness/              # stdlib gates (lint, check, guard, score, …)
 │   └── bpy_stages/           # bpy-side stages (build, render, fit, joints)
 ├── references/               # routed depth, read on demand from SKILL.md
-│   ├── doctrine.md           # representation doctrine + canonical helpers
+│   ├── doctrine.md           # representation doctrine + canonical runtime
 │   ├── image-analysis.md     # agent-vision perception stage
 │   ├── image-fit.md          # registered camera/mask/landmark/layout contract
 │   ├── complex-forms.md      # loft/sweep/shell routing + shape-first probe
@@ -41,7 +43,7 @@ procagen3d-skill/
 
 ## Requirements
 
-- **Blender 4.x** (tested on 4.5 LTS). Discovery order: `--blender` flag →
+- **Blender 4.5 LTS or 5.2**. Discovery order: `--blender` flag →
   `$PROCAGEN3D_BLENDER` → `blender` on PATH → `~/.cache/procagen3d/*/blender`.
 - **Python 3.10+** for the driver. No pip packages — scripts are stdlib
   only; Blender stages use Blender's bundled Python.
@@ -65,6 +67,7 @@ point the agent at `SKILL.md`.
 ## CLI (used by the agent, usable by hand)
 
 ```sh
+python3 scripts/procagen3d.py lint program.py   # source safety + runtime import gate
 python3 scripts/procagen3d.py build program.py --out out/ --form-diagnostics  # curved/mixed
 python3 scripts/procagen3d.py fit out/ --spec out/fit_spec.json               # image-conditioned
 python3 scripts/procagen3d.py check out/ --tier showcase --form auto
@@ -76,6 +79,11 @@ python3 scripts/procagen3d.py render out/ --engine eevee    # re-render (beauty 
 ```
 
 Exit 0 = pass, 1 = failure with printed `[PROCAGEN3D:FAIL:*]` reasons.
+Authoring programs can import selected helpers from `procagen3d_runtime`.
+`build` freezes the tested runtime source into the retained `out/program.py`,
+so the deliverable has no external module dependency. Direct
+`bpy.ops.object.transform_apply` calls fail source validation unless all of
+`location=`, `rotation=`, and `scale=` are explicit.
 Image-conditioned runs also retain each used input at the output root as
 `reference_01.<ext>`, `reference_02.<ext>`, etc., with provenance recorded in
 `priors.md`. They also retain `fit_spec.json`, a hash-bound `fit_report.json`,

@@ -6,6 +6,7 @@ blender_stages.py running under Blender's bundled Python; everything else
 (check/score/guard/edit-gates) runs under plain python3.
 
 Subcommands:
+    lint       <program.py>              source safety and runtime-import gate
     build      <program.py> --out DIR    build, export GLB, render views
     render     <dir>                     re-render canonical views
     fit        <dir> --spec FILE         registered image-fit gates
@@ -31,6 +32,7 @@ from harness.blender import cmd_build, cmd_fit, cmd_joints, cmd_render
 from harness.check import cmd_check
 from harness.edit_gates import cmd_edit_gates
 from harness.guard import cmd_guard
+from harness.program_source import cmd_lint
 from harness.score import cmd_score
 
 
@@ -39,6 +41,10 @@ def main():
         prog="procagen3d", description="ProcAgen3D code-native 3D asset pipeline")
     parser.add_argument("--blender", help="path to blender executable")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("lint", help="validate program source without Blender")
+    p.add_argument("program")
+    p.set_defaults(func=cmd_lint)
 
     p = sub.add_parser("build", help="build program, export GLB, render views")
     p.add_argument("program")

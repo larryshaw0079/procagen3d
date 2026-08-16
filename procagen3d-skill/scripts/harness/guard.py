@@ -4,6 +4,7 @@ import difflib
 import re
 from pathlib import Path
 
+from .program_source import lint_program_source, report_source_issues
 from .tags import OK, fail, warn
 
 
@@ -14,6 +15,11 @@ def cmd_guard(args):
     old = Path(args.old).read_text()
     new = Path(args.new).read_text()
     failures = 0
+
+    source_issues = lint_program_source(new, args.new)
+    if source_issues:
+        report_source_issues(source_issues, args.new)
+        failures += len(source_issues)
 
     if "def build(" not in new:
         failures += 1

@@ -1,6 +1,6 @@
 # ProcAgen3D
 
-**Version:** 0.1.0
+**Version:** 0.1.1
 
 Code-native generation of programmable 3D assets, implemented as an agent
 skill for Claude Code, Codex, and compatible runtimes.
@@ -130,6 +130,7 @@ projection offline.
 procagen3d/
 ├── procagen3d-skill/     # the skill — see its README for full docs
 │   ├── SKILL.md          # entry point: the staged loop and gates
+│   ├── runtime/          # versioned helpers frozen into delivered programs
 │   ├── scripts/          # driver + Blender-side stages
 │   ├── references/       # routed depth docs (doctrine, joints, edits, …)
 │   └── examples/         # bench-style items: L1_stool, L2_bicycle, L3_robot_arm
@@ -138,7 +139,7 @@ procagen3d/
 
 ## Requirements
 
-- **Blender 4.x** (tested on 4.5 LTS), found via `--blender` flag →
+- **Blender 4.5 LTS or 5.2**, found via `--blender` flag →
   `$PROCAGEN3D_BLENDER` → PATH → `~/.cache/procagen3d/*/blender`.
 - **Python 3.10+**. No pip packages — the harness is stdlib only, and
   Blender stages run under Blender's bundled Python.
@@ -146,6 +147,16 @@ procagen3d/
 ## Update log
 
 Entries are newest first.
+
+### 0.1.1 — 2026-08-16
+
+- Added a versioned canonical modeling runtime that `build` vendors into the
+  retained, self-contained `program.py`; existing standalone programs remain
+  compatible.
+- Added the stdlib-only `lint` gate and made builds/repair guards fail closed
+  on ambiguous `bpy.ops.object.transform_apply` calls before Blender starts.
+- Replaced the unsafe scale-only transform example with explicit transform
+  flags and added source/runtime regression coverage.
 
 ### 0.1.0 — 2026-08-11
 

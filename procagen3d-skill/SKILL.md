@@ -21,7 +21,7 @@ renders.
 
 ## Requirements
 
-- Blender 4.x. Resolved in order: `--blender` flag → `$PROCAGEN3D_BLENDER` →
+- Blender 4.5 LTS or 5.2. Resolved in order: `--blender` flag → `$PROCAGEN3D_BLENDER` →
   `blender` on PATH → `~/.cache/procagen3d/*/blender`. Nothing else to install:
   Blender stages run under Blender's bundled Python; everything else is
   Python 3.10+ stdlib.
@@ -119,9 +119,12 @@ accepted form constants and builders into the full program. Details:
 
 **3 — Synthesize.** Write `<out>/<slug>.py`: constants → one
 `build_<part>()` per part → `build()` assembling the transform tree, joints
-via the canonical `add_joint` helper, materials by part meaning. The program
-must be self-contained (runnable in bare Blender) and deterministic; it must
-not render, export, or touch files/network — the harness does that. Choose
+via the canonical `add_joint` helper, materials by part meaning. Import needed
+helpers explicitly from `procagen3d_runtime`; `build` vendors that versioned
+runtime into the retained, self-contained `<out>/program.py`. Legacy programs
+that already define their helpers remain supported. The program must be
+deterministic; it must not render, export, or touch files/network — the harness
+does that. Choose
 geometry by the form table: primitive CSG for assembled solids; profile
 extrusion for intentional facets; loft/sweep/revolve/subdivision/grid for
 continuous or shell forms; modifiers for edge treatment and instanced arrays
@@ -131,7 +134,8 @@ median ~490 LOC; vehicles often run 100–340 parts. A showcase draft under
 too coarse, but never fragment an accepted continuous surface to inflate the
 count. Detail cannot be retrofitted through the repair budget.
 
-**4 — Build.** Run `procagen3d build <out>/<slug>.py --out <out>`; add
+**4 — Build.** Run `procagen3d lint <out>/<slug>.py`, then
+`procagen3d build <out>/<slug>.py --out <out>`; add
 `--form-diagnostics` for curved/mixed. On `PROCAGEN3D_BUILD_ERROR`, read the
 traceback, fix the program, and rebuild. Persistent same-error after two
 attempts → reconsider the approach instead of patching the same line again.

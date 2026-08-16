@@ -7,6 +7,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .program_source import (
+    ProgramSourceError,
+    freeze_program_source,
+    lint_program_source,
+    report_source_issues,
+)
+from .tags import fail
+
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -45,14 +53,28 @@ def run_blender(stage_args, blender=None):
 
 def cmd_build(args):
     program = Path(args.program)
-    if not program.exists():
-        sys.exit(f"ProcAgen3D: program not found: {program}")
+    if not program.is_file():
+        fail("PROGRAM_NOT_FOUND", str(program))
+        return 1
+    source = program.read_text(encoding="utf-8")
+    source_issues = lint_program_source(source, program)
+    if source_issues:
+        return report_source_issues(source_issues, program)
+    try:
+        kept_source = freeze_program_source(source, program)
+    except ProgramSourceError as exc:
+        fail("PROGRAM_RUNTIME", str(exc))
+        return 1
+    frozen_issues = lint_program_source(kept_source, program)
+    if frozen_issues:
+        return report_source_issues(frozen_issues, program)
+
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     kept = out / "program.py"
-    if program.resolve() != kept.resolve():
-        shutil.copyfile(program, kept)
-    stage = ["build", "--program", str(program), "--out", str(out),
+    if program.resolve() != kept.resolve() or kept_source != source:
+        kept.write_text(kept_source, encoding="utf-8")
+    stage = ["build", "--program", str(kept), "--out", str(out),
              "--size", str(args.size), "--engine", args.engine]
     if args.no_render:
         stage.append("--no-render")

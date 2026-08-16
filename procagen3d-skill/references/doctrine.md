@@ -9,7 +9,8 @@ is on you. Violations found by gates are never acceptable residue.
 - Defines `def build()` that constructs the whole scene into the (empty)
   current scene and returns the root object. Ends with
   `if __name__ == "__main__": build()` so it also runs in bare Blender.
-- Pure `bpy` / `bmesh` / `mathutils` / `math`. No rendering, no export, no
+- Pure `bpy` / `bmesh` / `mathutils` / `math`, plus the authoring-only
+  `procagen3d_runtime` import described below. No rendering, no export, no
   file/network I/O, no `subprocess` — the harness owns execution (these are
   flagged as `[PROCAGEN3D:WARN:PROGRAM]`).
 - Deterministic: no unseeded randomness. If organic variation is wanted,
@@ -71,72 +72,42 @@ A small set of physically based families assigned by part meaning (Wood,
 PaintedSteel, Rubber, Glass, Brass...), not per-mesh one-offs. Reuse via the
 helper; keep 3–8 materials per asset.
 
-## Canonical helpers (paste into every program)
+## Canonical modeling runtime
 
-These are tested against Blender 4.5 headless. Take what the program needs;
-`add_joint` and `reparent_keep_world` are required verbatim whenever joints
-or parenting are used — the validators rely on their conventions.
+Do not rewrite basic modeling helpers in every asset. Import the tested,
+versioned authoring API explicitly:
 
 ```python
-import math
-
 import bpy
 from mathutils import Vector
-
-
-def make_material(name, color, roughness=0.6, metallic=0.0):
-    mat = bpy.data.materials.get(name)
-    if mat is None:
-        mat = bpy.data.materials.new(name)
-        mat.use_nodes = True
-        bsdf = mat.node_tree.nodes["Principled BSDF"]
-        bsdf.inputs["Base Color"].default_value = (*color, 1.0)
-        bsdf.inputs["Roughness"].default_value = roughness
-        bsdf.inputs["Metallic"].default_value = metallic
-        mat.diffuse_color = (*color, 1.0)   # workbench/viewport color
-    return mat
-
-
-def box(name, size, location, mat):
-    """Axis-aligned box with applied scale (avoids the unapplied-scale trap)."""
-    bpy.ops.mesh.primitive_cube_add(size=1, location=location)
-    obj = bpy.context.object
-    obj.name = name
-    obj.dimensions = size
-    bpy.ops.object.transform_apply(scale=True)
-    obj.data.materials.append(mat)
-    return obj
-
-
-def reparent_keep_world(obj, new_parent):
-    """Parent without moving the child (bpy default parenting shifts it)."""
-    bpy.context.view_layer.update()
-    mw = obj.matrix_world.copy()
-    obj.parent = new_parent
-    bpy.context.view_layer.update()
-    obj.matrix_world = mw
-
-
-def add_joint(name, parent, child, jtype, axis, limits=None, origin=None):
-    """ProcAgen3D joint: an empty at the pivot; re-parents parent <- joint <- child
-    preserving world transforms. jtype: 'revolute' | 'prismatic' | 'fixed'.
-    axis: world-space at rest pose. limits: [lo, hi] in degrees (revolute)
-    or meters (prismatic)."""
-    j = bpy.data.objects.new(name, None)
-    j.empty_display_type = "ARROWS"
-    j.empty_display_size = 0.05
-    bpy.context.scene.collection.objects.link(j)
-    j.location = origin if origin is not None else child.matrix_world.translation
-    j["procagen3d_joint_type"] = jtype
-    j["procagen3d_joint_axis"] = list(axis)
-    if limits is not None:
-        j["procagen3d_joint_limits"] = list(limits)
-    j["procagen3d_joint_child"] = child.name
-    j["procagen3d_joint_parent"] = parent.name if parent else ""
-    reparent_keep_world(j, parent)
-    reparent_keep_world(child, j)
-    return j
+from procagen3d_runtime import (
+    add_joint,
+    apply_transform,
+    box,
+    cylinder_between,
+    ellipsoid,
+    loft_rings,
+    make_material,
+    mark_form,
+    new_group,
+    reparent_keep_world,
+    revolve_profile,
+    sweep_profile,
+)
 ```
+
+`procagen3d build` replaces that module-scope import with the canonical runtime
+source and retains the frozen result as `<out>/program.py`. The delivered
+program is therefore self-contained and runnable in bare Blender; the shorter
+authoring source remains easy to generate and review. Existing self-contained
+programs remain supported.
+
+Run `procagen3d lint <source.py>` before an expensive build. A direct
+`bpy.ops.object.transform_apply` call is accepted only when `location=`,
+`rotation=`, and `scale=` are all present. Prefer `apply_transform(obj,
+location=False, rotation=False, scale=True)`, which also makes `obj` the sole
+active selection. This gate prevents positioned mesh data from being baked
+around the world origin by Blender's omitted `location=True` default.
 
 ## Program skeleton
 
@@ -150,13 +121,12 @@ import math
 
 import bpy
 from mathutils import Vector
+from procagen3d_runtime import box, make_material, reparent_keep_world
 
 # --- constants (meters) ---
 SEAT_HEIGHT = 0.45
 LEG_COUNT = 3
 # ... every load-bearing dimension ...
-
-# --- canonical helpers here ---
 
 def build_seat(mat):
     ...
