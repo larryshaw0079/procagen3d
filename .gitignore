@@ -11,6 +11,10 @@ wheels/
 
 uv.lock
 
+# Third-party dependencies
+third-party/
+benchmark/
+
 # ProcAgen3D skill outputs
 procagen3d_out/
 assets/*

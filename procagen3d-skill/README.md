@@ -21,8 +21,10 @@ does design and visual review.
 procagen3d-skill/
 ├── SKILL.md                  # entry point — the staged loop and gates
 ├── scripts/
-│   ├── procagen3d.py         # driver + stdlib gates (fit/check/score/guard/edit-gates)
-│   └── blender_stages.py     # bpy-side: build, render, fit, joints (runs inside Blender)
+│   ├── procagen3d.py         # CLI entry: argparse + dispatch
+│   ├── blender_stages.py     # Blender entry: invoked by the driver
+│   ├── harness/              # stdlib gates (check, score, guard, edit-gates, …)
+│   └── bpy_stages/           # bpy-side stages (build, render, fit, joints)
 ├── references/               # routed depth, read on demand from SKILL.md
 │   ├── doctrine.md           # representation doctrine + canonical helpers
 │   ├── image-analysis.md     # agent-vision perception stage
