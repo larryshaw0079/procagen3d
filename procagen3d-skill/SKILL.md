@@ -56,7 +56,7 @@ asks): `program.py` (the deliverable), `model.glb`, `scene.blend`,
 `intake.md`, `design.md`, `form_probe/`, `spec.yaml`, `joints_report.json`,
 `score_report.json`. Image-conditioned assets also contain `priors.md`,
 `fit_spec.json`, `fit_report.json`, registered `reference_match.png` and
-`reference_overlay.png`, scored reference/render masks, and an
+`reference_overlay.png`, suite-scored reference/render masks, and an
 unaltered copy of every reference image used, named `reference_01.<ext>`,
 `reference_02.<ext>`, etc. in input order.
 
@@ -88,8 +88,9 @@ to original filename, URL, or attachment label in `<out>/priors.md`; then Read
 the saved copies and complete the structured priors (showcase: including the
 §7 detail inventory + identity features; curved/mixed: the form blueprint and
 macro identity forms), then author `<out>/fit_spec.json` with the registered
-camera, whole-frame mask, 6–12 semantic landmarks and important ratios; add
-per-instance boxes and relations for multi-object references. If the runtime cannot expose the
+camera, registered mask metric suite, 6–12 semantic landmarks and important
+ratios; add per-instance boxes and relations for multi-object references. If
+the runtime cannot expose the
 original bytes, save the highest-resolution representation available and mark
 that substitution in `priors.md`. Do not skip the copies or priors: together
 they are the reproducible perception input and stage.
@@ -168,11 +169,15 @@ attempts → reconsider the approach instead of patching the same line again.
 
 **4a — Registered image fit (image-conditioned).** Run
 `procagen3d fit <out> --spec <out>/fit_spec.json`. It renders at the reference's
-exact resolution/aspect and declared camera, then scores mask IoU,
-bbox/centroid alignment, landmarks/ratios, and declared instance relations.
-Every fit gate MUST pass. Read `reference_overlay.png`, both masks, and
-`fit_report.json`; fix camera before geometry, then lock it. Never proceed on
-the legacy auto-centered preview alone.
+exact resolution/aspect and declared camera, then independently gates mask
+IoU/precision/recall, contour F1/Chamfer/p95, regional mean/p10/occupancy,
+bbox/centroid/area, landmarks/ratios, and declared instance relations. Every
+blocking fit gate MUST pass; an uncertain mask may be diagnostic only when a
+semantic landmark/ratio/instance/relation gate still blocks. Read
+`reference_overlay.png`, both masks, and `fit_report.json`; fix camera before
+geometry, then lock it. Never proceed on the legacy auto-centered preview
+alone, lower thresholds past the safety envelope, or accept a version-1 fit
+report.
 
 **5 — Deterministic gates.** Run
 `procagen3d check <out> --tier <tier> --form <profile>`. FAILs are doctrine or

@@ -23,17 +23,29 @@ from .fit_measure import (
     reference_mask,
     uv_distance,
 )
+from .mask_metrics import measure_grid_suite, resolve_metric_config
 from .render import setup_engine
-from .runtime import FAIL, OK, depsgraph, finish
+from .runtime import FAIL, OK, WARN, depsgraph, finish
 
 
-def fit_gate(gates, gate_id, kind, target, measured, passed, note=""):
+def fit_gate(
+    gates,
+    gate_id,
+    kind,
+    target,
+    measured,
+    passed,
+    note="",
+    *,
+    blocking=True,
+):
     gates.append({
         "id": str(gate_id),
         "kind": kind,
         "target": target,
         "measured": measured,
         "pass": bool(passed),
+        "blocking": bool(blocking),
         "note": note,
     })
 
@@ -48,6 +60,31 @@ def draw_cross(image, uv, color, radius=4):
     y0, y1 = max(0, y - radius), min(height, y + radius + 1)
     image[y, x0:x1, :3] = color
     image[y0:y1, x, :3] = color
+
+
+def mask_metric_grid(mask, maximum_resolution):
+    """Return an aspect-preserving max-pooled byte grid for local metrics."""
+    import numpy as np
+
+    height, width = mask.shape
+    if width < 2 or height < 2:
+        raise ValueError("mask metric suite requires images at least 2x2 pixels")
+    scale = min(1.0, float(maximum_resolution) / max(width, height))
+    target_width = max(2, int(round(width * scale)))
+    target_height = max(2, int(round(height * scale)))
+    if (target_width, target_height) == (width, height):
+        sampled = np.ascontiguousarray(mask, dtype=np.uint8)
+        return sampled.tobytes(), width, height
+
+    # Blockwise OR pooling keeps narrow silhouette features visible. Reducing
+    # one axis at a time avoids a full-resolution integral-image allocation.
+    source = np.asarray(mask, dtype=bool)
+    x0 = np.floor(np.arange(target_width) * width / target_width).astype(int)
+    y0 = np.floor(np.arange(target_height) * height / target_height).astype(int)
+    pooled_rows = np.logical_or.reduceat(source, y0, axis=0)
+    sampled = np.logical_or.reduceat(pooled_rows, x0, axis=1)
+    sampled = np.ascontiguousarray(sampled, dtype=np.uint8)
+    return sampled.tobytes(), target_width, target_height
 
 
 def stage_fit(args):
@@ -68,7 +105,7 @@ def stage_fit(args):
         (renders_dir / name).unlink(missing_ok=True)
 
     base_report = {
-        "procagen3d_fit_version": 1,
+        "procagen3d_fit_version": 2,
         "fit_spec": spec_path.name,
         "passed": False,
         "gates": [],
@@ -79,8 +116,11 @@ def stage_fit(args):
         if not spec_path.is_file():
             raise ValueError(f"fit spec not found: {spec_path}")
         spec = json.loads(spec_path.read_text())
-        if not isinstance(spec, dict) or spec.get("version") != 1:
-            raise ValueError("fit spec must be a JSON object with version: 1")
+        if not isinstance(spec, dict) or type(spec.get("version")) is not int:
+            raise ValueError("fit spec must be a JSON object with version: 1 or 2")
+        if spec["version"] not in (1, 2):
+            raise ValueError("fit spec version must be 1 or 2")
+        base_report["fit_spec_version"] = spec["version"]
         reference_path = fit_path(
             out_dir, spec.get("reference_image"), "reference_image")
         reference_rgba = load_rgba(reference_path)
@@ -108,66 +148,126 @@ def stage_fit(args):
             raise ValueError("thresholds must be an object")
         gates = []
         mask_config = spec.get("mask")
-        reference_fg = None
+        if not isinstance(mask_config, dict):
+            raise ValueError("mask must be an object; registered fit requires a mask")
         render_fg = rendered_rgba[..., 3] > 0.5
         overlay = reference_rgba.copy()
         overlay[..., 3] = 1.0
-        if mask_config is not None:
-            if not isinstance(mask_config, dict):
-                raise ValueError("mask must be an object")
-            reference_fg, mask_source = reference_mask(
-                reference_rgba, mask_config, out_dir)
-            if not np.any(render_fg):
-                raise ValueError("registered render mask is empty")
-            ref_obs = mask_observation(reference_fg)
-            render_obs = mask_observation(render_fg)
-            intersection = np.logical_and(reference_fg, render_fg).sum()
-            union = np.logical_or(reference_fg, render_fg).sum()
-            iou = float(intersection / union) if union else 0.0
-            bbox_error = max(abs(a - b) for a, b in zip(
-                ref_obs["bbox_uv"], render_obs["bbox_uv"]))
-            centroid_error = math.hypot(*(
-                ref_obs["centroid_uv"][index] - render_obs["centroid_uv"][index]
-                for index in range(2)))
-            area_ratio_error = abs(
-                render_obs["area_fraction"] / ref_obs["area_fraction"] - 1.0)
-            min_iou = float(mask_config.get(
-                "min_iou", thresholds.get("mask_min_iou", 0.70)))
-            max_bbox = float(mask_config.get(
-                "max_bbox_error", thresholds.get("bbox_max_error", 0.05)))
-            max_centroid = float(mask_config.get(
-                "max_centroid_error", thresholds.get("centroid_max_error", 0.04)))
-            max_area = float(mask_config.get(
-                "max_area_ratio_error", thresholds.get("area_ratio_max_error", 0.25)))
-            fit_gate(gates, "mask_iou", "mask", f">= {min_iou:.4f}",
-                     round(iou, 6), iou >= min_iou)
-            fit_gate(gates, "mask_bbox", "mask", f"<= {max_bbox:.4f}",
-                     round(bbox_error, 6), bbox_error <= max_bbox)
-            fit_gate(gates, "mask_centroid", "mask", f"<= {max_centroid:.4f}",
-                     round(centroid_error, 6), centroid_error <= max_centroid)
-            fit_gate(gates, "mask_area_ratio", "mask", f"<= {max_area:.4f}",
-                     round(area_ratio_error, 6), area_ratio_error <= max_area)
-            save_mask(renders_dir / "reference_mask.png", reference_fg)
-            save_mask(renders_dir / "render_mask.png", render_fg)
-            overlap = np.logical_and(reference_fg, render_fg)
-            reference_only = np.logical_and(reference_fg, ~render_fg)
-            render_only = np.logical_and(render_fg, ~reference_fg)
-            overlay[overlap, :3] = 0.45 * overlay[overlap, :3] + np.array(
-                [0.1, 0.9, 0.2], dtype=np.float32) * 0.55
-            overlay[reference_only, :3] = 0.35 * overlay[reference_only, :3] + np.array(
-                [1.0, 0.1, 0.1], dtype=np.float32) * 0.65
-            overlay[render_only, :3] = 0.35 * overlay[render_only, :3] + np.array(
-                [0.1, 0.35, 1.0], dtype=np.float32) * 0.65
-            base_report["mask"] = {
-                "source": mask_source,
-                "reference": ref_obs,
-                "render": render_obs,
-            }
-            if mask_source == "file":
-                supplied_mask_path = fit_path(
-                    out_dir, mask_config.get("path"), "mask.path")
-                input_hashes["mask_sha256"] = sha256_file(supplied_mask_path)
-                base_report["mask"]["path"] = supplied_mask_path.name
+        reference_fg, mask_source = reference_mask(
+            reference_rgba, mask_config, out_dir)
+        if not np.any(render_fg):
+            raise ValueError("registered render mask is empty")
+        ref_obs = mask_observation(reference_fg)
+        render_obs = mask_observation(render_fg)
+        reference_area = int(np.count_nonzero(reference_fg))
+        render_area = int(np.count_nonzero(render_fg))
+        intersection = int(np.logical_and(reference_fg, render_fg).sum())
+        union = int(np.logical_or(reference_fg, render_fg).sum())
+        iou = intersection / union if union else 0.0
+        precision = intersection / render_area if render_area else 0.0
+        recall = intersection / reference_area if reference_area else 0.0
+        dice = 2.0 * intersection / (reference_area + render_area)
+        bbox_error = max(abs(a - b) for a, b in zip(
+            ref_obs["bbox_uv"], render_obs["bbox_uv"]))
+        centroid_error = math.hypot(*(
+            ref_obs["centroid_uv"][index] - render_obs["centroid_uv"][index]
+            for index in range(2)))
+        area_ratio_error = abs(
+            render_obs["area_fraction"] / ref_obs["area_fraction"] - 1.0)
+
+        metric_config = resolve_metric_config(mask_config, thresholds)
+        effective = metric_config["effective"]
+        reference_grid, grid_width, grid_height = mask_metric_grid(
+            reference_fg, effective["resolution"])
+        render_grid, render_grid_width, render_grid_height = mask_metric_grid(
+            render_fg, effective["resolution"])
+        if (render_grid_width, render_grid_height) != (grid_width, grid_height):
+            raise ValueError("mask metric grids do not have matching dimensions")
+        sampled_suite = measure_grid_suite(
+            reference_grid,
+            render_grid,
+            grid_width,
+            grid_height,
+            boundary_tolerance_uv=effective["boundary_tolerance_uv"],
+            grid_size=effective["grid_size"],
+            min_region_coverage=effective["min_region_coverage"],
+        )
+        boundary = sampled_suite["boundary"]
+        regional = sampled_suite["regional"]
+        mask_blocking = metric_config["mode"] == "gate"
+        mask_note = "" if mask_blocking else "diagnostic mask mode"
+        metric_gates = (
+            ("mask_iou", iou, "min_iou", ">="),
+            ("mask_precision", precision, "min_precision", ">="),
+            ("mask_recall", recall, "min_recall", ">="),
+            ("mask_boundary_f1", boundary["f1"], "min_boundary_f1", ">="),
+            ("mask_boundary_chamfer", boundary["chamfer_uv"],
+             "max_boundary_chamfer", "<="),
+            ("mask_boundary_p95", boundary["p95_uv"],
+             "max_boundary_p95", "<="),
+            ("mask_regional_iou_mean", regional["iou_mean"],
+             "min_regional_iou_mean", ">="),
+            ("mask_regional_iou_p10", regional["iou_p10"],
+             "min_regional_iou_p10", ">="),
+            ("mask_regional_occupancy", regional["occupancy_error_max"],
+             "max_regional_occupancy_error", "<="),
+            ("mask_bbox", bbox_error, "max_bbox_error", "<="),
+            ("mask_centroid", centroid_error, "max_centroid_error", "<="),
+            ("mask_area_ratio", area_ratio_error,
+             "max_area_ratio_error", "<="),
+        )
+        for gate_id, measured, config_key, operator in metric_gates:
+            target = effective[config_key]
+            passed = measured >= target if operator == ">=" else measured <= target
+            fit_gate(
+                gates,
+                gate_id,
+                "mask",
+                f"{operator} {target:.4f}",
+                round(measured, 6),
+                passed,
+                mask_note,
+                blocking=mask_blocking,
+            )
+
+        save_mask(renders_dir / "reference_mask.png", reference_fg)
+        save_mask(renders_dir / "render_mask.png", render_fg)
+        overlap = np.logical_and(reference_fg, render_fg)
+        reference_only = np.logical_and(reference_fg, ~render_fg)
+        render_only = np.logical_and(render_fg, ~reference_fg)
+        overlay[overlap, :3] = 0.45 * overlay[overlap, :3] + np.array(
+            [0.1, 0.9, 0.2], dtype=np.float32) * 0.55
+        overlay[reference_only, :3] = 0.35 * overlay[reference_only, :3] + np.array(
+            [1.0, 0.1, 0.1], dtype=np.float32) * 0.65
+        overlay[render_only, :3] = 0.35 * overlay[render_only, :3] + np.array(
+            [0.1, 0.35, 1.0], dtype=np.float32) * 0.65
+        base_report["mask"] = {
+            "source": mask_source,
+            "reference": ref_obs,
+            "render": render_obs,
+            "metric_suite": {
+                **metric_config,
+                "global": {
+                    "reference_pixels": reference_area,
+                    "render_pixels": render_area,
+                    "intersection_pixels": intersection,
+                    "union_pixels": union,
+                    "iou": iou,
+                    "precision": precision,
+                    "recall": recall,
+                    "dice": dice,
+                    "bbox_error": bbox_error,
+                    "centroid_error": centroid_error,
+                    "area_ratio_error": area_ratio_error,
+                },
+                "sampled": sampled_suite,
+            },
+        }
+        if mask_source == "file":
+            supplied_mask_path = fit_path(
+                out_dir, mask_config.get("path"), "mask.path")
+            input_hashes["mask_sha256"] = sha256_file(supplied_mask_path)
+            base_report["mask"]["path"] = supplied_mask_path.name
 
         dg = depsgraph()
         landmark_records = []
@@ -386,33 +486,59 @@ def stage_fit(args):
             relation_records.append(record)
         base_report["relations"] = relation_records
 
-        if not gates:
+        blocking_gates = [gate for gate in gates if gate["blocking"]]
+        diagnostic_gates = [gate for gate in gates if not gate["blocking"]]
+        if not blocking_gates:
             raise ValueError(
-                "fit spec defines no gates; add mask, landmarks, instances, or relations")
+                "fit spec defines no blocking gates; a diagnostic mask must be "
+                "paired with a gated landmark, ratio, instance, or relation")
         save_rgba(renders_dir / "reference_overlay.png", overlay)
-        passed_count = sum(1 for gate in gates if gate["pass"])
+        passed_count = sum(1 for gate in blocking_gates if gate["pass"])
+        diagnostic_passed = sum(1 for gate in diagnostic_gates if gate["pass"])
         base_report.update({
             "reference_image": reference_path.name,
             "camera": normalized_camera,
             "gates": gates,
             "summary": {
                 "passed": passed_count,
-                "total": len(gates),
-                "failures": len(gates) - passed_count,
+                "total": len(blocking_gates),
+                "failures": len(blocking_gates) - passed_count,
+                "diagnostics": {
+                    "passed": diagnostic_passed,
+                    "total": len(diagnostic_gates),
+                    "failures": len(diagnostic_gates) - diagnostic_passed,
+                },
             },
-            "passed": passed_count == len(gates),
+            "passed": passed_count == len(blocking_gates),
             "inputs": input_hashes,
         })
         report_path.write_text(json.dumps(base_report, indent=2))
         print(f"ProcAgen3D fit — {reference_path.name}")
+        for adjustment in metric_config["adjustments"]:
+            print(
+                f"{WARN}:FIT_THRESHOLD] mask.metrics.{adjustment['field']} "
+                f"adjusted from {adjustment['requested']} to "
+                f"{adjustment['effective']} ({adjustment['reason']})"
+            )
         for gate in gates:
-            verdict = "PASS" if gate["pass"] else "FAIL"
+            if gate["blocking"]:
+                verdict = "PASS" if gate["pass"] else "FAIL"
+            else:
+                verdict = "DIAG-PASS" if gate["pass"] else "DIAG-FAIL"
             note = f"  ({gate['note']})" if gate.get("note") else ""
             print(f"  {gate['id']:<28} target {str(gate['target']):<24} "
                   f"measured {str(gate['measured']):>12}  {verdict}{note}")
-        print(f"  -> {passed_count}/{len(gates)} fit gates passed")
-        if passed_count != len(gates):
-            print(f"{FAIL}:REFERENCE_FIT] {len(gates) - passed_count} fit gate(s) failed")
+        print(f"  -> {passed_count}/{len(blocking_gates)} blocking fit gates passed")
+        if diagnostic_gates:
+            print(
+                f"  -> {diagnostic_passed}/{len(diagnostic_gates)} "
+                "diagnostic metrics passed"
+            )
+        if passed_count != len(blocking_gates):
+            print(
+                f"{FAIL}:REFERENCE_FIT] "
+                f"{len(blocking_gates) - passed_count} blocking fit gate(s) failed"
+            )
             finish(1)
         print(f"{OK} registered reference fit passed; overlay -> "
               f"{renders_dir / 'reference_overlay.png'}")

@@ -127,7 +127,8 @@ scale anchor: <part> = <value> m (<reason>)
 overall: H x W x D ≈ <..> m (front faces -Y)
 form profile: <rectilinear | curved | mixed>
 reference camera: <projection; azimuth, elevation; FOV or ortho-scale estimate>
-fit contract: fit_spec.json (registered camera, mask, landmarks/ratios, instances)
+fit contract: fit_spec.json (registered camera, mask metric suite,
+landmarks/ratios, instances)
 
 ## references
 | saved copy | original source | notes |

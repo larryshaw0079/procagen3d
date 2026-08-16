@@ -2,8 +2,10 @@
 
 Use this reference for every image-conditioned asset. Convert visible evidence
 into `fit_spec.json`, render through the declared camera, and make the numeric
-fit pass after every full build and before accepting the asset. Treat the fit
-as proof of visible projection only; it cannot verify hidden geometry.
+fit pass after every full build and before accepting the asset. The mask proof
+is a suite of independent global, contour, regional, and framing metrics—not a
+single permissive silhouette score. Treat the fit as proof of visible
+projection only; it cannot verify hidden geometry.
 
 ## Contents
 
@@ -15,17 +17,17 @@ as proof of visible projection only; it cannot verify hidden geometry.
 
 ## 1. Author the contract
 
-Write `<out>/fit_spec.json` before geometry code. Use JSON `version: 1` and
+Write `<out>/fit_spec.json` before geometry code. Use JSON `version: 2` and
 paths relative to `<out>`. Use normalized image coordinates `[u, v]` with
 top-left `(0, 0)` and bottom-right `(1, 1)`. Keep image-derived targets here;
 keep explicit user requirements in `spec.yaml`.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "reference_image": "reference_01.png",
   "camera": {},
-  "mask": {},
+  "mask": {"source": "auto", "mode": "gate", "metrics": {}},
   "landmarks": [],
   "ratios": [],
   "instances": [],
@@ -36,6 +38,9 @@ keep explicit user requirements in `spec.yaml`.
 Measure coordinates against the preserved reference copy, not a screenshot or
 resized preview. Record ambiguous evidence in `priors.md`; do not tighten a
 threshold to pretend uncertain evidence is exact.
+
+Version-1 specs remain readable for migration, but every rerun uses the metric
+suite and emits a version-2 report. Author and retain version 2 for new work.
 
 ## 2. Register the camera and mask
 
@@ -73,17 +78,80 @@ Choose one foreground-mask source:
 "mask": {
   "source": "auto",
   "color_threshold": 0.08,
-  "min_iou": 0.75,
-  "max_bbox_error": 0.04,
-  "max_centroid_error": 0.03,
-  "max_area_ratio_error": 0.20
+  "mode": "gate",
+  "metrics": {
+    "resolution": 256,
+    "grid_size": 4,
+    "min_region_coverage": 0.005,
+    "boundary_tolerance_uv": 0.012,
+    "min_iou": 0.75,
+    "min_precision": 0.80,
+    "min_recall": 0.80,
+    "min_boundary_f1": 0.75,
+    "max_boundary_chamfer": 0.015,
+    "max_boundary_p95": 0.040,
+    "min_regional_iou_mean": 0.58,
+    "min_regional_iou_p10": 0.25,
+    "max_regional_occupancy_error": 0.18,
+    "max_bbox_error": 0.04,
+    "max_centroid_error": 0.03,
+    "max_area_ratio_error": 0.20
+  }
 }
 ```
 
 Use a supplied mask for textured or nonuniform backgrounds. Border estimation
-is appropriate only for clean product renders. Defaults are deliberately
-lenient (`IoU 0.70`, bbox `0.05`, centroid `0.04`, area-ratio error `0.25`);
-calibrate stricter values from representative references.
+is appropriate only for clean product renders. `color_threshold` applies only
+to border extraction and is ignored for `file`; it is shown above to keep the
+source controls distinct from `metrics`.
+
+The suite creates one gate per signal. No weighted average can rescue a failed
+signal:
+
+- exact full-resolution IoU, foreground precision, and foreground recall catch
+  both overfill and underfill;
+- boundary F1 uses the declared normalized tolerance, while symmetric boundary
+  Chamfer and the bidirectional p95 distance expose contour drift and local
+  outliers;
+- grid-region mean IoU, p10 IoU, and maximum occupancy error expose moved or
+  missing local masses that whole-mask statistics hide;
+- bbox, centroid, and area-ratio errors retain framing and scale coverage;
+- connected-component and hole-count deltas are reported as topology
+  diagnostics, not brittle pass/fail gates.
+
+Global metrics run on the exact masks. Contour, regional, and topology metrics
+run on an aspect-preserving, max-pooled grid capped by `resolution`. The report
+retains every region and the three worst active regions for repair targeting.
+
+Gate-mode overrides may tighten the defaults. Attempts to weaken them past the
+following safety envelope are clamped, recorded under
+`mask.metric_suite.adjustments`, and printed as warnings:
+
+| setting | default | weakest gate-mode value |
+|---|---:|---:|
+| `resolution` | 256 | minimum 192 |
+| `grid_size` | 4 | minimum 4 |
+| `min_region_coverage` | 0.005 | maximum 0.010 |
+| `boundary_tolerance_uv` | 0.012 | maximum 0.020 |
+| `min_iou` | 0.75 | minimum 0.70 |
+| `min_precision`, `min_recall` | 0.80 | minimum 0.75 |
+| `min_boundary_f1` | 0.75 | minimum 0.65 |
+| `max_boundary_chamfer` | 0.015 | maximum 0.025 |
+| `max_boundary_p95` | 0.040 | maximum 0.060 |
+| `min_regional_iou_mean` | 0.58 | minimum 0.48 |
+| `min_regional_iou_p10` | 0.25 | minimum 0.10 |
+| `max_regional_occupancy_error` | 0.18 | maximum 0.30 |
+| `max_bbox_error` | 0.04 | maximum 0.06 |
+| `max_centroid_error` | 0.03 | maximum 0.05 |
+| `max_area_ratio_error` | 0.20 | maximum 0.30 |
+
+Use `"mode": "diagnostic"` only when the reference mask is objectively
+uncertain—for example, soft shadows merged into a photographic background.
+Diagnostic mask metrics remain visible but do not block. Such a contract must
+contain at least one blocking landmark, ratio, instance, or relation gate;
+an all-diagnostic fit fails closed. Do not simulate uncertainty by lowering
+gate thresholds. Legacy mask-level threshold fields are still read, but move
+them under `mask.metrics` when updating a spec.
 
 ## 3. Declare landmarks and ratios
 
@@ -164,9 +232,11 @@ Read all emitted evidence:
 - `renders/reference_overlay.png` — green overlap, red reference-only, blue
   render-only; yellow crosses are reference landmarks and cyan are renders;
 - `renders/reference_mask.png` and `render_mask.png` — exact scored masks;
-- `fit_report.json` — target, measured value, verdict, and input hashes.
+- `fit_report.json` — version-2 suite configuration, adjustments, exact and
+  sampled measurements, blocking/diagnostic verdicts, and input hashes.
 
 Fix the highest-impact camera error before geometry. Once the camera is
 credible, lock it and repair macro dimensions/layout. Never deform the asset
 to compensate for a knowingly wrong camera. `check` rejects missing, failed,
-or stale fit evidence whenever preserved `reference_NN.*` inputs exist.
+stale, legacy version-1, or incomplete metric-suite evidence whenever
+preserved `reference_NN.*` inputs exist.

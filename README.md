@@ -1,6 +1,6 @@
 # ProcAgen3D
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 
 Code-native generation of programmable 3D assets, implemented as an agent
 skill for Claude Code, Codex, and compatible runtimes.
@@ -122,8 +122,8 @@ Every stage is a CLI command with exit codes and grep-able
 build errors, doctrine violations, broken joints, failed reference fits, and
 failed dimensional constraints are all caught mechanically. Semantic
 perception is agent vision by design — no learned depth/normal/edge models —
-while registered camera, mask, landmark, ratio, and layout gates verify visible
-projection offline.
+while registered camera, independent global/contour/regional mask metrics,
+landmark, ratio, and layout gates verify visible projection offline.
 
 Initialize once with
 `python3 procagen3d-skill/scripts/procagen3d.py next --init --out <out> ...`,
@@ -155,6 +155,17 @@ procagen3d/
 ## Update log
 
 Entries are newest first.
+
+### 0.3.0 — 2026-08-16
+
+- Replaced the permissive whole-mask fit with independently blocking IoU,
+  precision/recall, boundary F1/Chamfer/p95, regional mean/p10/occupancy, and
+  framing gates plus topology diagnostics.
+- Added gate-mode safety floors/ceilings, explicit diagnostic-mask mode backed
+  by semantic gates, full requested/effective settings, and worst-region
+  evidence in version-2 fit reports.
+- Made `check` reject legacy or incomplete fit evidence and added stdlib
+  regression coverage for local rearrangements that global IoU misses.
 
 ### 0.2.0 — 2026-08-16
 

@@ -1,6 +1,6 @@
 # procagen3d-skill
 
-**Version:** 0.2.0 — see the repository [update log](../README.md#update-log).
+**Version:** 0.3.0 — see the repository [update log](../README.md#update-log).
 
 An agent skill implementing **ProcAgen3D: Code-Native Generation of Programmable
 3D Assets** ([arXiv:2607.22738](https://arxiv.org/abs/2607.22738)) for
@@ -98,9 +98,11 @@ so the deliverable has no external module dependency. Direct
 `location=`, `rotation=`, and `scale=` are explicit.
 Image-conditioned runs also retain each used input at the output root as
 `reference_01.<ext>`, `reference_02.<ext>`, etc., with provenance recorded in
-`priors.md`. They also retain `fit_spec.json`, a hash-bound `fit_report.json`,
-registered reference render/overlay, and scored masks. Curved/mixed runs add a
-neutral clay `form_sheet.png` and use a shape-only probe before the full build.
+`priors.md`. They also retain `fit_spec.json`, a hash-bound version-2
+`fit_report.json`, registered reference render/overlay, and masks scored by
+independent global, contour, regional, and framing gates. Curved/mixed runs
+add a neutral clay `form_sheet.png` and use a shape-only probe before the full
+build.
 
 ## Design notes
 
@@ -116,4 +118,5 @@ primitive and anti-cardboard lessons plus
 form-first loft/sweep/surface practice. The implementation is original Blender
 Python rather than copied project code. Semantic perception remains agent
 vision, while visible projection is enforced by the dependency-free registered
-camera, mask, landmark, ratio, and layout gates in `references/image-fit.md`.
+camera, mask metric suite, landmark, ratio, and layout gates in
+`references/image-fit.md`.
