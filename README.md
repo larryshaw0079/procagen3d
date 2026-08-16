@@ -1,6 +1,6 @@
 # ProcAgen3D
 
-**Version:** 0.1.1
+**Version:** 0.2.0
 
 Code-native generation of programmable 3D assets, implemented as an agent
 skill for Claude Code, Codex, and compatible runtimes.
@@ -106,10 +106,11 @@ compiled to a portable GLB by the ProcAgen3D pipeline.
 ## How it works
 
 The agent supplies design judgment and visual review; a deterministic,
-stdlib-only harness enforces the paper's pipeline around it:
+stdlib-only harness persists the exact pending step in
+`.procagen3d/state.json` and enforces the paper's pipeline around it:
 
 ```
-design → curved/mixed shape probe → synthesize program
+intake → design → curved/mixed shape probe → synthesize program → lint
 → build + canonical renders (headless Blender)
 → registered image fit (image-conditioned) → deterministic checks
 → agent-vision inspection → guarded repair loop (≤3)
@@ -123,6 +124,13 @@ failed dimensional constraints are all caught mechanically. Semantic
 perception is agent vision by design — no learned depth/normal/edge models —
 while registered camera, mask, landmark, ratio, and layout gates verify visible
 projection offline.
+
+Initialize once with
+`python3 procagen3d-skill/scripts/procagen3d.py next --init --out <out> ...`,
+then run the same driver with `next` at every start or transition.
+Deterministic commands advance automatically; manual judgments receive a
+concrete completion command and require the named hash-bound evidence plus a
+note.
 
 ## Repository layout
 
@@ -147,6 +155,18 @@ procagen3d/
 ## Update log
 
 Entries are newest first.
+
+### 0.2.0 — 2026-08-16
+
+- Added the resumable `.procagen3d/state.json` workflow ledger and
+  `procagen3d next` command.
+- Added conditional form-probe, image-fit, articulation, and scoring routes,
+  exact-command ordering, automatic command advancement, and SHA-256 evidence
+  freshness invalidation.
+- Added evidence-backed manual transitions, atomic state writes, repair-cycle
+  archives, automatic `program.iterN.py` snapshots, and a hard repair ceiling.
+- Kept state opt-in at the CLI layer so existing commands remain unchanged
+  when no state file exists.
 
 ### 0.1.1 — 2026-08-16
 

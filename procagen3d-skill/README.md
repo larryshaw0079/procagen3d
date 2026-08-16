@@ -1,6 +1,6 @@
 # procagen3d-skill
 
-**Version:** 0.1.1 — see the repository [update log](../README.md#update-log).
+**Version:** 0.2.0 — see the repository [update log](../README.md#update-log).
 
 An agent skill implementing **ProcAgen3D: Code-Native Generation of Programmable
 3D Assets** ([arXiv:2607.22738](https://arxiv.org/abs/2607.22738)) for
@@ -31,6 +31,7 @@ procagen3d-skill/
 │   ├── doctrine.md           # representation doctrine + canonical runtime
 │   ├── image-analysis.md     # agent-vision perception stage
 │   ├── image-fit.md          # registered camera/mask/landmark/layout contract
+│   ├── workflow-state.md     # resumable state, evidence freshness, repairs
 │   ├── complex-forms.md      # loft/sweep/shell routing + shape-first probe
 │   ├── detail.md             # tier floors + decomposition recipes
 │   ├── articulation.md       # joint schema + validator semantics
@@ -67,6 +68,8 @@ point the agent at `SKILL.md`.
 ## CLI (used by the agent, usable by hand)
 
 ```sh
+python3 scripts/procagen3d.py next --init --out out/ --form rectilinear
+python3 scripts/procagen3d.py next              # exact pending step/command
 python3 scripts/procagen3d.py lint program.py   # source safety + runtime import gate
 python3 scripts/procagen3d.py build program.py --out out/ --form-diagnostics  # curved/mixed
 python3 scripts/procagen3d.py fit out/ --spec out/fit_spec.json               # image-conditioned
@@ -78,7 +81,16 @@ python3 scripts/procagen3d.py edit-gates base/ edited/ --target "Handle"
 python3 scripts/procagen3d.py render out/ --engine eevee    # re-render (beauty pass)
 ```
 
-Exit 0 = pass, 1 = failure with printed `[PROCAGEN3D:FAIL:*]` reasons.
+Exit 0 = pass, 1 = pipeline failure, 2 = invalid workflow state/order, and
+3 = hard repair stop; failures print `[PROCAGEN3D:FAIL:*]` reasons.
+For new generation, `next --init` creates the Git-ignored local authority at
+`.procagen3d/state.json`. It conditionally inserts form-probe, image-fit,
+articulation, and scoring stages; exact successful commands advance
+automatically. Manual steps print and enforce their required evidence paths
+plus a verdict, stale evidence reopens the completed suffix, and bounded
+repairs preserve prior cycles plus source snapshots. Without the default state
+file, existing CLI workflows remain backward compatible; an explicitly
+selected missing state fails closed. See `references/workflow-state.md`.
 Authoring programs can import selected helpers from `procagen3d_runtime`.
 `build` freezes the tested runtime source into the retained `out/program.py`,
 so the deliverable has no external module dependency. Direct

@@ -15,9 +15,9 @@ surface grids) are constructive geometry and are required when primitives
 cannot express the form.
 
 Division of labor: **scripts do enforcement; your vision does judgment.**
-Deterministic gates (build, check, guard, joints, score, edit-gates) run at
-zero reasoning cost; your tokens go to designing, writing code, and judging
-renders.
+Deterministic gates (next, lint, build, check, guard, joints, score,
+edit-gates) run at zero reasoning cost; your tokens go to designing, writing
+code, and judging renders.
 
 ## Requirements
 
@@ -30,13 +30,30 @@ renders.
   printed reasons. Grep-able tags: `[PROCAGEN3D:OK]`, `[PROCAGEN3D:WARN:*]`,
   `[PROCAGEN3D:FAIL:*]`.
 
+## Mandatory local state
+
+For every new asset, initialize the resumable workflow before intake and use
+the exact tier, form, reference, joint, and spec conditions for the request:
+
+`procagen3d next --init --out <out> --program <out>/<slug>.py --tier <tier> --form <profile> [--reference <path>] [--joints] [--spec <spec>]`
+
+Then run `procagen3d next` at every start, resume, and stage transition. It
+reads `.procagen3d/state.json` and prints the only admissible next command.
+Successful deterministic commands advance automatically. Manual steps advance
+only through the printed `next --done <step>` command, which names every
+required evidence file and requires a verdict note. Changed or missing
+evidence reopens that step and its suffix. Do not reconstruct progress from
+conversation memory or edit the state file to bypass a gate. Exit 2 is invalid
+state/order; exit 3 is a hard repair stop. Full contract:
+`references/workflow-state.md`.
+
 ## Output workspace
 
 Per asset, one directory (default `./procagen3d_out/<slug>/`, or where the user
 asks): `program.py` (the deliverable), `model.glb`, `scene.blend`,
 `scene_graph.json`, `diagnostics.json`, `renders/` (six canonical views +
 `sheet.png`; curved/mixed also `form_sheet.png`), and when applicable
-`form_probe/`, `spec.yaml`, `joints_report.json`,
+`intake.md`, `design.md`, `form_probe/`, `spec.yaml`, `joints_report.json`,
 `score_report.json`. Image-conditioned assets also contain `priors.md`,
 `fit_spec.json`, `fit_report.json`, registered `reference_match.png` and
 `reference_overlay.png`, scored reference/render masks, and an
@@ -47,6 +64,10 @@ unaltered copy of every reference image used, named `reference_01.<ext>`,
 
 **0 — Intake.** Classify the request: text-only or image-conditioned; new
 asset or edit of an existing ProcAgen3D asset (edit → see Local edits below).
+For text-only work, persist requirements, assumptions, and measurable
+constraints in `<out>/intake.md`. For image-conditioned work, the preserved
+references, `priors.md`, and `fit_spec.json` are the intake evidence. Mark the
+state's `intake` step complete only after those files exist.
 Declare the **detail tier** (`quick | standard | showcase`, see
 `references/detail.md`): image-conditioned replication and any
 "detailed/realistic" ask default to **showcase**; standard and above MUST
@@ -73,8 +94,9 @@ original bytes, save the highest-resolution representation available and mark
 that substitution in `priors.md`. Do not skip the copies or priors: together
 they are the reproducible perception input and stage.
 
-**1 — Design.** Decide before coding, and record as the program's header
-comment: the constants block (real-world meters), the part table (PascalCase
+**1 — Design.** Decide before coding, persist the plan in `<out>/design.md`,
+and repeat its compact contract in the program header: the constants block
+(real-world meters), the part table (PascalCase
 names with counts — `Spoke_17`, never one merged `Spokes`), the hierarchy
 tree (one root, semantic groups), and the joint table (type, axis, limits,
 pivot). The part table must decompose to the detail.md ladder — sub-parts
@@ -116,6 +138,8 @@ at most two probe corrections. If it still fails, stop/request better views
 or report the limitation; never advance to detail. Otherwise transfer the
 accepted form constants and builders into the full program. Details:
 `references/complex-forms.md`.
+Record both probe sheets and the written verdict when completing the state's
+`form-probe-review` step.
 
 **3 — Synthesize.** Write `<out>/<slug>.py`: constants → one
 `build_<part>()` per part → `build()` assembling the transform tree, joints
@@ -133,6 +157,8 @@ median ~490 LOC; vehicles often run 100–340 parts. A showcase draft under
 ~300 LOC or under the tier's secondary-detail floor means the design table was
 too coarse, but never fragment an accepted continuous surface to inflate the
 count. Detail cannot be retrofitted through the repair budget.
+Complete the state's `synthesize` step with the authoring program as evidence;
+`next` then supplies the lint command.
 
 **4 — Build.** Run `procagen3d lint <out>/<slug>.py`, then
 `procagen3d build <out>/<slug>.py --out <out>`; add
@@ -183,16 +209,22 @@ Image-conditioned: compare against every saved reference and `priors.md`.
 An admitted residual on an identity-bearing silhouette, compound transition,
 or panel language keeps shape/form at FAIL; detail and materials cannot
 compensate. Never judge from the build log alone.
+If all hard verdicts pass, complete `visual-review` with the inspected sheets
+and written verdict as evidence. Otherwise start the repair through `next`.
 
 **7 — Repair (≤ 3 full-program iterations).** For each failed verdict, name
 the single highest-impact defect, its evidence view, and an explicit PRESERVE
 list of passing dimensions/features/views. Decide whether the blueprint is
-wrong (`refine-priors`) or its implementation is wrong (`refine-code`). Apply
-a minimal source edit; if the representation family is wrong, rewrite only
-that primary builder rather than adding cosmetic parts. Save the current
-program as `<out>/program.iter<N>.py`, then run
-`procagen3d guard <out>/program.iter<N>.py <out>/<slug>.py`. Use
-`--allow-shrink` only for a declared representation rewrite and record why.
+wrong (`refine-priors`) or its implementation is wrong (`refine-code`). Run
+`procagen3d next --repair --evidence <failed-view> --reason "<defect +
+PRESERVE list>"`; it snapshots the current source as the next unused
+`<out>/program.iter<N>.py` and advances to `repair-edit`. Apply a minimal
+source edit; if the representation family is wrong, rewrite only that primary
+builder rather than adding cosmetic parts. For a declared representation
+rewrite, add `--allow-shrink` to the `next --repair` command; add repeated
+`--allow-drop <pattern>` only for explicitly permitted removals. Complete
+`repair-edit` with the changed source as evidence, then run the exact `guard`
+command printed by `next`.
 The guard MUST pass before rebuilding from step 4. Hard ceiling: **3 repair
 iterations** (build-error fixes included). If exhausted, keep the best
 successful intermediate and report honestly what remains wrong.
@@ -215,28 +247,33 @@ this output, and failures stay in the final report.
 constraint table if any, and named residual mismatches. "Approximate" where
 you eyeballed; "verified" only where a gate ran. "This cannot be built
 faithfully from this input" is a valid outcome — say it instead of faking.
+Complete the state's `deliver` step with `model.glb` and the final evidence
+summary before sending that message.
 
 ## Gates (do not skip)
 
-1. Image-conditioned: every reference image actually used is present at the
+1. `.procagen3d/state.json` exists for new generation, and `next` names the
+   current step; no later command bypasses a pending manual or deterministic
+   gate.
+2. Image-conditioned: every reference image actually used is present at the
    output root as `reference_NN.<ext>`, mapped in `priors.md`, and measured in
    `fit_spec.json` before code.
-2. Curved/mixed: tagged form probe passes `check --form <profile>` and both
+3. Curved/mixed: tagged form probe passes `check --form <profile>` and both
    probe sheets are Read before full synthesis; resolve `FORM_*` warnings and
    add no detail before form pass.
-3. Full `build` exit 0 before anything else proceeds.
-4. Image-conditioned: registered `fit` exit 0 after every full build; Read its
+4. Full `build` exit 0 before anything else proceeds.
+5. Image-conditioned: registered `fit` exit 0 after every full build; Read its
    overlay, scored masks, and report.
-5. `check --tier <tier> --form <profile>` exit 0 before visual inspection;
+6. `check --tier <tier> --form <profile>` exit 0 before visual inspection;
    form/detail WARNs at showcase are repair input, not acceptable residue.
-6. `guard` pass between every full-program repair iteration — no exceptions.
-7. `sheet.png` actually Read; curved/mixed also `form_sheet.png`, and use
+7. `guard` pass between every full-program repair iteration — no exceptions.
+8. `sheet.png` actually Read; curved/mixed also `form_sheet.png`, and use
    `reference_match.png` whenever emitted.
-8. `joints` exit 0 whenever the design table declares a joint.
-9. `score` output quoted verbatim whenever a spec exists.
-10. Repair ceiling of 3 — on exhaustion, deliver best intermediate + honest
+9. `joints` exit 0 whenever the design table declares a joint.
+10. `score` output quoted verbatim whenever a spec exists.
+11. Repair ceiling of 3 — on exhaustion, deliver best intermediate + honest
    residuals, never a silent extra loop.
-11. Repairs preserve what passes: list the passing verdicts in the repair
+12. Repairs preserve what passes: list the passing verdicts in the repair
    note and do not regress them while fixing the failing one — a repair
    that trades a pass for a pass is a regression, revert it.
 
