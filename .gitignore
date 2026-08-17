@@ -17,6 +17,7 @@ benchmark/
 
 # ProcAgen3D skill outputs
 .procagen3d/
+outputs/
 procagen3d_out/
 assets/*
 !assets/teaser.png
