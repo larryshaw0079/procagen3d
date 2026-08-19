@@ -1,4 +1,4 @@
-# Blender pitfalls — headless bpy traps (Blender 4.x)
+# Blender pitfalls — headless bpy traps (Blender 4.x / 5.x)
 
 Every trap below is from a real failure mode. Read before writing bpy code;
 revisit when a build error or a weird render doesn't make sense.
@@ -125,3 +125,12 @@ than fighting the context.
 `obj.scale.x = -1` inverts normals and trips the unapplied-scale gate.
 Build mirrored instances by constructing at the mirrored position (negate
 the position/angle constants), or apply the mirror into mesh data.
+
+## Trap 13 — macOS sandbox + Blender 5.x is a startup SIGSEGV
+
+A `Writing: .../blender.crash.txt` with an empty Python backtrace is not a
+bpy error. Blender 5.x dies in `supports_barycentric_whitelist` while
+detecting Metal, before `blender_stages.py` runs. Re-run the same
+`procagen3d` command outside the sandbox (full GPU permissions). Default
+workbench/Cycles paths are 5.x-compatible; do not "fix" this by rewriting
+geometry code or installing 4.x unless you want 4.x for other reasons.

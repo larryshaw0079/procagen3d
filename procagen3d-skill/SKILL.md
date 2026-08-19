@@ -21,10 +21,14 @@ renders.
 
 ## Requirements
 
-- Blender 4.x. Resolved in order: `--blender` flag → `$PROCAGEN3D_BLENDER` →
-  `blender` on PATH → `~/.cache/procagen3d/*/blender`. Nothing else to install:
-  Blender stages run under Blender's bundled Python; everything else is
-  Python 3.10+ stdlib.
+- Blender 4.x or 5.x (tested on 4.5 LTS and 5.2 LTS). Resolved in order:
+  `--blender` flag → `$PROCAGEN3D_BLENDER` → `blender` on PATH →
+  `~/.cache/procagen3d/*/blender`. Nothing else to install: Blender stages
+  run under Blender's bundled Python; everything else is Python 3.10+ stdlib.
+  **macOS + Blender 5.x:** every `build`/`render`/`fit`/`joints` invocation
+  must run unsandboxed with Metal GPU access. A sandboxed launch SIGSEGVs in
+  `supports_barycentric_whitelist` during `WM_init` — Python never starts.
+  That is a Blender Metal-detection bug, not a 4.x-vs-5.x bpy API mismatch.
 - Run all commands as `python3 <skill-root>/scripts/procagen3d.py <cmd> ...`
   (below abbreviated to `procagen3d <cmd>`). Exit 0 = pass, 1 = failure with
   printed reasons. Grep-able tags: `[PROCAGEN3D:OK]`, `[PROCAGEN3D:WARN:*]`,
@@ -34,7 +38,8 @@ renders.
 
 Per asset, one directory (default `./procagen3d_out/<slug>/`, or where the user
 asks): `program.py` (the deliverable), `model.glb`, `scene.blend`,
-`scene_graph.json`, `diagnostics.json`, `renders/` (six canonical views +
+`scene_graph.json` (per-mesh shape signatures and canonical-view silhouette
+areas), `diagnostics.json`, `renders/` (six canonical views +
 `sheet.png`; curved/mixed also `form_sheet.png`), and when applicable
 `form_probe/`, `spec.yaml`, `joints_report.json`,
 `score_report.json`. Image-conditioned assets also contain `priors.md`,
@@ -69,12 +74,16 @@ the saved copies and complete the structured priors (showcase: including the
 §7 detail inventory + identity features; curved/mixed: the form blueprint and
 macro identity forms). Solve canonical object frame, registered camera, rigid
 pose, and every visible articulated chain before dimensions. Author
-`<out>/reconstruction_plan.json` with candidate-tested primitive families,
-rejected alternatives, perceptual complexity, and required feature groups.
-Then author version-2 `<out>/fit_spec.json` with the camera, whole-frame mask,
-at least three local silhouette regions, geometry-bound landmarks/ratios,
-frame axes, and pose chains; add per-instance boxes/relations for multi-object
-references. If the runtime cannot expose the original bytes, save the
+`<out>/reconstruction_plan.json` with a locked `camera_solve` (at least two
+compared viewpoints and why the loser lost), candidate-tested primitive
+families, rejected alternatives, perceptual complexity, and required feature
+groups. Then author version-2 `<out>/fit_spec.json` with the locked camera,
+whole-frame mask, one local silhouette region per two primary masses (minimum
+three), geometry-bound landmarks/ratios, frame axes, and pose chains; add
+per-instance boxes/relations for multi-object references. **Do not write
+threshold values**: pass marks live in the harness and a spec that asks for a
+looser one is clamped and failed. Version 2 and the reconstruction plan are
+both mandatory for image-conditioned work; version 1 no longer validates. If the runtime cannot expose the original bytes, save the
 highest-resolution representation available and mark
 that substitution in `priors.md`. Do not skip the copies or priors: together
 they are the reproducible perception input and stage.
@@ -131,8 +140,13 @@ and attachments in all useful views. Wrong family → revise the prior and rewri
 that builder in either direction; wrong pose → repair camera/root/joint
 transforms, not dimensions. Allow at most two probe corrections. If it still
 fails, stop/request better views or report the limitation; never decorate a
-rejected reconstruction. Details: `references/reconstruction-planning.md` and
-`references/complex-forms.md`.
+rejected reconstruction.
+
+**`complex` and `extreme` plans probe one assembly at a time.** Split the object
+into five to nine named assemblies, give each its own silhouette region, and
+register them in identity order. One aggregate score over a thirty-mass object
+cannot tell you which mass is wrong; a per-region row can. Details:
+`references/reconstruction-planning.md` §6 and `references/complex-forms.md`.
 
 **3 — Synthesize.** Write `<out>/<slug>.py`: constants → one
 `build_<part>()` per part → `build()` assembling the transform tree, joints
@@ -158,12 +172,28 @@ attempts → reconsider the approach instead of patching the same line again.
 
 **4a — Registered image fit (image-conditioned).** Run
 `procagen3d fit <out> --spec <out>/fit_spec.json`. It renders at the reference's
-exact resolution/aspect and declared camera, then scores mask IoU,
+exact resolution/aspect and the locked camera, then scores mask IoU,
 bbox/centroid alignment, local silhouettes, geometry-bound landmarks/ratios,
 frame axes, pose chains, and instance relations. Every gate MUST pass. Read the
 overlay, masks, and report; fix camera/frame → rigid pose → articulated pose →
 shape/dimensions in that order, locking each passing layer. Never proceed on the
 legacy auto-centered preview alone.
+
+Thresholds are the harness's, not yours. Mask IoU floors run 0.88/0.84/0.80/0.76
+for simple/moderate/complex/extreme, with an automatic allowance of up to 0.15
+for genuinely wiry subjects, measured by eroding the reference mask. The
+`threshold_policy` gate fails and lists every value the spec tried to loosen. A
+floor you cannot reach is a real finding: fix the geometry or report the
+limitation honestly.
+
+Targets are the image's, not yours either. Every `reference_uv` must be read
+off the saved reference; deriving one by projecting your own model makes that
+landmark and every ratio, frame axis, and pose chain built on it a comparison
+of the model with itself, which passes unconditionally. `landmark_provenance`
+fails when the median landmark error drops below 0.001, because estimating a
+point from an image is worth about a pixel and cannot be that good. **And note what this stage cannot see** — every metric here
+is one camera's image plane, so a passing fit says "registers from this view",
+never "is correct in 3D". Depth is gated in step 5.
 
 **5 — Deterministic gates.** Run
 `procagen3d check <out> --tier <tier> --form <profile>`. FAILs are doctrine or
@@ -171,11 +201,38 @@ form/reconstruction violations (unnamed parts, duplicate `.001` names, shape
 family/method mismatch, missing plan features or occupied regions, empty
 meshes, broken joints) — fix them; they are never acceptable residue.
 Version-2 showcase detail floors and feature/region coverage are hard gates.
-`FORM_MACRO_COVERAGE` applies to curved targets; mixed targets require both
-families but never a continuous-volume quota or a large curved token mass.
 WARNs remain advisory only where explicitly printed.
 For image-conditioned outputs, `check` also fails when fit evidence is missing,
 failed, or stale relative to the reference, fit spec, or scene graph.
+
+Six of these gates measure the built geometry rather than cross-checking one
+declaration against another, and they are the ones that catch what renders
+reveal:
+
+- `SHAPE_FAMILY_MEASURED` — declared family versus measured `fill_ratio` and
+  `planar_area_fraction`. An ellipsoid cannot ship under a `box` tag, and a
+  flat-sided block cannot ship as a `loft`. Bevelling a box leaves it at 82%
+  planar; an ellipsoid is at 8%. Rounded corners are not curvature.
+- `PRIMARY_DEPTH` — a primary mass whose thinnest dimension is under 8% of its
+  longest is a cut-out, not a volume.
+- `VIEW_COLLAPSE` — the canonical orthographic views share one scale, so their
+  silhouette areas are comparable. A bas-relief that fits one camera and
+  nothing else shows up here and nowhere else.
+- `INSTANCE_CONGRUENCE` — members of a `Name_NN` array must share
+  rotation-invariant size unless the plan says why they differ.
+- `REGION_DENSITY` — every region the plan calls occupied must actually contain
+  meshes; naming a cube `Vent_03` no longer counts as a vent.
+- `FORM_PROMISED_CURVATURE` — masses declared `continuous`/`shell` must be
+  measurably curved.
+- `RIGID_AXIS` — parts of an assembly the plan declares rigid and single-axis
+  (rifle, spear, mast, axle) must actually be collinear in 3D. Author such an
+  assembly as one origin plus one direction; placing each endpoint separately
+  to match the image is how a straight weapon comes out bent.
+
+Nothing here asks for curved mass. `FORM_PROFILE_EVIDENCE` fires only when a
+`curved` profile shows almost no measurable curvature, and its remedy is to
+declare `rectilinear` or `mixed`. Faceted armour, receivers, and camera bodies
+are boxes; keep them boxes and bevel the edges.
 
 **6 — Inspect (your judgment).** Read `<out>/renders/sheet.png` — top row
 `front | right | iso`, bottom row `left | back | top`. Curved/mixed MUST also
@@ -184,7 +241,9 @@ read `form_sheet.png`; image-conditioned runs with a camera contract MUST read
 line per aspect before deciding:
 
 - **shape** — silhouette and construction correct in every useful view (not
-  just front); watch for parts that only look right from one angle;
+  just front); watch for parts that only look right from one angle. Look at
+  the side and top tiles specifically and ask whether the object has depth;
+  a model tuned against one reference camera collapses there first;
 - **family** (image-conditioned; hard floor) — every planned box/prism retains
   planar fields/constant sections and every planned curved mass has evidenced
   curvature; bevels are not ellipsoids and lofts are not default blockouts;
@@ -208,7 +267,7 @@ An admitted residual on an identity-bearing silhouette, compound transition,
 or panel language keeps shape/form at FAIL; detail and materials cannot
 compensate. Never judge from the build log alone.
 
-**7 — Repair (≤ 3 full-program iterations).** For each failed verdict, name
+**7 — Repair (budget scales with complexity).** For each failed verdict, name
 the single highest-impact defect, its evidence view, and an explicit PRESERVE
 list of passing dimensions/features/views. Decide whether the blueprint is
 wrong (`refine-priors`: camera/pose/family/complexity) or its implementation is
@@ -218,9 +277,12 @@ that primary builder rather than adding cosmetic parts. Save the current
 program as `<out>/program.iter<N>.py`, then run
 `procagen3d guard <out>/program.iter<N>.py <out>/<slug>.py`. Use
 `--allow-shrink` only for a declared representation rewrite and record why.
-The guard MUST pass before rebuilding from step 4. Hard ceiling: **3 repair
-iterations** (build-error fixes included). If exhausted, keep the best
-successful intermediate and report honestly what remains wrong.
+The guard MUST pass before rebuilding from step 4. Ceiling by complexity class
+(build-error fixes included): **3** for text-only, `simple`, or `moderate`
+work, **6** for `complex`, **8** for `extreme`. A car, mecha, or character
+legitimately needs more passes than a stool; what it never gets is a lower bar.
+If exhausted, keep the best successful intermediate and report honestly what
+remains wrong.
 Image-conditioned repairs must rerun `fit` after every rebuild; changes to
 shape/feature plans must also rerun `check`. Older evidence is invalidated by
 the new scene graph/spec.
@@ -246,7 +308,8 @@ faithfully from this input" is a valid outcome — say it instead of faking.
 
 1. Image-conditioned: every reference image actually used is present at the
    output root as `reference_NN.<ext>`, mapped in `priors.md`; version-2
-   `fit_spec.json` and `reconstruction_plan.json` exist before code.
+   `fit_spec.json` and `reconstruction_plan.json` (with a locked `camera_solve`)
+   exist before code. Version 1 is rejected.
 2. Image-conditioned or curved/mixed: reconstruction probe passes `check`; an
    image-conditioned probe also passes registered `fit`. Read its canonical and
    registered evidence before synthesis; add no detail before family/pose/form
@@ -262,11 +325,13 @@ faithfully from this input" is a valid outcome — say it instead of faking.
    `reference_match.png` whenever emitted.
 8. `joints` exit 0 whenever the design table declares a joint.
 9. `score` output quoted verbatim whenever a spec exists.
-10. Repair ceiling of 3 — on exhaustion, deliver best intermediate + honest
-   residuals, never a silent extra loop.
+10. Repair ceiling of 3 / 6 / 8 by complexity — on exhaustion, deliver best
+   intermediate + honest residuals, never a silent extra loop.
 11. Repairs preserve what passes: list the passing verdicts in the repair
    note and do not regress them while fixing the failing one — a repair
    that trades a pass for a pass is a regression, revert it.
+12. Never author a fit threshold to make a gate pass. Thresholds belong to the
+   harness; the spec may only tighten them. Loosening is itself a failure.
 
 ## Local edits (existing ProcAgen3D asset)
 

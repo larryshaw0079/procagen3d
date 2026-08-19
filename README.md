@@ -138,8 +138,10 @@ procagen3d/
 
 ## Requirements
 
-- **Blender 4.x** (tested on 4.5 LTS), found via `--blender` flag →
-  `$PROCAGEN3D_BLENDER` → PATH → `~/.cache/procagen3d/*/blender`.
+- **Blender 4.x or 5.x** (tested on 4.5 LTS and 5.2 LTS), found via
+  `--blender` flag → `$PROCAGEN3D_BLENDER` → PATH →
+  `~/.cache/procagen3d/*/blender`. On macOS, Blender 5.x headless needs
+  Metal GPU access; a sandboxed launch SIGSEGVs during GPU detection.
 - **Python 3.10+**. No pip packages — the harness is stdlib only, and
   Blender stages run under Blender's bundled Python.
 

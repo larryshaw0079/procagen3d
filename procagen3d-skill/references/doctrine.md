@@ -83,7 +83,7 @@ helper and meet the complexity-adaptive floor in `detail.md`.
 
 ## Canonical helpers (paste into every program)
 
-These are tested against Blender 4.5 headless. Take what the program needs;
+These are tested against Blender 4.5 and 5.2 headless. Take what the program needs;
 `add_joint` and `reparent_keep_world` are required verbatim whenever joints
 or parenting are used — the validators rely on their conventions.
 

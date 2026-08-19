@@ -35,6 +35,13 @@ Legacy assets without a reconstruction plan keep fallback floors (standard
 Never fragment a coherent surface or inflate a repeated array merely to reach a
 number; fix missing feature groups first.
 
+Global counts are the weakest possible detail signal — 260 meshes says nothing
+about *where* they are, and a complex object hits that number easily while its
+identity regions stay empty. The binding constraint is `REGION_DENSITY`, which
+bins every mesh by where its centre actually sits in the object's 3×3 grid and
+requires 2/4/8/12 meshes in each declared occupied region. A blob torso fails
+it no matter how many panel slivers sit on the legs.
+
 ## The decomposition ladder
 
 Decompose until the smallest separate part is ~1% of the object's major
@@ -46,7 +53,12 @@ dimension (a door handle on a car, a knob on an amp). Four levels, all named:
 If you can name a sub-feature, it gets its own `build_*` call and mesh.
 Repetition is always an **array of numbered instances** (tread lugs, grille
 slats, bed grooves, coil rings, spokes, vents) — count them in the reference,
-place them with a loop. Keep a continuous primary mass continuous; panel gaps,
+place them with a loop. One builder, shared dimension constants, and only the
+transform varies per instance; `INSTANCE_CONGRUENCE` measures rotation-invariant
+size across each array and fails a six-plus-member array that drifts past 25%
+without a `reconstruction_plan.instance_arrays` entry explaining why. Sizing each
+member by eye against the reference silhouette is how eighteen identical swords
+become eighteen different swords. Keep a continuous primary mass continuous; panel gaps,
 trim, and attached shells may be separate, but the surface beneath them must
 not become a collage of independently beveled primitives.
 

@@ -116,6 +116,199 @@ def base_axis_plane_counts(mesh):
     return counts
 
 
+def normal_clusters(mesh, merge_deg=6.0):
+    """Group face area by surface normal, coarse-bucketed then merged.
+
+    Bucketing is O(faces) and merging is O(buckets^2) on a set that stays small
+    for anything that is not already a smooth surface, so this is affordable on
+    every mesh at build time.
+    """
+    buckets = {}
+    for poly in mesh.polygons:
+        normal = poly.normal
+        if normal.length_squared < 1e-12:
+            continue
+        normal = normal.normalized()
+        key = tuple(round(component * 48.0) for component in normal)
+        entry = buckets.get(key)
+        if entry is None:
+            buckets[key] = [normal.copy(), poly.area]
+        else:
+            entry[1] += poly.area
+    clusters = []
+    tolerance = math.cos(math.radians(merge_deg))
+    for normal, area in sorted(buckets.values(), key=lambda item: -item[1]):
+        for cluster in clusters:
+            if normal.dot(cluster[0]) >= tolerance:
+                cluster[1] += area
+                break
+        else:
+            clusters.append([normal, area])
+        if len(clusters) > 4096:
+            break
+    return sorted((area for _, area in clusters), reverse=True)
+
+
+def section_variation(mesh, axis, stations=7):
+    """Relative spread of cross-section size along ``axis``.
+
+    Sections are cut by intersecting edges with station planes rather than by
+    binning vertices, because an extrusion or a lathe carries vertices only at
+    its end rings and would otherwise report no section at all.
+
+    Near zero for a box, prism, or cylinder (constant section); large for a
+    cone, taper, or loft.  This is what separates a stretched block from a form
+    whose section genuinely changes.
+    """
+    coords = [v.co for v in mesh.vertices]
+    lo = min(c[axis] for c in coords)
+    hi = max(c[axis] for c in coords)
+    span = hi - lo
+    if span <= 1e-9:
+        return 0.0
+    others = [i for i in range(3) if i != axis]
+    edges = {key for poly in mesh.polygons for key in poly.edge_keys}
+    extents = []
+    for index in range(1, stations + 1):
+        level = lo + span * index / (stations + 1)
+        points = []
+        for start_index, end_index in edges:
+            a = coords[start_index]
+            b = coords[end_index]
+            delta = b[axis] - a[axis]
+            if abs(delta) <= 1e-12:
+                continue
+            t = (level - a[axis]) / delta
+            if not 0.0 <= t <= 1.0:
+                continue
+            points.append([a[other] + (b[other] - a[other]) * t
+                           for other in others])
+        if len(points) < 3:
+            continue
+        area = 1.0
+        for column in range(2):
+            values = [p[column] for p in points]
+            area *= max(values) - min(values)
+        extents.append(math.sqrt(max(area, 0.0)))
+    if len(extents) < 3:
+        return 0.0
+    mean = sum(extents) / len(extents)
+    if mean <= 1e-9:
+        return 0.0
+    return (max(extents) - min(extents)) / mean
+
+
+def principal_axis(points):
+    """Dominant direction of a point cloud, plus how elongated it is.
+
+    Power iteration on the covariance matrix, then one deflation for the second
+    eigenvalue.  ``elongation`` near 1 means the cloud has no meaningful long
+    axis, so callers can ignore compact parts.
+    """
+    count = len(points)
+    if count < 3:
+        return None, 1.0
+    centre = [sum(p[i] for p in points) / count for i in range(3)]
+    cov = [[0.0] * 3 for _ in range(3)]
+    for point in points:
+        d = [point[i] - centre[i] for i in range(3)]
+        for i in range(3):
+            for j in range(3):
+                cov[i][j] += d[i] * d[j]
+
+    def multiply(vector):
+        return [sum(cov[i][j] * vector[j] for j in range(3)) for i in range(3)]
+
+    def iterate(seed):
+        vector = seed
+        value = 0.0
+        for _ in range(48):
+            nxt = multiply(vector)
+            length = math.sqrt(sum(c * c for c in nxt))
+            if length <= 1e-18:
+                return None, 0.0
+            vector = [c / length for c in nxt]
+            value = length
+        return vector, value
+
+    first, lambda1 = iterate([0.5773, 0.5774, 0.5775])
+    if first is None:
+        return None, 1.0
+    for i in range(3):
+        for j in range(3):
+            cov[i][j] -= lambda1 * first[i] * first[j]
+    seed = [1.0, 0.0, 0.0]
+    if abs(first[0]) > 0.9:
+        seed = [0.0, 1.0, 0.0]
+    _, lambda2 = iterate(seed)
+    elongation = math.sqrt(lambda1 / lambda2) if lambda2 > 1e-18 else 999.0
+    return first, elongation
+
+
+def shape_signature(mesh):
+    """Measure the geometry that actually distinguishes one shape family from another.
+
+    Two numbers carry most of the discrimination:
+
+    ``fill_ratio`` — solid volume over local bounding-box volume.  A box is 1.0,
+    a cylinder 0.79, an ellipsoid 0.52, a cone 0.26.
+
+    ``planar_area_fraction`` — surface area lying in the six largest coplanar
+    normal clusters.  A box is ~1.0 even after bevelling, a cylinder ~0.4, a
+    sphere or loft below 0.1.
+
+    Together they catch an ellipsoid wearing a ``box`` label, which no amount of
+    metadata cross-checking can.  Returns None when the mesh is too coarse to
+    classify.
+    """
+    polys = mesh.polygons
+    if len(polys) < 4 or not mesh.vertices:
+        return None
+    coords = [v.co for v in mesh.vertices]
+    dims = [max(c[i] for c in coords) - min(c[i] for c in coords)
+            for i in range(3)]
+    bbox_volume = dims[0] * dims[1] * dims[2]
+
+    mesh.calc_loop_triangles()
+    volume = 0.0
+    for tri in mesh.loop_triangles:
+        a, b, c = (coords[i] for i in tri.vertices)
+        volume += a.dot(b.cross(c))
+    volume = abs(volume) / 6.0
+
+    boundary = 0
+    edge_use = {}
+    for poly in polys:
+        for key in poly.edge_keys:
+            edge_use[key] = edge_use.get(key, 0) + 1
+    for count in edge_use.values():
+        if count == 1:
+            boundary += 1
+
+    areas = normal_clusters(mesh)
+    total_area = sum(areas)
+    if total_area <= 1e-12:
+        return None
+    planar = sum(areas[:6]) / total_area
+    longest = max(range(3), key=lambda i: dims[i])
+
+    ordered = sorted(dims)
+    return {
+        "fill_ratio": round(volume / bbox_volume, 4) if bbox_volume > 1e-12 else 0.0,
+        "planar_area_fraction": round(planar, 4),
+        "largest_planar_fraction": round(areas[0] / total_area, 4),
+        "normal_cluster_count": len(areas),
+        "section_variation": round(section_variation(mesh, longest), 4),
+        "thin_ratio": round(ordered[0] / ordered[2], 4) if ordered[2] > 1e-12 else 0.0,
+        "local_dims": [round(d, 6) for d in dims],
+        # Rotation-invariant size, so repeated parts stay comparable even when
+        # a builder bakes each instance's rotation into its vertices.
+        "volume": round(volume, 12),
+        "surface_area": round(total_area, 12),
+        "closed": boundary == 0,
+    }
+
+
 def descendants(obj):
     out = []
     stack = list(obj.children)
@@ -190,6 +383,14 @@ def collect_scene_graph():
                     "materials": [m.name for m in obj.data.materials if m],
                 }
             )
+            signature = shape_signature(me)
+            if signature is not None:
+                world = [ev.matrix_world @ v.co for v in me.vertices]
+                axis, elongation = principal_axis(world)
+                if axis is not None:
+                    signature["world_axis"] = [round(c, 6) for c in axis]
+                    signature["elongation"] = round(min(elongation, 999.0), 4)
+                entry["shape_signature"] = signature
             total_tris += tris
             ev.to_mesh_clear()
         props = {
@@ -249,7 +450,11 @@ def setup_engine(scene, engine):
     scene.collection.objects.link(sun)
     sun.rotation_euler = (math.radians(50), 0.0, math.radians(30))
     if engine == "eevee":
-        scene.render.engine = "BLENDER_EEVEE_NEXT"
+        # 4.2–4.5 shipped EEVEE Next as BLENDER_EEVEE_NEXT; 5.0 restored
+        # BLENDER_EEVEE as the only identifier.
+        scene.render.engine = (
+            "BLENDER_EEVEE" if bpy.app.version >= (5, 0, 0)
+            else "BLENDER_EEVEE_NEXT")
         scene.eevee.taa_render_samples = 16
     else:
         scene.render.engine = "CYCLES"
@@ -323,7 +528,7 @@ def render_views(out_dir, size, engine, form_diagnostics=False):
     meshes = mesh_objects()
     if not meshes:
         print(f"{FAIL}:NO_MESHES] nothing to render")
-        return []
+        return [], None
     dg = depsgraph()
     lo, hi = union_bbox(meshes, dg)
     center = (lo + hi) / 2
@@ -385,6 +590,7 @@ def render_views(out_dir, size, engine, form_diagnostics=False):
         return paths
 
     written.extend(render_canonical_set())
+    silhouettes = measure_view_silhouettes(renders_dir, size)
     sheet = make_contact_sheet(renders_dir, size)
     if sheet:
         written.append(sheet)
@@ -431,7 +637,45 @@ def render_views(out_dir, size, engine, form_diagnostics=False):
             renders_dir, size, prefix="form_", output_name="form_sheet.png")
         if form_sheet:
             written.append(form_sheet)
-    return written
+    return written, silhouettes
+
+
+def measure_view_silhouettes(renders_dir, size):
+    """Silhouette coverage of the orthographic canonical views.
+
+    All five ortho views share one ortho_scale and resolution, so their
+    foreground areas are directly comparable.  A model that fits a reference
+    from one camera by flattening into a bas-relief keeps a large front area
+    and loses almost all of its side and top area, which is invisible to any
+    single-view image metric but obvious here.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        print(f"{WARN}:NO_NUMPY] view silhouette measurement skipped")
+        return None
+    out = {}
+    for view in VIEW_ORDER:
+        if view == "iso":  # perspective; not area-comparable with the ortho set
+            continue
+        path = renders_dir / f"{view}.png"
+        if not path.is_file():
+            continue
+        img = bpy.data.images.load(str(path))
+        px = np.array(img.pixels[:], dtype=np.float32).reshape(size, size, 4)
+        bpy.data.images.remove(img)
+        mask = px[..., 3] > 0.5
+        area = float(mask.mean())
+        entry = {"area_fraction": round(area, 6)}
+        if mask.any():
+            rows = np.flatnonzero(mask.any(axis=1))
+            cols = np.flatnonzero(mask.any(axis=0))
+            entry["extent_fraction"] = [
+                round(float(cols[-1] - cols[0] + 1) / size, 6),
+                round(float(rows[-1] - rows[0] + 1) / size, 6),
+            ]
+        out[view] = entry
+    return out or None
 
 
 def make_contact_sheet(renders_dir, size, prefix="", output_name="sheet.png"):
@@ -904,6 +1148,134 @@ def draw_box(image, bbox, color):
     image[top:bottom + 1, max(left, right - 1):right + 1, :3] = color
 
 
+# Registered-fit strictness lives here, in code, not in the agent-authored spec.
+# A spec that asks for a looser number is clamped back to these values and the
+# run is failed, because a self-chosen pass mark measures nothing.  Floors are
+# indexed by the reconstruction plan's complexity class: a mecha genuinely
+# cannot register as tightly as a camera body, but it may not pick its own bar.
+FIT_MASK_IOU_FLOOR = {
+    "simple": 0.88, "moderate": 0.84, "complex": 0.80, "extreme": 0.76,
+}
+FIT_REGION_IOU_FLOOR = {
+    "simple": 0.85, "moderate": 0.82, "complex": 0.78, "extreme": 0.74,
+}
+FIT_DEFAULT_COMPLEXITY = "complex"
+FIT_ERROR_CEILINGS = {
+    "bbox_max_error": 0.05,
+    "centroid_max_error": 0.04,
+    "area_ratio_max_error": 0.20,
+    "region_area_ratio_max_error": 0.18,
+    "landmark_max_error": 0.04,
+    "ratio_max_relative_error": 0.10,
+    "pose_axis_max_angle_error_deg": 4.0,
+    "pose_segment_max_angle_error_deg": 5.0,
+    "pose_joint_max_angle_error_deg": 7.0,
+    "pose_length_fraction_max_error": 0.04,
+    "instance_bbox_max_error": 0.05,
+    "instance_centroid_max_error": 0.04,
+    "relation_max_error": 0.05,
+}
+# Wiry subjects (bicycle, drone, antenna arrays) lose IoU to one-pixel
+# registration slop in a way a solid body does not.  The allowance is derived
+# from the reference mask itself, so it cannot be claimed by declaration.
+FIT_THINNESS_RELIEF = 0.20
+FIT_THINNESS_RELIEF_CAP = 0.15
+# Reading a point off an image is worth roughly a pixel at best.  Below this,
+# the target was computed from the model rather than observed.
+LANDMARK_PROVENANCE_FLOOR = 0.001
+LANDMARK_PROVENANCE_MIN_SAMPLES = 5
+
+
+def erode_mask(mask, radius):
+    """Plus-shaped binary erosion, ``radius`` iterations."""
+    import numpy as np
+
+    out = mask
+    for _ in range(max(0, radius)):
+        shrunk = out.copy()
+        shrunk[1:, :] &= out[:-1, :]
+        shrunk[:-1, :] &= out[1:, :]
+        shrunk[:, 1:] &= out[:, :-1]
+        shrunk[:, :-1] &= out[:, 1:]
+        shrunk[0, :] = False
+        shrunk[-1, :] = False
+        shrunk[:, 0] = False
+        shrunk[:, -1] = False
+        out = shrunk
+    return out
+
+
+def mask_thinness(mask):
+    """Fraction of foreground that a small erosion removes: 0 solid, ~1 wiry."""
+    total = int(mask.sum())
+    if not total:
+        return 0.0
+    height, width = mask.shape[:2]
+    radius = max(1, int(round(0.004 * min(height, width))))
+    return 1.0 - float(erode_mask(mask, radius).sum()) / total
+
+
+class FitThresholdPolicy:
+    """Resolve every fit threshold as the stricter of policy and spec."""
+
+    def __init__(self, complexity_class):
+        self.complexity = (complexity_class
+                           if complexity_class in FIT_MASK_IOU_FLOOR
+                           else FIT_DEFAULT_COMPLEXITY)
+        self.thinness = 0.0
+        self.violations = []
+        self.applied = {}
+
+    def observe_reference(self, reference_fg):
+        self.thinness = round(mask_thinness(reference_fg), 4)
+
+    def _relief(self):
+        return min(FIT_THINNESS_RELIEF_CAP, FIT_THINNESS_RELIEF * self.thinness)
+
+    def mask_iou_floor(self):
+        return round(FIT_MASK_IOU_FLOOR[self.complexity] - self._relief(), 4)
+
+    def region_iou_floor(self):
+        return round(FIT_REGION_IOU_FLOOR[self.complexity] - self._relief(), 4)
+
+    def floor(self, label, requested, limit):
+        """Minimum-style threshold: the spec may raise it, never lower it."""
+        if requested is None:
+            return limit
+        value = float(requested)
+        if value < limit - 1e-9:
+            self.violations.append(
+                f"{label}: spec asks {value:.4g}, policy floor is {limit:.4g}")
+            return limit
+        return value
+
+    def ceiling(self, label, requested, name):
+        """Maximum-style threshold: the spec may tighten it, never loosen it."""
+        limit = FIT_ERROR_CEILINGS[name]
+        if requested is None:
+            return limit
+        value = float(requested)
+        if value > limit + 1e-9:
+            self.violations.append(
+                f"{label}: spec asks {value:.4g}, policy ceiling is {limit:.4g}")
+            return limit
+        return value
+
+
+def load_complexity_class(out_dir):
+    path = Path(out_dir) / "reconstruction_plan.json"
+    if not path.is_file():
+        return None
+    try:
+        plan = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    complexity = plan.get("complexity") if isinstance(plan, dict) else None
+    if isinstance(complexity, dict):
+        return complexity.get("class")
+    return None
+
+
 def stage_fit(args):
     import numpy as np
 
@@ -980,6 +1352,7 @@ def stage_fit(args):
         thresholds = spec.get("thresholds", {})
         if not isinstance(thresholds, dict):
             raise ValueError("thresholds must be an object")
+        policy = FitThresholdPolicy(load_complexity_class(out_dir))
         gates = []
         mask_config = spec.get("mask")
         reference_fg = None
@@ -1005,14 +1378,26 @@ def stage_fit(args):
                 for index in range(2)))
             area_ratio_error = abs(
                 render_obs["area_fraction"] / ref_obs["area_fraction"] - 1.0)
-            min_iou = float(mask_config.get(
-                "min_iou", thresholds.get("mask_min_iou", 0.70)))
-            max_bbox = float(mask_config.get(
-                "max_bbox_error", thresholds.get("bbox_max_error", 0.05)))
-            max_centroid = float(mask_config.get(
-                "max_centroid_error", thresholds.get("centroid_max_error", 0.04)))
-            max_area = float(mask_config.get(
-                "max_area_ratio_error", thresholds.get("area_ratio_max_error", 0.25)))
+            policy.observe_reference(reference_fg)
+            min_iou = policy.floor(
+                "mask.min_iou",
+                mask_config.get("min_iou", thresholds.get("mask_min_iou")),
+                policy.mask_iou_floor())
+            max_bbox = policy.ceiling(
+                "mask.max_bbox_error",
+                mask_config.get("max_bbox_error",
+                                thresholds.get("bbox_max_error")),
+                "bbox_max_error")
+            max_centroid = policy.ceiling(
+                "mask.max_centroid_error",
+                mask_config.get("max_centroid_error",
+                                thresholds.get("centroid_max_error")),
+                "centroid_max_error")
+            max_area = policy.ceiling(
+                "mask.max_area_ratio_error",
+                mask_config.get("max_area_ratio_error",
+                                thresholds.get("area_ratio_max_error")),
+                "area_ratio_max_error")
             fit_gate(gates, "mask_iou", "mask", f">= {min_iou:.4f}",
                      round(iou, 6), iou >= min_iou)
             fit_gate(gates, "mask_bbox", "mask", f"<= {max_bbox:.4f}",
@@ -1090,15 +1475,19 @@ def stage_fit(args):
             render_area = int(render_crop.sum())
             area_error = (abs(render_area / reference_area - 1.0)
                           if reference_area else math.inf)
-            min_iou = float(entry.get(
-                "min_iou", thresholds.get("region_min_iou", 0.75)))
-            max_area = float(entry.get(
-                "max_area_ratio_error",
-                thresholds.get("region_area_ratio_max_error", 0.20)))
-            if spec_version == 2 and not 0.60 <= min_iou <= 1.0:
+            min_iou = policy.floor(
+                f"silhouette region {region_id}.min_iou",
+                entry.get("min_iou", thresholds.get("region_min_iou")),
+                policy.region_iou_floor())
+            max_area = policy.ceiling(
+                f"silhouette region {region_id}.max_area_ratio_error",
+                entry.get("max_area_ratio_error",
+                          thresholds.get("region_area_ratio_max_error")),
+                "region_area_ratio_max_error")
+            if spec_version == 2 and not 0.0 <= min_iou <= 1.0:
                 raise ValueError(
                     f"silhouette region {region_id}.min_iou must be within "
-                    "[0.60, 1.00] for fit spec version 2")
+                    "[0.00, 1.00]")
             if spec_version == 2 and not 0.0 <= max_area <= 0.35:
                 raise ValueError(
                     f"silhouette region {region_id}.max_area_ratio_error must "
@@ -1122,7 +1511,7 @@ def stage_fit(args):
         dg = depsgraph()
         landmark_records = []
         landmark_map = {}
-        default_landmark_error = float(thresholds.get("landmark_max_error", 0.04))
+        default_landmark_error = thresholds.get("landmark_max_error")
         landmarks = spec.get("landmarks", [])
         if not isinstance(landmarks, list):
             raise ValueError("landmarks must be a list")
@@ -1146,7 +1535,10 @@ def stage_fit(args):
                 }
                 landmark_map[landmark_id] = record
                 if bool(entry.get("gate", True)):
-                    maximum = float(entry.get("max_error", default_landmark_error))
+                    maximum = policy.ceiling(
+                        f"landmark {landmark_id}.max_error",
+                        entry.get("max_error", default_landmark_error),
+                        "landmark_max_error")
                     fit_gate(gates, landmark_id, "landmark", f"<= {maximum:.4f}",
                              round(error, 6), error <= maximum)
                 draw_cross(overlay, reference_uv, (1.0, 0.85, 0.05))
@@ -1158,6 +1550,32 @@ def stage_fit(args):
                          "unmeasurable", False, str(exc))
             landmark_records.append(record)
         base_report["landmarks"] = landmark_records
+
+        # A landmark read off an image carries irreducible estimation error.
+        # Twenty of them agreeing with the render to six decimal places did not
+        # come from the image: they were back-filled by projecting the model
+        # through its own camera, which turns every landmark, ratio, frame-axis,
+        # and pose-chain gate into the model grading itself.
+        gated = [record for record in landmark_records
+                 if isinstance(record.get("error"), (int, float))]
+        if len(gated) >= LANDMARK_PROVENANCE_MIN_SAMPLES:
+            errors = sorted(record["error"] for record in gated)
+            median = errors[len(errors) // 2]
+            base_report["landmark_provenance"] = {
+                "median_error": round(median, 9),
+                "max_error": round(errors[-1], 9),
+                "floor": LANDMARK_PROVENANCE_FLOOR,
+            }
+            if median < LANDMARK_PROVENANCE_FLOOR:
+                fit_gate(
+                    gates, "landmark_provenance", "policy",
+                    f"median error >= {LANDMARK_PROVENANCE_FLOOR:g}",
+                    round(median, 9), False,
+                    f"{len(gated)} landmarks agree with the render to a median "
+                    f"of {median:.2g} — reference_uv was projected from the "
+                    "model, not observed in the image, so every landmark, "
+                    "ratio, and pose gate here is vacuous; re-read each point "
+                    "off the saved reference")
 
         ratio_records = []
         ratios = spec.get("ratios", [])
@@ -1191,8 +1609,11 @@ def stage_fit(args):
                 target_ratio = ref_num / ref_den
                 measured_ratio = got_num / got_den
                 relative_error = abs(measured_ratio / target_ratio - 1.0)
-                maximum = float(entry.get(
-                    "max_relative_error", thresholds.get("ratio_max_relative_error", 0.10)))
+                maximum = policy.ceiling(
+                    f"ratio {ratio_id}.max_relative_error",
+                    entry.get("max_relative_error",
+                              thresholds.get("ratio_max_relative_error")),
+                    "ratio_max_relative_error")
                 record = {
                     "id": ratio_id,
                     "target": target_ratio,
@@ -1213,8 +1634,7 @@ def stage_fit(args):
         if isinstance(pose_config, dict):
             pose_records["mode"] = str(pose_config.get("mode", ""))
             pose_ids = set()
-            default_axis_error = float(
-                thresholds.get("pose_axis_max_angle_error_deg", 4.0))
+            default_axis_error = thresholds.get("pose_axis_max_angle_error_deg")
             for index, entry in enumerate(pose_config.get("frame_axes", [])):
                 if not isinstance(entry, dict):
                     raise ValueError(f"pose.frame_axes[{index}] must be an object")
@@ -1234,12 +1654,13 @@ def stage_fit(args):
                     render_angle = directed_angle_deg(
                         points[0]["render_uv"], points[1]["render_uv"])
                     error = angle_error_deg(reference_angle, render_angle)
-                    maximum = float(entry.get(
-                        "max_angle_error_deg", default_axis_error))
-                    if spec_version == 2 and not 0.0 < maximum <= 12.0:
+                    maximum = policy.ceiling(
+                        f"pose frame axis {axis_id}.max_angle_error_deg",
+                        entry.get("max_angle_error_deg", default_axis_error),
+                        "pose_axis_max_angle_error_deg")
+                    if maximum <= 0.0:
                         raise ValueError(
-                            "pose frame-axis max_angle_error_deg must be within "
-                            "(0, 12] for fit spec version 2")
+                            "pose frame-axis max_angle_error_deg must be positive")
                     record = {
                         "id": axis_id,
                         "landmarks": ids,
@@ -1257,12 +1678,12 @@ def stage_fit(args):
                              "unmeasurable", False, str(exc))
                 pose_records["frame_axes"].append(record)
 
-            default_segment_error = float(
-                thresholds.get("pose_segment_max_angle_error_deg", 5.0))
-            default_joint_error = float(
-                thresholds.get("pose_joint_max_angle_error_deg", 7.0))
-            default_length_error = float(
-                thresholds.get("pose_length_fraction_max_error", 0.04))
+            default_segment_error = thresholds.get(
+                "pose_segment_max_angle_error_deg")
+            default_joint_error = thresholds.get(
+                "pose_joint_max_angle_error_deg")
+            default_length_error = thresholds.get(
+                "pose_length_fraction_max_error")
             for index, entry in enumerate(pose_config.get("chains", [])):
                 if not isinstance(entry, dict):
                     raise ValueError(f"pose.chains[{index}] must be an object")
@@ -1310,24 +1731,24 @@ def stage_fit(args):
                     length_errors = [
                         abs(a / reference_total - b / render_total)
                         for a, b in zip(reference_lengths, render_lengths)]
-                    maximum_segment = float(entry.get(
-                        "max_segment_angle_error_deg", default_segment_error))
-                    maximum_joint = float(entry.get(
-                        "max_joint_angle_error_deg", default_joint_error))
-                    maximum_length = float(entry.get(
-                        "max_length_fraction_error", default_length_error))
-                    if spec_version == 2 and not 0.0 < maximum_segment <= 15.0:
+                    maximum_segment = policy.ceiling(
+                        f"pose chain {chain_id}.max_segment_angle_error_deg",
+                        entry.get("max_segment_angle_error_deg",
+                                  default_segment_error),
+                        "pose_segment_max_angle_error_deg")
+                    maximum_joint = policy.ceiling(
+                        f"pose chain {chain_id}.max_joint_angle_error_deg",
+                        entry.get("max_joint_angle_error_deg",
+                                  default_joint_error),
+                        "pose_joint_max_angle_error_deg")
+                    maximum_length = policy.ceiling(
+                        f"pose chain {chain_id}.max_length_fraction_error",
+                        entry.get("max_length_fraction_error",
+                                  default_length_error),
+                        "pose_length_fraction_max_error")
+                    if min(maximum_segment, maximum_joint, maximum_length) <= 0.0:
                         raise ValueError(
-                            "pose chain max_segment_angle_error_deg must be "
-                            "within (0, 15] for fit spec version 2")
-                    if spec_version == 2 and not 0.0 < maximum_joint <= 20.0:
-                        raise ValueError(
-                            "pose chain max_joint_angle_error_deg must be within "
-                            "(0, 20] for fit spec version 2")
-                    if spec_version == 2 and not 0.0 < maximum_length <= 0.15:
-                        raise ValueError(
-                            "pose chain max_length_fraction_error must be within "
-                            "(0, 0.15] for fit spec version 2")
+                            "pose chain error tolerances must be positive")
                     measured_segment = max(segment_errors, default=0.0)
                     measured_joint = max(joint_errors, default=0.0)
                     measured_length = max(length_errors, default=0.0)
@@ -1394,11 +1815,16 @@ def stage_fit(args):
                     reference_centroid[1] - observation["centroid_uv"][1])
                 observation["bbox_error"] = bbox_error
                 observation["centroid_error"] = centroid_error
-                max_bbox = float(entry.get(
-                    "max_bbox_error", thresholds.get("instance_bbox_max_error", 0.05)))
-                max_centroid = float(entry.get(
-                    "max_centroid_error", thresholds.get(
-                        "instance_centroid_max_error", 0.04)))
+                max_bbox = policy.ceiling(
+                    f"instance {instance_id}.max_bbox_error",
+                    entry.get("max_bbox_error",
+                              thresholds.get("instance_bbox_max_error")),
+                    "instance_bbox_max_error")
+                max_centroid = policy.ceiling(
+                    f"instance {instance_id}.max_centroid_error",
+                    entry.get("max_centroid_error",
+                              thresholds.get("instance_centroid_max_error")),
+                    "instance_centroid_max_error")
                 fit_gate(gates, f"{instance_id}.bbox", "instance",
                          f"<= {max_bbox:.4f}", round(bbox_error, 6),
                          bbox_error <= max_bbox)
@@ -1443,8 +1869,11 @@ def stage_fit(args):
                     b = instance_map.get(b_id)
                     if a is None or b is None:
                         raise ValueError("relation references an unresolved instance")
-                    maximum = float(entry.get(
-                        "max_error", thresholds.get("relation_max_error", 0.05)))
+                    maximum = policy.ceiling(
+                        f"relation {relation_id}.max_error",
+                        entry.get("max_error",
+                                  thresholds.get("relation_max_error")),
+                        "relation_max_error")
                     if relation_type == "relative_position":
                         target_delta = [
                             b["reference_centroid_uv"][axis]
@@ -1488,6 +1917,18 @@ def stage_fit(args):
             raise ValueError(
                 "fit spec defines no gates; add mask, silhouette regions, landmarks, "
                 "pose, instances, or relations")
+        base_report["threshold_policy"] = {
+            "complexity_class": policy.complexity,
+            "reference_thinness": policy.thinness,
+            "mask_iou_floor": policy.mask_iou_floor(),
+            "region_iou_floor": policy.region_iou_floor(),
+            "loosening_attempts": policy.violations,
+        }
+        if policy.violations:
+            fit_gate(
+                gates, "threshold_policy", "policy", "spec may only tighten",
+                f"{len(policy.violations)} loosened threshold(s)", False,
+                "; ".join(policy.violations[:6]))
         save_rgba(renders_dir / "reference_overlay.png", overlay)
         passed_count = sum(1 for gate in gates if gate["pass"])
         base_report.update({
@@ -1601,7 +2042,11 @@ def stage_build(args):
     bpy.ops.wm.save_as_mainfile(filepath=str(out_dir / "scene.blend"))
 
     if not args.no_render:
-        render_views(out_dir, args.size, args.engine, args.form_diagnostics)
+        _, silhouettes = render_views(
+            out_dir, args.size, args.engine, args.form_diagnostics)
+        if silhouettes:
+            graph["view_silhouettes"] = silhouettes
+            (out_dir / "scene_graph.json").write_text(json.dumps(graph, indent=2))
 
     diag["build_ok"] = True
     diag["stats"] = graph["totals"]
@@ -1622,7 +2067,13 @@ def stage_render(args):
         print(f"{FAIL}:NO_SCENE] {blend} not found (run build first)")
         finish(1)
     bpy.ops.wm.open_mainfile(filepath=str(blend))
-    render_views(out_dir, args.size, args.engine, args.form_diagnostics)
+    _, silhouettes = render_views(
+        out_dir, args.size, args.engine, args.form_diagnostics)
+    graph_path = out_dir / "scene_graph.json"
+    if silhouettes and graph_path.is_file():
+        graph = json.loads(graph_path.read_text())
+        graph["view_silhouettes"] = silhouettes
+        graph_path.write_text(json.dumps(graph, indent=2))
     finish(0)
 
 

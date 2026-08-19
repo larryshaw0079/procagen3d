@@ -40,8 +40,10 @@ procagen3d-skill/
 
 ## Requirements
 
-- **Blender 4.x** (tested on 4.5 LTS). Discovery order: `--blender` flag →
-  `$PROCAGEN3D_BLENDER` → `blender` on PATH → `~/.cache/procagen3d/*/blender`.
+- **Blender 4.x or 5.x** (tested on 4.5 LTS and 5.2 LTS). Discovery order:
+  `--blender` flag → `$PROCAGEN3D_BLENDER` → `blender` on PATH →
+  `~/.cache/procagen3d/*/blender`. On macOS, Blender 5.x headless needs real
+  Metal GPU access; an agent sandbox makes it SIGSEGV at startup.
 - **Python 3.10+** for the driver. No pip packages — scripts are stdlib
   only; Blender stages use Blender's bundled Python.
 

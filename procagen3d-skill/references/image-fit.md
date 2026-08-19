@@ -5,20 +5,22 @@ into `fit_spec.json`, render through the declared camera, and make every numeric
 gate pass after every full build. Fit proves visible projection, not hidden
 geometry.
 
-Author new assets with schema `version: 2`. Version 1 remains supported only
-for rebuilding legacy assets. Version 2 adds mandatory local-silhouette and pose
-contracts so a loose whole-frame fit cannot hide wrong primitive families or
-an incorrect articulated stance.
+Schema `version: 2` is required, along with `reconstruction_plan.json`. Version
+1 is rejected for image-conditioned assets: it had no local-silhouette, pose, or
+shape-prior contract, which made declaring it a way to opt out of every
+reconstruction gate at once.
 
 ## Contents
 
 1. Author the contract
+1a. You do not set the pass mark
 2. Register the camera and mask
 3. Gate local silhouette regions
 4. Declare landmarks and ratios
 5. Gate rigid and articulated pose
 6. Declare scene instances and relations
 7. Run and interpret the gate
+8. A passing fit is not a correct model
 
 ## 1. Author the contract
 
@@ -42,9 +44,40 @@ image-derived targets here; keep explicit user requirements in `spec.yaml`.
 ```
 
 Measure against the preserved reference copy, not a screenshot or resized
-preview. Record ambiguous evidence in `priors.md`; do not loosen or tighten a
-threshold to pretend uncertain evidence is exact. Version 2 also requires
-`reconstruction_plan.json`; see `reconstruction-planning.md`.
+preview. Record ambiguous evidence in `priors.md`. Version 2 and
+`reconstruction_plan.json` are both required for any image-conditioned asset;
+see `reconstruction-planning.md`.
+
+## 1a. You do not set the pass mark
+
+Pass thresholds live in `blender_stages.py`, not in your spec. A spec value is
+honoured only when it is **stricter** than policy; anything looser is clamped
+back and the run fails on the `threshold_policy` gate, which lists every value
+you tried to relax. Omit thresholds entirely unless you are tightening one.
+
+Whole-frame mask IoU floors, by the plan's complexity class:
+
+| complexity | mask IoU | region IoU |
+|---|---:|---:|
+| `simple` | 0.88 | 0.85 |
+| `moderate` | 0.84 | 0.82 |
+| `complex` | 0.80 | 0.78 |
+| `extreme` | 0.76 | 0.74 |
+
+Error ceilings are fixed: bbox 0.05, centroid 0.04, whole-frame area ratio
+0.20, region area ratio 0.18, landmark 0.04, ratio 0.10, pose axis 4°, chain
+segment 5°, chain joint 7°, chain length fraction 0.04, instance bbox 0.05,
+instance centroid 0.04, relation 0.05.
+
+Wiry subjects get an automatic allowance of up to 0.15 IoU, derived by eroding
+the reference mask and measuring how much of the foreground disappears. A
+bicycle earns it; a camera body does not. It is measured, so there is nothing
+to claim. The report records `threshold_policy.reference_thinness` and the
+floors actually applied.
+
+A floor you cannot reach is information. Fix the geometry, or report honestly
+that the reference does not support the reconstruction — never negotiate the
+bar.
 
 ## 2. Register the camera and mask
 
@@ -77,6 +110,15 @@ Record a real root lean separately only when ground/contact or articulation
 evidence proves it; a single floating product view cannot distinguish camera
 rotation from rigid object rotation.
 
+The camera is solved once, at probe time, and then **locked** into
+`reconstruction_plan.json` under `camera_solve`. `check` compares the fit
+spec's camera against that lock and fails on `CAMERA_LOCK` if they drift.
+This exists because a wrong camera and a wrong shape produce the same
+silhouette score, and when the camera is free to move it is always the shape
+that ends up deformed to compensate. Changing the camera later is a
+`refine-priors` decision: re-solve it against the reference, say why, and
+update the lock — never nudge it to rescue a failing fit.
+
 Choose one foreground-mask source:
 
 - `alpha`: threshold reference alpha;
@@ -96,14 +138,16 @@ Choose one foreground-mask source:
 ```
 
 Use a supplied mask for textured/nonuniform backgrounds. Border estimation is
-appropriate only for clean product renders. Defaults are deliberately lenient
-for whole-frame evidence; version 2's local regions provide the stricter shape
-checks.
+appropriate only for clean product renders. Whole-frame evidence is the weakest
+signal in the spec: a whole-object mask can pass while every local part is
+wrong, which is what local regions exist to prevent.
 
 ## 3. Gate local silhouette regions
 
-Declare at least three tight crops that cross informative contours. Choose
-regions around primitive decisions (box corner versus ellipsoid arc),
+Declare one tight crop for every two primary masses — at least three, up to
+eight. `check` enforces this as `FIT_REGION_COVERAGE`, because three regions on
+a thirty-mass mecha leaves nearly every family and pose decision untested.
+Choose regions around primitive decisions (box corner versus ellipsoid arc),
 pose-sensitive limbs, tapers, openings, or attachments. Do not use a crop that
 is nearly all foreground/background or simply repeats the whole frame.
 
@@ -123,10 +167,25 @@ is nearly all foreground/background or simply repeats the whole frame.
 
 The gate computes crop-local mask IoU and foreground-area error. The overlay
 draws magenta crop boxes. A region must contain a real contour; the tool rejects
-reference occupancy outside 2–98 percent, duplicate crops, v2 IoU thresholds
-below 0.60, and v2 area-error thresholds above 0.35.
+reference occupancy outside 2–98 percent and duplicate crops. Per-region
+`min_iou` and `max_area_ratio_error` are subject to §1a: state them only to go
+stricter than the policy floor for that complexity class.
 
 ## 4. Declare landmarks and ratios
+
+`reference_uv` is **what you saw in the image**. Read each point off the saved
+reference and write down that coordinate. Never obtain it by projecting your
+own model through the camera and copying the result: that makes the landmark,
+every ratio built on it, and every frame axis and pose chain that uses it a
+comparison of the model against itself, and they will all pass no matter how
+wrong the model is.
+
+The `landmark_provenance` gate detects this. Estimating a point from an image
+is worth about a pixel; if the median landmark error across five or more
+landmarks falls below 0.001, the targets were back-filled and the fit fails.
+Real agreement on a good model lands around 0.005–0.03. A landmark you cannot
+locate confidently in the image is a landmark you should not gate — set
+`"gate": false` and say so in `priors.md`.
 
 Place semantic empty objects at actual joints/control stations when necessary,
 then match their names with `anchor: "origin"`. Otherwise anchor to a matched
@@ -249,5 +308,24 @@ Read all evidence:
 Fix in this order: camera/frame → rigid root pose → articulated chains → macro
 dimensions/families → detail. Lock each passing layer before continuing. Never
 deform geometry to compensate for a knowingly wrong camera or joint pose.
+
+## 8. A passing fit is not a correct model
+
+Every metric on this page is measured in the image plane of one camera. Nothing
+here can see depth. A model that is a flattened bas-relief — correct from the
+reference viewpoint, paper-thin from the side — scores as well as a solid one,
+and optimising against these numbers alone actively produces that failure.
+
+Depth is gated separately, from the canonical orthographic renders, which all
+share one scale and are therefore directly comparable:
+
+- `PRIMARY_DEPTH` fails a primary mass whose smallest dimension drops below 8%
+  of its largest, unless it is genuinely a shell, plate, or strand;
+- `VIEW_COLLAPSE` fails when the smallest canonical silhouette falls below 10%
+  of the largest, and warns below 22%.
+
+So `fit` passing means "registers correctly from this camera," never "is
+correct." Read `sheet.png` and judge the side and top views yourself before
+calling shape passed.
 `check` rejects missing, failed, or stale fit evidence whenever preserved
 `reference_NN.*` inputs exist.

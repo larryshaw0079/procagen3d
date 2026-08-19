@@ -38,6 +38,41 @@ Estimate dimensions only after this decomposition. Measure along object axes
 or with pose-corrected ratios. Mark depth and occluded links inferred when one
 view cannot determine them.
 
+### Rigid equipment is authored from one axis, not from endpoints
+
+A rifle, spear, mast, axle, or pipe run is a single straight object. Author it
+as one origin plus one direction and derive every station along that line:
+
+```python
+RIFLE_AXIS = (RIFLE_MUZZLE - RIFLE_BUTT).normalized()
+RIFLE_LENGTH = (RIFLE_MUZZLE - RIFLE_BUTT).length
+def station(t):                      # t in 0..1 from butt to muzzle
+    return RIFLE_BUTT + RIFLE_AXIS * (RIFLE_LENGTH * t)
+receiver = box_between("Rifle_Receiver", station(0.00), station(0.26), ...)
+barrel   = box_between("Rifle_Barrel",   station(0.26), station(1.00), ...)
+```
+
+Placing the butt, the receiver end, and the muzzle as three independent points
+is how a straight weapon comes out bent. Each point gets nudged until it sits
+right in the reference, and because one view cannot see depth, the depth
+component of each is chosen freely — so the parts end up pointing in different
+directions while the projection still looks correct. A real run produced a
+receiver and barrel 22° apart, with the muzzle sitting 3.2 units off the
+receiver's own axis on a 10.7-unit weapon, and it looked fine from the
+reference camera.
+
+Declare the assembly so the checker can hold it straight:
+
+```json
+"rigid_axes": [
+  {"pattern": "Rifle_*", "max_deviation_deg": 5}
+]
+```
+
+`RIGID_AXIS` compares the parts' measured long axes and fails past the
+tolerance. Declare only genuinely rigid groups: an articulated chain such as
+thigh-plus-shin is elongated too and is supposed to bend.
+
 Use `fit_spec.json` version 2. Its `pose.frame_axes` gates projected object-axis
 directions; `pose.chains` gates segment directions, bend angles, and normalized
 segment lengths. Add at least three tight `silhouette_regions` around
@@ -79,6 +114,14 @@ mostly prisms plus a truly curved grip; a mecha may use faceted armor shells and
 small capsule-like joint cores. Never convert correct blocks into lofts merely
 to make a `mixed` check pass.
 
+No gate asks for curved mass. The checks run the other way: `FORM_PROMISED_CURVATURE`
+fails masses you declared `continuous`/`shell` that were built as flat-sided
+blocks, and `FORM_PROFILE_EVIDENCE` fires only when a `curved` profile has
+almost no measurable curvature anywhere — and its remedy is to declare
+`rectilinear` or `mixed`, not to inflate correct blocks. If your object is a
+faceted, assembled thing, say so; boxes are a valid answer and the tool will
+never push you off them.
+
 Tag every planned structural mesh so the checker can compare program to plan:
 
 ```python
@@ -95,6 +138,40 @@ def mark_form(obj, role, topology, method, family, section_count=None):
 Use `method="analytic-primitive"` for a genuine sphere/ellipsoid/capsule.
 Boxes/prisms use `primitive-csg`, `profile-extrude`, or `boolean`; a plan that
 says `box` cannot be implemented with `loft`.
+
+### The tag is checked against the geometry, not just against the plan
+
+Every mesh is measured at build time and the signature is stored in
+`scene_graph.json`. `check` fails on `SHAPE_FAMILY_MEASURED` when the declared
+family contradicts what was actually built, so tagging a UV sphere `box` buys
+nothing. Two numbers do most of the work:
+
+- **`fill_ratio`** — solid volume over local bounding-box volume;
+- **`planar_area_fraction`** — surface area in the six largest coplanar
+  clusters, i.e. "does this thing have broad flat sides?"
+
+Measured on clean primitives:
+
+| built shape | `fill_ratio` | `planar_area_fraction` | `section_variation` |
+|---|---:|---:|---:|
+| plain box | 1.00 | 1.00 | 0.00 |
+| bevelled box (6% radius) | 0.99 | 0.82 | 0.00 |
+| heavily rounded box (22%) | 0.89 | 0.51 | 0.05 |
+| hexagonal prism | 0.75 | 0.76 | 0.00 |
+| cylinder | 0.78 | 0.35 | 0.00 |
+| cone | 0.26 | 0.37 | 1.50 |
+| sphere | 0.52 | 0.03 | 0.41 |
+| ellipsoid | 0.52 | 0.08 | 0.41 |
+| tapered loft | 0.41 | 0.32 | 0.64 |
+
+Read the middle column again: **bevelling a box barely moves it, and rounding
+it hard still leaves it at 0.51 against an ellipsoid's 0.08.** Softened corners
+are not curvature. If a mass measures above 0.40 there, it has flat sides and
+belongs to `box` or `prism`, whatever the highlights suggest.
+
+`section_variation` is the prism/loft discriminator: it is zero for anything
+with a constant section, so a straight extrusion of a flat profile cannot be
+passed off as a `loft`.
 
 ## 3. Classify perceptual complexity
 
@@ -137,6 +214,18 @@ Write `<out>/reconstruction_plan.json` before code:
 ```json
 {
   "version": 1,
+  "camera_solve": {
+    "locked": true,
+    "candidates_tested": [
+      "az 28 el 12 fov 34: chosen — lens ellipse axis ratio 0.62 matches, top plate barely visible",
+      "az 40 el 20 fov 34: rejected — shows far too much of the top plate and over-widens the grip"
+    ],
+    "camera": {
+      "projection": "perspective",
+      "azimuth_deg": 28.0, "elevation_deg": 12.0, "roll_deg": -3.0,
+      "fov_y_deg": 34.0, "distance_m": 2.8, "target_m": [0.0, 0.0, 0.45]
+    }
+  },
   "complexity": {
     "class": "complex",
     "occupied_regions": [
@@ -192,6 +281,11 @@ Write `<out>/reconstruction_plan.json` before code:
 The example is abbreviated: a `complex` plan must actually list all 16–27
 visible groups, not merely claim 18 in `drivers`.
 
+`camera_solve` is mandatory: name at least two viewpoints you actually compared
+and why the loser lost, then lock the winner. `check` compares `fit_spec.camera`
+against this lock and fails on `CAMERA_LOCK` if they diverge. Solve the camera
+once; do not tune it later to rescue a fit.
+
 Priorities are `identity | structural | secondary | micro | inferred`.
 Every non-inferred group is required by default. The checker verifies family
 tags and construction methods, primary/macro prior coverage, feature patterns
@@ -199,9 +293,40 @@ and counts, complexity-band consistency, identity-group minimums, occupied
 region coverage, and adaptive detail floors. Use only the object-centric 3×3
 region names from §3. A moderate/complex/extreme plan must cover at least
 3/5/6 occupied regions respectively, and every declared occupied region needs
-a required visible feature group. These gates prove plan compliance, not that
-the visual evidence was interpreted correctly; inspection must still compare
-the saved reference.
+a required visible feature group.
+
+Name-pattern coverage proves only that meshes were named after the plan, so it
+is backed by a measurement. `REGION_DENSITY` bins every mesh by where its
+centre actually sits in the object's 3×3 grid and requires 2/4/8/12 meshes in
+each declared occupied region for simple/moderate/complex/extreme. This is what
+makes "the torso is one undifferentiated blob" a machine-detectable failure:
+two hundred panel slivers on the legs cannot pay for an empty chest.
+
+Repeated parts have a congruence contract. `INSTANCE_CONGRUENCE` groups meshes
+by `Name_NN` and compares volume and surface area — both rotation-invariant, so
+a builder that bakes each instance's rotation into its vertices still reads as
+congruent. Eighteen swords fanned across a back are eighteen calls to one
+`build_sword()` differing only in transform, not eighteen shapes eyeballed into
+a silhouette.
+
+Arrays whose members genuinely differ — seams tracing panel edges of different
+lengths, per-glyph letter blocks, a stack of trim rings — declare it once:
+
+```json
+"instance_arrays": [
+  {"pattern": "WingBlade_*", "congruent": true, "tolerance": 0.05},
+  {"pattern": "BodySeam_*", "congruent": false,
+   "reason": "each seam traces a different panel edge"}
+]
+```
+
+Undeclared arrays warn above 8% spread, and fail above 25% once they reach six
+members: at that size an unexplained inconsistency is drift, and the fix is
+either one shared builder or one line saying why not.
+
+These gates prove plan compliance and geometric honesty, not that the visual
+evidence was interpreted correctly; inspection must still compare the saved
+reference.
 
 ## 5. Pass the reconstruction probe
 
@@ -223,3 +348,26 @@ registered views. Pass only when:
 If a family is wrong, revise the prior and rewrite that builder. If pose is
 wrong, repair camera/root/joint transforms. Do not adjust dimensions or add
 detail until those two layers pass.
+
+## 6. Complex and extreme targets: probe one assembly at a time
+
+A stool or a drone fits in one mental chunk, which is why single-pass
+generation works for them and collapses on a car, a mecha, or a character. For
+`complex` and `extreme` plans, do not write the whole object and hope the
+aggregate score tells you what is wrong — it cannot. Work assembly by assembly:
+
+1. Split the object into named assemblies (torso, head, each limb, equipment,
+   bodywork zone). Five to nine is typical.
+2. Give each one at least one `silhouette_regions` crop in `fit_spec.json`.
+   `FIT_REGION_COVERAGE` requires roughly one region per two primary masses, so
+   this falls out naturally.
+3. Probe and register the assemblies in identity order, most recognisable
+   first. Read the per-region rows in `fit_report.json` after every build; a
+   failing region names the assembly that is wrong, which whole-frame IoU never
+   does.
+4. Only add detail to an assembly whose region already passes. Detail on a
+   wrong mass is wasted work that the repair budget then has to protect.
+
+Repair budgets scale with the same class: 3 iterations for `simple`/`moderate`,
+6 for `complex`, 8 for `extreme`. A complex object legitimately needs more
+passes; what it does not get is a lower bar.

@@ -24,6 +24,7 @@ import difflib
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -57,16 +58,50 @@ def find_blender(explicit=None):
              "put blender on PATH, or install under ~/.cache/procagen3d/.")
 
 
+def _fatal_signal(code):
+    """POSIX signal number if `code` is a signal death, else None."""
+    if code is None:
+        return None
+    if code < 0:
+        return -code
+    if 128 < code < 160:
+        return code - 128
+    return None
+
+
+def _crash_log_from_output(output):
+    for line in output.splitlines():
+        if line.startswith("Writing:") and ".crash.txt" in line:
+            path = Path(line.split("Writing:", 1)[1].strip())
+            if path.is_file():
+                return path
+    return None
+
+
+def _metal_startup_crash(crash_path):
+    if crash_path is None:
+        return False
+    try:
+        text = crash_path.read_text(errors="replace")
+    except OSError:
+        return False
+    return ("supports_barycentric_whitelist" in text
+            or "metal_is_supported" in text
+            or "GPU_backend_type_selection_detect" in text)
+
+
 def run_blender(stage_args, blender=None):
+    blender_bin = find_blender(blender)
     cmd = [
-        find_blender(blender), "--background", "--factory-startup",
+        blender_bin, "--background", "--factory-startup",
         "--python-exit-code", "1",
         "--python", str(SCRIPT_DIR / "blender_stages.py"), "--", *stage_args,
     ]
     proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT)
+    output = proc.stdout or ""
     code = proc.returncode
-    for line in proc.stdout.splitlines():
+    for line in output.splitlines():
         m = re.match(r"^PROCAGEN3D_EXIT:(\d+)$", line.strip())
         if m:
             code = int(m.group(1))
@@ -75,6 +110,32 @@ def run_blender(stage_args, blender=None):
                  "Fra:", "Read blend:", "WARN (gpu", "INFO ",
                  "Color management")) and "| INFO" not in line:
             print(line)
+    wrote_crash = "Writing:" in output and ".crash.txt" in output
+    sig = _fatal_signal(code)
+    if sig is not None or wrote_crash:
+        crash_path = _crash_log_from_output(output)
+        version = "Blender"
+        for line in output.splitlines():
+            if line.startswith("Blender "):
+                version = line.strip()
+                break
+        if sig == 11 or _metal_startup_crash(crash_path):
+            fail(
+                "BLENDER_CRASH",
+                f"{version} ({blender_bin}) SIGSEGV'd during Metal GPU "
+                "detection, before any ProcAgen3D Python ran. On macOS this "
+                "is a Blender 5.x bug when the process cannot see the GPU "
+                "(typical of an agent sandbox). Re-run this command with "
+                "full/unsandboxed permissions so Metal can initialize — you "
+                "do not need to downgrade to 4.x. "
+                f"Crash log: {crash_path or '(none)'}")
+            return 1
+        fail(
+            "BLENDER_CRASH",
+            f"{version} ({blender_bin}) aborted"
+            + (f" with signal {sig}" if sig else f" with exit {code}")
+            + (f"; crash log: {crash_path}" if crash_path else ""))
+        return 1
     return code
 
 
@@ -203,8 +264,16 @@ def image_fit_errors(dir_path):
     reference_path = root / reference_name if isinstance(reference_name, str) else None
     if reference_path is None or not reference_path.is_file():
         errors.append(f"fit reference is missing: {reference_name!r}")
-    if spec.get("version") == 2 and not (root / "reconstruction_plan.json").is_file():
-        errors.append("fit spec version 2 requires reconstruction_plan.json")
+    # Version 1 predates local silhouette, pose, and shape-prior evidence.
+    # Leaving it available let an image-conditioned asset opt out of every
+    # reconstruction gate by declaring the older schema.
+    if spec.get("version") != 2:
+        errors.append(
+            f"image-conditioned assets require fit_spec version 2 (found "
+            f"{spec.get('version')!r}) — version 1 has no local silhouette, "
+            "pose, or shape-prior contract")
+    if not (root / "reconstruction_plan.json").is_file():
+        errors.append("image-conditioned assets require reconstruction_plan.json")
     if not report.get("passed"):
         summary = report.get("summary", {})
         errors.append(
@@ -344,9 +413,11 @@ def load_reconstruction_plan(dir_path):
     """Load the v2 image-reconstruction contract, when present/required."""
     root = Path(dir_path)
     path = root / "reconstruction_plan.json"
-    required = False
+    # Any image-conditioned asset needs the plan, not only one that happens to
+    # declare a version-2 fit spec.
+    required = bool(sorted(root.glob("reference_[0-9][0-9].*")))
     fit_path = root / "fit_spec.json"
-    if fit_path.is_file():
+    if not required and fit_path.is_file():
         try:
             fit_spec = json.loads(fit_path.read_text())
             required = (isinstance(fit_spec, dict)
@@ -384,6 +455,25 @@ def load_reconstruction_plan(dir_path):
                 "object-centric 3x3 regions")
         elif len(set(occupied_regions)) != len(occupied_regions):
             errors.append("complexity.occupied_regions contains duplicates")
+    # The camera must be solved once, on evidence, and then held still.  With a
+    # free camera, a wrong viewpoint and a wrong shape are indistinguishable
+    # from a single silhouette score, and the shape is what ends up deformed.
+    camera_solve = plan.get("camera_solve")
+    if not isinstance(camera_solve, dict):
+        errors.append("camera_solve must be an object with the solved camera, "
+                      "the alternatives you tested, and locked: true")
+    else:
+        if camera_solve.get("locked") is not True:
+            errors.append("camera_solve.locked must be true before synthesis")
+        if not isinstance(camera_solve.get("camera"), dict):
+            errors.append("camera_solve.camera must hold the solved camera, in "
+                          "the same form as fit_spec.camera")
+        candidates = camera_solve.get("candidates_tested")
+        if (not isinstance(candidates, list) or len(candidates) < 2
+                or any(not isinstance(item, str) or not item.strip()
+                       for item in candidates)):
+            errors.append("camera_solve.candidates_tested must record at least "
+                          "two viewpoints you compared, and why the loser lost")
     if not isinstance(plan.get("shape_priors"), list) or not plan.get("shape_priors"):
         errors.append("shape_priors must be a non-empty list")
     if (not isinstance(plan.get("detail_features"), list)
@@ -419,6 +509,269 @@ def is_shallow_form_cage(obj):
         return False
     return ((base_vertices is not None and base_vertices <= 8)
             or (base_polys is not None and base_polys <= 6))
+
+
+# Measured contradictions between a declared shape family and the geometry the
+# program actually emitted.  Each entry is a predicate over the build-time shape
+# signature that must be FALSE for the declared family, plus the reason printed
+# when it is true.  Only clear contradictions are listed: the point is to make
+# an ellipsoid impossible to ship under a `box` label, not to guess intent.
+#
+# Reference values for a clean primitive:
+#   fill_ratio            box 1.00  cylinder 0.79  ellipsoid 0.52  cone 0.26
+#   planar_area_fraction  box 1.00  cylinder 0.42  ellipsoid 0.05  loft 0.05
+SHAPE_FAMILY_CONTRADICTIONS = {
+    "box": [
+        (lambda s: s["planar_area_fraction"] < 0.40,
+         "no broad planar field: only {planar_area_fraction:.0%} of the surface "
+         "lies in its six largest coplanar clusters (a plain box measures 100%, "
+         "a bevelled box 82%, a heavily rounded box 51%, an ellipsoid 8%) — "
+         "this mesh is a blob, not a box"),
+    ],
+    "prism": [
+        (lambda s: s["planar_area_fraction"] < 0.40,
+         "no broad planar field: {planar_area_fraction:.0%} planar area — a "
+         "prism is flat-sided by definition"),
+    ],
+    "cylinder": [
+        (lambda s: s["fill_ratio"] > 0.92,
+         "fills {fill_ratio:.0%} of its bounding box — that is a box, not a "
+         "cylinder (a cylinder fills ~79%)"),
+        (lambda s: s["fill_ratio"] < 0.45,
+         "fills only {fill_ratio:.0%} of its bounding box — too hollow/tapered "
+         "for a cylinder"),
+    ],
+    "cone": [
+        (lambda s: s["fill_ratio"] > 0.62,
+         "fills {fill_ratio:.0%} of its bounding box — a cone fills ~26%"),
+    ],
+    "sphere": [
+        (lambda s: s["planar_area_fraction"] > 0.55,
+         "{planar_area_fraction:.0%} of the surface is flat — this is a faceted "
+         "block wearing a sphere label"),
+        (lambda s: s["fill_ratio"] > 0.80,
+         "fills {fill_ratio:.0%} of its bounding box — a sphere fills ~52%"),
+    ],
+    "ellipsoid": [
+        (lambda s: s["planar_area_fraction"] > 0.55,
+         "{planar_area_fraction:.0%} of the surface is flat — this is a box or "
+         "prism, and the plan should say so"),
+        (lambda s: s["fill_ratio"] > 0.80,
+         "fills {fill_ratio:.0%} of its bounding box — an ellipsoid fills ~52%"),
+    ],
+    "capsule": [
+        (lambda s: s["planar_area_fraction"] > 0.55,
+         "{planar_area_fraction:.0%} of the surface is flat — not a capsule"),
+    ],
+    "loft": [
+        (lambda s: s["planar_area_fraction"] > 0.80
+         and s["section_variation"] < 0.10,
+         "constant section ({section_variation:.2f}) and {planar_area_fraction:.0%} "
+         "planar area: this is a straight extrusion of a flat profile, so plan "
+         "it as a box or prism instead of softening a block into a loft"),
+    ],
+    "sweep": [
+        (lambda s: s["planar_area_fraction"] > 0.80
+         and s["section_variation"] < 0.10,
+         "constant section and {planar_area_fraction:.0%} planar area — a "
+         "straight prism, not a sweep"),
+    ],
+    "revolve": [
+        (lambda s: s["fill_ratio"] > 0.92,
+         "fills {fill_ratio:.0%} of its bounding box — a lathe of any profile "
+         "cannot fill a box"),
+    ],
+    "surface-grid": [
+        (lambda s: s["planar_area_fraction"] > 0.85,
+         "{planar_area_fraction:.0%} planar area — a flat card, not a shaped "
+         "surface grid"),
+    ],
+}
+# Families whose whole justification is curvature.  A macro mass may only claim
+# one of these when the geometry is measurably curved, which is what keeps a
+# faceted mecha from dissolving into ellipsoids to satisfy a form quota.
+CURVED_FAMILIES = {"sphere", "ellipsoid", "capsule", "loft", "sweep",
+                   "revolve", "surface-grid", "shell"}
+PLATE_FAMILIES = {"shell", "surface-grid", "strand"}
+PLATE_TOPOLOGIES = {"shell", "relief", "strand"}
+# A primary mass thinner than this against its own longest axis is a cut-out,
+# not a volume.  Bodies, limbs, and housings that collapse to a slab are the
+# signature of fitting one camera and ignoring depth.
+PRIMARY_THIN_RATIO_FLOOR = 0.08
+# Ratio of the smallest to largest orthographic silhouette area.  A solid
+# subject stays well above this; a bas-relief does not.
+VIEW_COLLAPSE_FAIL = 0.10
+VIEW_COLLAPSE_WARN = 0.22
+INSTANCE_ARRAY_RE = re.compile(r"^(?P<base>.*?[A-Za-z])_?(?P<index>\d{1,3})$")
+CONGRUENCE_WARN = 0.08
+CONGRUENCE_FAIL = 0.25
+
+
+REGION_MESH_FLOOR = {"simple": 2, "moderate": 4, "complex": 8, "extreme": 12}
+REGION_ROWS = ("bottom", "middle", "top")
+REGION_COLUMNS = ("left", "center", "right")
+
+
+def shape_signature(obj):
+    sig = obj.get("shape_signature")
+    return sig if isinstance(sig, dict) else None
+
+
+# A rifle, spear, mast, axle, or pipe run is one straight object.  Its parts
+# only bend apart when each endpoint is placed independently to hit a position
+# in the reference image, because a single view cannot see the depth that the
+# bend hides in.
+RIGID_AXIS_FAIL_DEG = 5.0
+RIGID_AXIS_WARN_DEG = 8.0
+RIGID_AXIS_MIN_ELONGATION = 1.8
+
+
+def elongated_axis(obj):
+    signature = shape_signature(obj)
+    if signature is None:
+        return None
+    axis = signature.get("world_axis")
+    elongation = signature.get("elongation")
+    if (not isinstance(axis, list) or len(axis) != 3
+            or not isinstance(elongation, (int, float))
+            or elongation < RIGID_AXIS_MIN_ELONGATION):
+        return None
+    return [float(c) for c in axis]
+
+
+def axis_disagreement_deg(a, b):
+    """Angle between two undirected axes, in degrees."""
+    dot = abs(sum(x * y for x, y in zip(a, b)))
+    return math.degrees(math.acos(max(-1.0, min(1.0, dot))))
+
+
+def rigid_axis_spread(members):
+    """Worst pairwise long-axis disagreement across an assembly's parts."""
+    axes = [(obj["name"], elongated_axis(obj)) for obj in members]
+    axes = [(name, axis) for name, axis in axes if axis is not None]
+    if len(axes) < 2:
+        return None, None
+    worst = 0.0
+    culprit = ""
+    for index, (name_a, axis_a) in enumerate(axes):
+        for name_b, axis_b in axes[index + 1:]:
+            angle = axis_disagreement_deg(axis_a, axis_b)
+            if angle > worst:
+                worst, culprit = angle, f"{name_a} vs {name_b}"
+    return worst, culprit
+
+
+CAMERA_LOCK_TOLERANCE = {
+    "azimuth_deg": 0.5, "elevation_deg": 0.5, "roll_deg": 0.5,
+    "fov_y_deg": 0.5, "distance_m": 1e-3, "ortho_scale_m": 1e-3,
+    "shift_x": 1e-3, "shift_y": 1e-3,
+}
+
+
+def camera_drift(locked, actual):
+    """Describe how a fit camera differs from the locked solve, if it does."""
+    drift = []
+    for key in ("projection",):
+        if str(locked.get(key, "perspective")) != str(actual.get(key, "perspective")):
+            drift.append(f"{key} {locked.get(key)!r}->{actual.get(key)!r}")
+    for key, tolerance in CAMERA_LOCK_TOLERANCE.items():
+        if key not in locked and key not in actual:
+            continue
+        a, b = locked.get(key, 0.0), actual.get(key, 0.0)
+        if not (isinstance(a, (int, float)) and isinstance(b, (int, float))):
+            continue
+        if abs(float(a) - float(b)) > tolerance:
+            drift.append(f"{key} {a:g}->{b:g}")
+    for key in ("target_m", "location_m"):
+        a, b = locked.get(key), actual.get(key)
+        if isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
+            if any(abs(float(x) - float(y)) > 1e-3 for x, y in zip(a, b)):
+                drift.append(f"{key} {a}->{b}")
+        elif (a is None) != (b is None):
+            drift.append(f"{key} {'set' if b is not None else 'removed'}")
+    return "; ".join(drift[:6])
+
+
+def region_occupancy(graph, meshes):
+    """Count meshes whose centre falls in each object-centric 3x3 region.
+
+    The grid is the world bounding box split in thirds across X (left/right)
+    and Z (bottom/top), matching the region vocabulary the plan uses.
+    """
+    box = graph.get("world_bbox") or {}
+    low = box.get("min")
+    size = box.get("size")
+    if not (isinstance(low, list) and isinstance(size, list)
+            and len(low) >= 3 and len(size) >= 3):
+        return {}
+    counts = {}
+    for obj in meshes:
+        lo = obj.get("bbox_world_min")
+        hi = obj.get("bbox_world_max")
+        if not (isinstance(lo, list) and isinstance(hi, list)):
+            continue
+        cell = []
+        for axis, names in ((0, REGION_COLUMNS), (2, REGION_ROWS)):
+            span = size[axis]
+            if span <= 1e-9:
+                cell.append(names[1])
+                continue
+            centre = (lo[axis] + hi[axis]) / 2.0
+            index = int((centre - low[axis]) / span * 3.0)
+            cell.append(names[min(2, max(0, index))])
+        counts[f"{cell[1]}-{cell[0]}"] = counts.get(f"{cell[1]}-{cell[0]}", 0) + 1
+    return counts
+
+
+def shape_family_contradiction(family, signature):
+    """Return the reason the geometry contradicts the declared family, or None."""
+    for predicate, template in SHAPE_FAMILY_CONTRADICTIONS.get(family, ()):
+        try:
+            if predicate(signature):
+                return template.format(**signature)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def instance_arrays(meshes, minimum=3):
+    """Group ``Sword_01``-style siblings by their shared base name."""
+    groups = {}
+    for obj in meshes:
+        match = INSTANCE_ARRAY_RE.match(obj["name"])
+        if match:
+            groups.setdefault(match.group("base"), []).append(obj)
+    return {base: members for base, members in groups.items()
+            if len(members) >= minimum}
+
+
+def congruence_spread(members):
+    """Largest relative disagreement in size across array members.
+
+    Measured from volume and surface area rather than bounding-box dimensions,
+    because both are rotation-invariant: a builder that bakes each instance's
+    rotation into its vertices still produces identical numbers for identical
+    parts.  Both are reduced to a characteristic length so the spread reads as
+    a percentage of size.
+    """
+    lengths = []
+    for obj in members:
+        signature = shape_signature(obj)
+        if signature is None:
+            return None
+        volume = signature.get("volume")
+        area = signature.get("surface_area")
+        if not isinstance(volume, (int, float)) or not isinstance(area, (int, float)):
+            return None
+        lengths.append((max(volume, 0.0) ** (1.0 / 3.0), max(area, 0.0) ** 0.5))
+    spread = 0.0
+    for column in range(2):
+        values = [item[column] for item in lengths]
+        mean = sum(values) / len(values)
+        if mean <= 1e-12:
+            continue
+        spread = max(spread, (max(values) - min(values)) / mean)
+    return spread
 
 
 def bbox_proxy_volume(obj):
@@ -599,6 +952,168 @@ def cmd_check(args):
 
     primary = [o for o in meshes
                if form_prop(o, "procagen3d_form_role") == "primary"]
+
+    # ---- measured geometry gates -------------------------------------------
+    # Everything above this point compares one declaration against another.
+    # These compare declarations against the mesh that was actually built.
+    mismatched_family = []
+    for obj in meshes:
+        family = form_prop(obj, "procagen3d_shape_family")
+        signature = shape_signature(obj)
+        if not isinstance(family, str) or signature is None:
+            continue
+        reason = shape_family_contradiction(family, signature)
+        if reason:
+            mismatched_family.append(f"{obj['name']} declared {family!r}: {reason}")
+    if mismatched_family:
+        failures += 1
+        fail("SHAPE_FAMILY_MEASURED",
+             "declared shape family contradicts the built geometry — "
+             + " | ".join(mismatched_family[:6])
+             + (f" (+{len(mismatched_family) - 6} more)"
+                if len(mismatched_family) > 6 else ""))
+
+    slabs = []
+    for obj in primary:
+        signature = shape_signature(obj)
+        if signature is None:
+            continue
+        family = form_prop(obj, "procagen3d_shape_family")
+        topology = form_prop(obj, "procagen3d_topology")
+        if family in PLATE_FAMILIES or topology in PLATE_TOPOLOGIES:
+            continue
+        if signature["thin_ratio"] < PRIMARY_THIN_RATIO_FLOOR:
+            slabs.append(f"{obj['name']} thin_ratio={signature['thin_ratio']:.3f}")
+    if slabs:
+        failures += 1
+        fail("PRIMARY_DEPTH", "primary volumes collapsed to slabs (floor "
+             f"{PRIMARY_THIN_RATIO_FLOOR:g}): {slabs[:8]} — a body, limb, or "
+             "housing that is paper-thin off-axis fits one camera and no other; "
+             "tag it shell/relief only if the reference really shows a plate")
+
+    silhouettes = graph.get("view_silhouettes")
+    if isinstance(silhouettes, dict) and len(silhouettes) >= 3:
+        areas = {view: entry.get("area_fraction", 0.0)
+                 for view, entry in silhouettes.items()
+                 if isinstance(entry, dict)}
+        widest = max(areas.values()) if areas else 0.0
+        if widest > 1e-6:
+            thinnest_view = min(areas, key=areas.get)
+            collapse = areas[thinnest_view] / widest
+            detail = (f"{thinnest_view} silhouette is {collapse:.0%} of the "
+                      f"largest view ({', '.join(f'{v}={a:.3f}' for v, a in sorted(areas.items()))})")
+            if collapse < VIEW_COLLAPSE_FAIL:
+                failures += 1
+                fail("VIEW_COLLAPSE", f"the model is a bas-relief: {detail} — "
+                     "orthographic views share one scale, so this measures real "
+                     "depth, not framing; rebuild the masses with thickness "
+                     "instead of fitting the reference camera alone")
+            elif collapse < VIEW_COLLAPSE_WARN:
+                warn("VIEW_COLLAPSE", f"shallow depth: {detail}")
+
+    # Local evidence must scale with the number of contested masses.  Three
+    # regions on a mecha leaves most family and pose decisions untested, and a
+    # whole-object mask hides all of them.
+    fit_spec_path = Path(args.dir) / "fit_spec.json"
+    if fit_spec_path.is_file() and primary:
+        try:
+            fit_spec = json.loads(fit_spec_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            fit_spec = None
+        if isinstance(fit_spec, dict) and reconstruction_plan is not None:
+            locked = (reconstruction_plan.get("camera_solve") or {}).get("camera")
+            spec_camera = fit_spec.get("camera")
+            if isinstance(locked, dict) and isinstance(spec_camera, dict):
+                drift = camera_drift(locked, spec_camera)
+                if drift:
+                    failures += 1
+                    fail("CAMERA_LOCK", "fit camera drifted from the locked "
+                         f"solve: {drift} — a camera change is a priors "
+                         "revision: re-solve it against the reference and "
+                         "update camera_solve, do not tune it to rescue a fit")
+        if isinstance(fit_spec, dict) and fit_spec.get("version") == 2:
+            declared = len(fit_spec.get("silhouette_regions") or [])
+            required = min(8, max(3, math.ceil(len(primary) / 2)))
+            if declared < required:
+                failures += 1
+                fail("FIT_REGION_COVERAGE", f"{len(primary)} primary masses but "
+                     f"only {declared} silhouette regions (need {required}) — "
+                     "put a tight region on every contested primitive family, "
+                     "taper, limb, and attachment")
+
+    # Arrays the plan explicitly calls out are held to their declaration.
+    # Everything else is only forced into the open when it is both large and
+    # badly inconsistent, so a run of genuinely different seams or major/minor
+    # tick marks does not have to be argued with.
+    declared_arrays = []
+    if reconstruction_plan is not None:
+        for entry in reconstruction_plan.get("instance_arrays") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("pattern"), str):
+                declared_arrays.append(entry)
+    # Rigid single-axis assemblies must actually be straight in 3D.  A group is
+    # only checked when the plan names it, because an articulated chain (thigh
+    # plus shin) is elongated too and is supposed to bend.
+    for entry in (reconstruction_plan or {}).get("rigid_axes") or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("pattern"), str):
+            failures += 1
+            fail("RIGID_AXIS", "rigid_axes entries need a pattern and an "
+                 "optional max_deviation_deg")
+            continue
+        members = [o for o in meshes
+                   if fnmatch.fnmatchcase(o["name"], entry["pattern"])]
+        if len(members) < 2:
+            continue
+        tolerance = entry.get("max_deviation_deg", RIGID_AXIS_FAIL_DEG)
+        if not isinstance(tolerance, (int, float)):
+            tolerance = RIGID_AXIS_FAIL_DEG
+        spread, culprit = rigid_axis_spread(members)
+        if spread is not None and spread > tolerance:
+            failures += 1
+            fail("RIGID_AXIS", f"{entry['pattern']} is declared one rigid axis "
+                 f"but its parts disagree by {spread:.1f}° (limit {tolerance:g}°, "
+                 f"worst: {culprit}) — author the assembly from a single origin "
+                 "and direction and place every station along it, never by "
+                 "positioning each endpoint to match the image separately")
+
+    incongruent = []
+    undeclared = []
+    for base, members in sorted(instance_arrays(meshes).items()):
+        spread = congruence_spread(members)
+        if spread is None:
+            continue
+        declaration = next(
+            (entry for entry in declared_arrays
+             if fnmatch.fnmatchcase(f"{base}_01", entry["pattern"])
+             or fnmatch.fnmatchcase(base, entry["pattern"])), None)
+        summary = f"{base}_* ({len(members)} members) sizes differ by {spread:.0%}"
+        if declaration is not None:
+            if declaration.get("congruent") is False:
+                continue
+            tolerance = declaration.get("tolerance", CONGRUENCE_WARN)
+            if not isinstance(tolerance, (int, float)):
+                tolerance = CONGRUENCE_WARN
+            if spread > tolerance:
+                incongruent.append(f"{summary} (declared congruent within "
+                                   f"{tolerance:.0%})")
+            continue
+        if len(members) >= 6 and spread > CONGRUENCE_FAIL:
+            undeclared.append(summary)
+        elif spread > CONGRUENCE_WARN:
+            warn("INSTANCE_CONGRUENCE", summary + " — intended variation, or drift?")
+    if incongruent:
+        failures += 1
+        fail("INSTANCE_CONGRUENCE", "arrays the plan declares congruent are not: "
+             + "; ".join(incongruent[:6]) + " — build repeated parts from one "
+             "builder with shared dimension constants and vary only the "
+             "transform")
+    if undeclared:
+        failures += 1
+        fail("INSTANCE_CONGRUENCE", "large instance arrays vary in size without "
+             "a decision on record: " + "; ".join(undeclared[:6])
+             + " — either build them from one builder with shared constants, or "
+             "add a reconstruction_plan.instance_arrays entry with "
+             "\"congruent\": false and the reason they legitimately differ")
+
     if form_profile in ("curved", "mixed"):
         macro = sorted(
             structural,
@@ -618,33 +1133,63 @@ def cmd_check(args):
             fail("FORM_TAG_COVERAGE", f"only {len(contracted_macro)}/{len(macro)} "
                  f"largest structural masses have valid form contracts "
                  f"(need {required_contract_ratio:.0%}); untagged: {untagged[:8]}")
+        # A mass only counts as shaped when the built surface is measurably
+        # curved.  Declaring `continuous` over an eight-vertex cage, or over a
+        # flat-sided block, buys nothing.
+        def measurably_curved(obj):
+            signature = shape_signature(obj)
+            if signature is None:
+                return not is_shallow_form_cage(obj)
+            return signature["planar_area_fraction"] < 0.55
+
         macro_shaped = [
             o for o in macro
             if o["name"] in valid_contract_names
             and form_prop(o, "procagen3d_topology") in ("continuous", "shell")
             and not is_shallow_form_cage(o)
+            and measurably_curved(o)
         ]
         mixed_shaped = [
             o for o in structural
             if o["name"] in valid_contract_names
             and form_prop(o, "procagen3d_topology") in ("continuous", "shell")
             and not is_shallow_form_cage(o)
+            and measurably_curved(o)
         ]
         mixed_assembled = [
             o for o in structural
             if o["name"] in valid_contract_names
             and form_prop(o, "procagen3d_topology") == "assembled"
         ]
+        # Promised curvature must be real.  Note the direction: this never asks
+        # for more curved mass, only that whatever was declared curved is.
+        # Converting correct blocks into lofts to hit a quota is the failure
+        # this replaces, not the behaviour it rewards.
+        broken_promises = [
+            f"{o['name']} ({shape_signature(o)['planar_area_fraction']:.0%} planar)"
+            for o in structural
+            if o["name"] in valid_contract_names
+            and form_prop(o, "procagen3d_topology") in ("continuous", "shell")
+            and shape_signature(o) is not None
+            and not measurably_curved(o)
+        ]
+        if broken_promises:
+            failures += 1
+            fail("FORM_PROMISED_CURVATURE", "masses declared continuous/shell are "
+                 f"flat-sided blocks: {broken_promises[:8]} — either build the "
+                 "curvature or retag them assembled and plan them as box/prism")
         if form_profile == "curved":
             macro_volume = sum(bbox_proxy_volume(o) for o in macro)
             shaped_volume = sum(bbox_proxy_volume(o) for o in macro_shaped)
             macro_shaped_ratio = shaped_volume / macro_volume if macro_volume else 1.0
-            if macro_shaped_ratio < 0.50:
+            if macro_shaped_ratio < 0.25:
                 failures += 1
-                fail("FORM_MACRO_COVERAGE", f"genuine continuous/shell forms cover "
-                     f"only {macro_shaped_ratio:.0%} of the top structural envelope "
-                     f"(need 50%; {len(macro_shaped)}/{len(macro)} masses); a "
-                     "small token loft cannot excuse a box-built curved body")
+                fail("FORM_PROFILE_EVIDENCE", "declared form profile 'curved' but "
+                     f"only {macro_shaped_ratio:.0%} of the top structural "
+                     "envelope is measurably curved — if the reference is a "
+                     "faceted, assembled object the fix is to declare "
+                     "'rectilinear' or 'mixed', NOT to inflate correct blocks "
+                     "into lofts")
         elif not mixed_shaped or not mixed_assembled:
             message = ("mixed means evidence-backed coexistence, not a "
                        "continuous-form quota: structural masses need at least "
@@ -662,16 +1207,6 @@ def cmd_check(args):
                  "tagged with procagen3d_form_role/topology/form_method; rebuild "
                  "from references/complex-forms.md")
         else:
-            shaped = [o for o in primary
-                      if form_prop(o, "procagen3d_topology") in
-                      ("continuous", "shell")]
-            shaped_ratio = len(shaped) / len(primary)
-            if form_profile == "curved" and shaped_ratio < 0.50:
-                failures += 1
-                fail("FORM_COVERAGE", f"{form_profile} target has only "
-                     f"{len(shaped)}/{len(primary)} ({shaped_ratio:.0%}) primary "
-                     "masses routed as continuous/shell forms")
-
             shallow = []
             weak_sections = []
             for obj in primary:
@@ -903,6 +1438,23 @@ def cmd_check(args):
             failures += 1
             fail("DETAIL_REGIONS", "occupied regions without a required visible "
                  f"feature group: {uncovered_regions}")
+
+        # Measured region density.  Name patterns prove only that meshes were
+        # named after the plan; this counts the meshes that physically occupy
+        # each declared region, so an empty torso cannot be paid for with two
+        # hundred panel slivers somewhere else.
+        if args.tier != "quick":
+            occupancy = region_occupancy(graph, meshes)
+            floor = REGION_MESH_FLOOR[complexity_class]
+            sparse = [f"{region} has {occupancy.get(region, 0)} meshes"
+                      for region in sorted(occupied_regions)
+                      if occupancy.get(region, 0) < floor]
+            if sparse:
+                failures += 1
+                fail("REGION_DENSITY", f"{complexity_class} plan declares these "
+                     f"regions occupied but the geometry is nearly empty there "
+                     f"(floor {floor} meshes): {sparse[:8]} — spend the budget on "
+                     "the empty region, not on more repetition elsewhere")
         identity_minimum = {
             "simple": 1, "moderate": 2, "complex": 3, "extreme": 4,
         }[complexity_class]
@@ -927,8 +1479,8 @@ def cmd_check(args):
         if len(mats) < mat_floor:
             misses.append(f"materials {len(mats)}/{mat_floor}")
         if boxy_ratio > 0.4:
-            misses.append(f"unbeveled-box meshes {boxy_ratio:.0%} "
-                          f"(e.g. {boxy[:4]})")
+            misses.append(f"raw unbeveled boxes {boxy_ratio:.0%} — bevel or "
+                          f"chamfer them, do not curve them (e.g. {boxy[:4]})")
         if misses:
             message = (f"{args.tier} floors not met"
                        + (f" for {complexity_class} complexity" if complexity_class
