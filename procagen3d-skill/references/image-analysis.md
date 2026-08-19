@@ -2,11 +2,24 @@
 
 Use structured agent vision for semantic judgment and registered image-fit
 gates for numeric projection evidence. Write unchanged reference copies,
-`<out>/priors.md`, and `<out>/fit_spec.json` **before any code**. Read
-`image-fit.md` completely and measure against the saved copies. Optional learned
-depth/normal/feature priors may supplement this stage later; they never replace
-the registered mask, landmark, ratio, and layout contract. Unstructured
-glancing produces fused parts and wrong proportions.
+`<out>/priors.md`, `<out>/reconstruction_plan.json`, and version-2
+`<out>/fit_spec.json` **before any code**. Read `reconstruction-planning.md`
+and `image-fit.md` completely and measure against the saved copies. Optional
+learned depth/normal/feature priors may supplement this stage later; they never
+replace the registered shape, pose, mask, landmark, ratio, and layout contract.
+Unstructured glancing produces fused parts, wrong primitive families, and
+foreshortening baked into dimensions.
+
+## Contents
+
+0. Preserve inputs
+1. Identity, scale, frame, and pose
+2. Parts and complexity
+3. Proportions, primitive priors, and curved-form blueprint
+4. Symmetry and structure
+5. Materials
+6. Articulation
+7. Detail inventory and priors template
 
 ## 0. Preserve the inputs
 
@@ -30,6 +43,22 @@ seat ≈ 0.45 m high; a mug ≈ 0.1 m). State the anchor explicitly:
 `scale anchor: wheel diameter 0.66 m (assumed 700C city wheel)`. Every other
 dimension derives from ratios measured against this anchor.
 
+## 1b. Canonical frame, camera, and pose
+
+Before measuring proportions, declare canonical front/up/right and
+longitudinal axes, symmetry plane, and contact convention. Then separate:
+
+- registered camera azimuth/elevation/roll and projection;
+- any evidence-backed rigid lean of the whole object;
+- every visible articulated chain as ordered joint centers.
+
+Use long edges, visible planar faces, circles/ellipses, symmetry, and contact
+evidence—not only the overall bbox. In a floating single-object image, keep
+geometry canonical and explain rigid view tilt with the camera unless support
+evidence proves a physical lean. Build articulated pose with joint/assembly
+transforms; do not change dimensions to imitate a bend. Put frame axes and
+chains in version-2 `fit_spec.json`.
+
 ## 2. Part inventory (part-coverage ground truth)
 
 List every visually distinct component with counts — this becomes the design
@@ -38,9 +67,17 @@ Count repeated instances exactly (spokes, bolts, drawers, slats: count them
 in the image, don't guess "many"). Note parts that are implied but occluded
 (the far pedal, the fourth chair leg) and mark them `inferred`.
 
+Also count visible **feature groups** for complexity, treating a repeated array
+as one group with an instance count. Classify `simple | moderate | complex |
+extreme` from `reconstruction-planning.md`; object category and triangle count
+are not complexity evidence. Mark the occupied cells of an object-centric 3×3
+grid in `complexity.occupied_regions`; this is the coverage contract for later
+detail work.
+
 ## 3. Proportions (depth/edge prior)
 
-Measure ratios off the image, not from memory: total height : width : depth;
+Only after camera/pose decomposition, measure ratios off the image, not from
+memory: total height : width : depth;
 each major part's extent relative to the anchor. Describe the silhouette per
 visible view in words ("side view: two equal circles, centers ~1.6 wheel
 diameters apart; seat above rear wheel center"). Note characteristic angles
@@ -53,15 +90,27 @@ bboxes/centroids and pairwise layout/depth relations. Do not collapse a scene
 to one overall bounding box or give every independent object the same facing
 direction. Details and schema: `image-fit.md`.
 
+## 3a. Primitive-family priors
+
+For every silhouette-bearing macro/meso mass, compare at least two candidate
+families. Record straight/parallel edges, planar fields, section
+constancy/change, curvature across faces, and edge treatment. Choose the
+simplest supported family and state the rejected alternative.
+
+A rounded corner does not make a body an ellipsoid. A camera body, receiver,
+housing, or faceted armor panel with broad planar fields remains a box/prism
+plus bevel/chamfer. Use ellipsoid/capsule only when curvature continues across
+the face; use loft only when 3+ measured sections change. Write decisions to
+`reconstruction_plan.json` and tag meshes with `procagen3d_shape_family`.
+
 ## 3b. Form blueprint (curved or mixed targets)
 
 Classify the overall form profile as `rectilinear | curved | mixed`. If it is
 `curved` or `mixed`, read `complex-forms.md` now and make primary geometry
 measurable before choosing helpers:
 
-- Estimate the reference camera as projection plus azimuth/elevation and
-  FOV (perspective) or vertical world scale (orthographic); distinguish
-  perspective convergence from real taper. Mark every camera value
+- Reuse the already-solved reference camera and pose; distinguish perspective
+  convergence or joint rotation from real taper. Mark every camera/pose value
   approximate unless calibrated.
 - Name 3–5 **macro identity forms** (continuous roof arc, rear-haunch swell,
   thigh-to-knee pinch) separately from badges/colors in §7.
@@ -75,9 +124,10 @@ measurable before choosing helpers:
 - Mark hidden sections `inferred`; constrain them by symmetry/class priors
   without claiming reference verification.
 
-A varying-section target built from a deformed box or overlapping ellipsoids
-is a representation error, not an acceptable blockout. The form blueprint is
-the ground truth for the shape-first probe.
+A varying-section target built from a deformed box or overlapping ellipsoids is
+a representation error. The converse is equally important: a constant-section
+planar/prismatic target rebuilt as a loft or ellipsoid is also a representation
+error. The primitive prior and form blueprint jointly ground the probe.
 
 ## 4. Symmetry and structure
 
@@ -92,9 +142,9 @@ Per part family, sample the color from a *mid-tone* region — not from
 highlights or shadow — and cross-check the same material at two spots in the
 image; if they disagree wildly, the surface is reflective/textured: record
 the base tone and say `glossy` / `textured`. Output one family per distinct
-real-world finish with RGB estimates and roughness/metallic guesses — 3–8
-for standard tier, 12+ for showcase (split two-tone paint, lens colors,
-chrome vs satin trim; see detail.md §Materials).
+real-world finish with RGB estimates and roughness/metallic guesses. Meet the
+complexity-adaptive floor in `detail.md`; split two-tone paint, lens colors,
+chrome, and satin trim into their real finishes.
 
 ## 6. Articulation inference
 
@@ -119,6 +169,12 @@ recognize *this specific object* (the KC roof lamps, the tailgate lettering,
 the tri-color stripe). A build that misses an identity feature fails
 inspection even when every global verdict passes.
 
+Convert the inventory to `reconstruction_plan.json`: one entry per visible
+feature group with a semantic name pattern, `min_count`, priority, and
+object-centric 3×3 region. Arrays remain one group. Make every non-inferred
+group required, cover every declared occupied region, and schedule hidden
+inferred work last.
+
 ## priors.md template
 
 ```markdown
@@ -126,8 +182,12 @@ inspection even when every global verdict passes.
 scale anchor: <part> = <value> m (<reason>)
 overall: H x W x D ≈ <..> m (front faces -Y)
 form profile: <rectilinear | curved | mixed>
+complexity: <simple | moderate | complex | extreme> (<N> visible feature groups)
+canonical frame: front <axis>, up <axis>, right <axis>; symmetry <...>
 reference camera: <projection; azimuth, elevation; FOV or ortho-scale estimate>
-fit contract: fit_spec.json (registered camera, mask, landmarks/ratios, instances)
+reference pose: <rigid root pose + articulated chains; inferred items marked>
+fit contract: fit_spec.json v2 (camera, local silhouette, pose, landmarks/ratios)
+reconstruction contract: reconstruction_plan.json (shape priors + detail groups)
 
 ## references
 | saved copy | original source | notes |
@@ -143,6 +203,15 @@ fit contract: fit_spec.json (registered camera, mask, landmarks/ratios, instance
 ## proportions & silhouette
 - side: <...>  front: <...>
 - symmetry: bilateral (x=0); bolt circle radial x8
+
+## primitive-family priors
+| mass | chosen family / edge treatment | evidence | rejected alternative | confidence |
+|------|--------------------------------|----------|----------------------|------------|
+| Body | box + 2 mm bevel | planar face, parallel rails | ellipsoid: no face curvature | high |
+
+## pose
+| frame axis / chain | ordered landmarks | reference angles/bends | confidence |
+|--------------------|-------------------|------------------------|------------|
 
 ## form blueprint (curved/mixed)
 macro identity forms: <3-5 bullets>

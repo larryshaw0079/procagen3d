@@ -21,4 +21,5 @@ assets/*
 
 benchmark/
 outputs/
+output_test/
 third-party/

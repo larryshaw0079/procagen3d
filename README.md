@@ -1,6 +1,6 @@
 # ProcAgen3D
 
-**Version:** 0.1.0
+**Version:** 0.2.0
 
 Code-native generation of programmable 3D assets, implemented as an agent
 skill for Claude Code, Codex, and compatible runtimes.
@@ -109,9 +109,9 @@ The agent supplies design judgment and visual review; a deterministic,
 stdlib-only harness enforces the paper's pipeline around it:
 
 ```
-design → curved/mixed shape probe → synthesize program
+shape/pose/detail plan → reconstruction probe → synthesize program
 → build + canonical renders (headless Blender)
-→ registered image fit (image-conditioned) → deterministic checks
+→ registered local-silhouette + pose fit (image-conditioned) → deterministic checks
 → agent-vision inspection → guarded repair loop (≤3)
 → articulation validation → constraint scoring → deliver
 ```
@@ -121,8 +121,8 @@ Every stage is a CLI command with exit codes and grep-able
 build errors, doctrine violations, broken joints, failed reference fits, and
 failed dimensional constraints are all caught mechanically. Semantic
 perception is agent vision by design — no learned depth/normal/edge models —
-while registered camera, mask, landmark, ratio, and layout gates verify visible
-projection offline.
+while registered camera, whole/local masks, landmark, pose-chain, ratio, and
+layout gates verify visible projection offline.
 
 ## Repository layout
 
@@ -146,6 +146,22 @@ procagen3d/
 ## Update log
 
 Entries are newest first.
+
+### 0.2.0 — 2026-08-17
+
+- Replaced mixed-form continuous-volume quotas with evidence-backed per-part
+  shape families, preventing legitimate camera/rifle boxes and prisms from
+  being rounded into lofts or ellipsoids.
+- Added `reconstruction_plan.json` with candidate-tested shape priors,
+  program-family tags, semantic feature coverage, and perceptual complexity.
+- Added fit schema v2 with contour-informative local silhouette regions,
+  directed frame-axis gates, and articulated pose-chain gates for segment
+  direction, bend, and normalized link length.
+- Added complexity-adaptive detail floors and hard showcase coverage checks so
+  simple repeated objects do not set the budget for cars and mecha; complex
+  plans must also distribute required features across occupied object regions.
+- Generalized the shape-only stage into an image reconstruction probe that must
+  pass family, camera, pose, and local-silhouette evidence before detail.
 
 ### 0.1.0 — 2026-08-11
 

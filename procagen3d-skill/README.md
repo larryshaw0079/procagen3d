@@ -1,6 +1,6 @@
 # procagen3d-skill
 
-**Version:** 0.1.0 — see the repository [update log](../README.md#update-log).
+**Version:** 0.2.0 — see the repository [update log](../README.md#update-log).
 
 An agent skill implementing **ProcAgen3D: Code-Native Generation of Programmable
 3D Assets** ([arXiv:2607.22738](https://arxiv.org/abs/2607.22738)) for
@@ -9,8 +9,8 @@ Claude Code, Codex, and compatible agent runtimes.
 The agent plays the paper's generator ℳθ: it writes an executable Blender
 Python program (named parts, real transform tree, joints with limits,
 dimensions as constants); headless Blender compiles it to a GLB. A
-deterministic harness enforces the paper's pipeline — build + canonical
-renders → registered image-fit gates → deterministic checks → agent-vision
+deterministic harness enforces the paper's pipeline — reconstruction plan/probe
+→ build + canonical renders → local-silhouette/pose-aware registered fit → deterministic checks → agent-vision
 inspection → guarded repair loop (≤3) →
 articulation validation → constraint scoring — while the agent's judgment
 does design and visual review.
@@ -26,7 +26,8 @@ procagen3d-skill/
 ├── references/               # routed depth, read on demand from SKILL.md
 │   ├── doctrine.md           # representation doctrine + canonical helpers
 │   ├── image-analysis.md     # agent-vision perception stage
-│   ├── image-fit.md          # registered camera/mask/landmark/layout contract
+│   ├── reconstruction-planning.md # shape family, pose, complexity contract
+│   ├── image-fit.md          # registered camera/local-mask/pose/layout contract
 │   ├── complex-forms.md      # loft/sweep/shell routing + shape-first probe
 │   ├── detail.md             # tier floors + decomposition recipes
 │   ├── articulation.md       # joint schema + validator semantics
@@ -76,9 +77,11 @@ python3 scripts/procagen3d.py render out/ --engine eevee    # re-render (beauty 
 Exit 0 = pass, 1 = failure with printed `[PROCAGEN3D:FAIL:*]` reasons.
 Image-conditioned runs also retain each used input at the output root as
 `reference_01.<ext>`, `reference_02.<ext>`, etc., with provenance recorded in
-`priors.md`. They also retain `fit_spec.json`, a hash-bound `fit_report.json`,
-registered reference render/overlay, and scored masks. Curved/mixed runs add a
-neutral clay `form_sheet.png` and use a shape-only probe before the full build.
+`priors.md`. They also retain `reconstruction_plan.json`, version-2
+`fit_spec.json`, a hash-bound `fit_report.json`, registered reference
+render/overlay, and scored masks. Image-conditioned runs use a neutral
+reconstruction probe before the full build; curved/mixed runs also add
+`form_sheet.png`.
 
 ## Design notes
 
@@ -94,4 +97,5 @@ primitive and anti-cardboard lessons plus
 form-first loft/sweep/surface practice. The implementation is original Blender
 Python rather than copied project code. Semantic perception remains agent
 vision, while visible projection is enforced by the dependency-free registered
-camera, mask, landmark, ratio, and layout gates in `references/image-fit.md`.
+camera, local silhouette, landmark, pose-chain, ratio, and layout gates in
+`references/image-fit.md`.

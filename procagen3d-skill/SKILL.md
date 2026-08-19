@@ -1,6 +1,6 @@
 ---
 name: procagen3d
-description: Generate 3D assets as executable Blender Python programs compiled to GLB — named parts, assembly hierarchy, articulated joints with limits, curved/streamlined and irregular mecha form workflows, and machine-checkable dimensional constraints (ProcAgen3D, arXiv:2607.22738). Use for text-to-3D or image-to-3D object generation, articulated/jointed models, parametric GLB/glTF assets, Blender procedural modeling, and source-level local edits of previously generated ProcAgen3D assets.
+description: Generate 3D assets as executable Blender Python programs compiled to GLB — named parts, assembly hierarchy, articulated joints, pose-aware image reconstruction, evidence-backed primitive/form priors, complexity-adaptive detail, and machine-checkable constraints (ProcAgen3D, arXiv:2607.22738). Use for text-to-3D or image-to-3D object generation, articulated/jointed models, parametric GLB/glTF assets, Blender procedural modeling, and source-level local edits of previously generated ProcAgen3D assets.
 ---
 
 # ProcAgen3D — code-native generation of programmable 3D assets
@@ -38,8 +38,9 @@ asks): `program.py` (the deliverable), `model.glb`, `scene.blend`,
 `sheet.png`; curved/mixed also `form_sheet.png`), and when applicable
 `form_probe/`, `spec.yaml`, `joints_report.json`,
 `score_report.json`. Image-conditioned assets also contain `priors.md`,
-`fit_spec.json`, `fit_report.json`, registered `reference_match.png` and
-`reference_overlay.png`, scored reference/render masks, and an
+`reconstruction_plan.json`, version-2 `fit_spec.json`, `fit_report.json`,
+registered `reference_match.png` and `reference_overlay.png`, scored
+reference/render masks, and an
 unaltered copy of every reference image used, named `reference_01.<ext>`,
 `reference_02.<ext>`, etc. in input order.
 
@@ -52,24 +53,29 @@ Declare the **detail tier** (`quick | standard | showcase`, see
 "detailed/realistic" ask default to **showcase**; standard and above MUST
 read `references/detail.md` before Design. Declare the **form profile**
 (`rectilinear | curved | mixed`): use `curved` for streamlined/compound
-surfaces and `mixed` for biomechanical mecha or machinery combining sculpted
-and block-built masses. Curved/mixed MUST read
-`references/complex-forms.md`; do not classify by object category alone—a
+surfaces and `mixed` only when evidence shows both continuous/shell and
+assembled masses. Mixed is not a continuous-geometry quota. Curved/mixed MUST
+read `references/complex-forms.md`; do not classify by object category alone—a
 hard-surface object may still be form-dominant. If the request states any
 measurable requirement (counts, dimensions, symmetry, required joints),
 author `spec.yaml` now — MUST read `references/constraints.md` first. If a
-reference image is used, MUST read `references/image-analysis.md` and
-`references/image-fit.md`. Before
+reference image is used, MUST read `references/image-analysis.md`,
+`references/reconstruction-planning.md`, and `references/image-fit.md`. Before
 analysis or code, create `<out>` and copy every used input image byte-for-byte
 to `<out>/reference_01.<ext>`, `<out>/reference_02.<ext>`, etc. in the order
 supplied, preserving each format/extension. Record the mapping from saved path
 to original filename, URL, or attachment label in `<out>/priors.md`; then Read
 the saved copies and complete the structured priors (showcase: including the
 §7 detail inventory + identity features; curved/mixed: the form blueprint and
-macro identity forms), then author `<out>/fit_spec.json` with the registered
-camera, whole-frame mask, 6–12 semantic landmarks and important ratios; add
-per-instance boxes and relations for multi-object references. If the runtime cannot expose the
-original bytes, save the highest-resolution representation available and mark
+macro identity forms). Solve canonical object frame, registered camera, rigid
+pose, and every visible articulated chain before dimensions. Author
+`<out>/reconstruction_plan.json` with candidate-tested primitive families,
+rejected alternatives, perceptual complexity, and required feature groups.
+Then author version-2 `<out>/fit_spec.json` with the camera, whole-frame mask,
+at least three local silhouette regions, geometry-bound landmarks/ratios,
+frame axes, and pose chains; add per-instance boxes/relations for multi-object
+references. If the runtime cannot expose the original bytes, save the
+highest-resolution representation available and mark
 that substitution in `priors.md`. Do not skip the copies or priors: together
 they are the reproducible perception input and stage.
 
@@ -85,36 +91,47 @@ housing + stem + glass, NOT one lump"; "Tire = casing + 20 tread lugs, NOT
 a smooth cylinder") — generic "make it detailed" notes are a measured
 no-op; named features are what get built. Give adjacent sub-parts
 contrasting materials: material contrast is the strongest single lever for
-perceived detail. First program of a session: MUST read
+perceived detail. For image-conditioned work, the part table must implement
+every required `detail_features` pattern/count; use the plan's adaptive
+complexity class, not object category, LOC, or repeated-instance totals. First
+program of a session: MUST read
 `references/doctrine.md` completely. Keep `references/blender-pitfalls.md`
 at hand while writing bpy code — the traps in it are all from real
-failures. For curved/mixed, add a structural-form table with
-`part | role | topology | method | guide stations/outline | evidence`; tag
-every macro/meso structural mesh with the same contract (`primary` for
-identity/silhouette masses, `secondary` for supports and deliberately
+failures. For every image-conditioned macro/meso mass, add a table with
+`part | role | topology | method | shape family | guide/outline | evidence |
+rejected alternative`; choose the simplest family supported by visible
+planar/edge/section evidence. Rounded edges do not make a box/prism an
+ellipsoid or loft. Tag every structural mesh with the same contract (`primary`
+for identity/silhouette masses, `secondary` for supports and deliberately
 assembled structure), and set
-`root["procagen3d_form_profile"]`. A `continuous` mass may not route to a box,
-deformed box, or straight extrusion.
+`root["procagen3d_form_profile"]`, including `procagen3d_shape_family`. A
+`continuous` mass may not route to a box, deformed box, or straight extrusion;
+a planned box/prism may not route to a loft/ellipsoid merely to soften edges.
 Image-conditioned programs must also create semantic empty markers for
 identity landmarks whose part-bbox anchors are insufficient; marker names must
 match `fit_spec.json`, derive from the same named dimension constants as the
 geometry, and remain parented to the relevant assembly.
 
-**2 — Form gate (curved/mixed only).** Write `<out>/form_probe.py` with only
-primary masses, ground/contact parts, joint-center markers, and negative-space
-openings in one neutral material. Build and gate it before any detail work:
+**2 — Reconstruction probe.** Required for every image-conditioned asset and
+every curved/mixed target. Write `<out>/form_probe.py` with every structural
+mass in the shape-prior plan, ground/contact parts, joint/pose markers, and
+negative-space openings in one neutral material; omit detail. Build and gate it
+before detail:
 
 `procagen3d build <out>/form_probe.py --out <out>/form_probe --form-diagnostics`
 
+Image-conditioned: `procagen3d fit <out>/form_probe --spec <out>/fit_spec.json`
+
 `procagen3d check <out>/form_probe --tier quick --form <profile>`
 
-Read both probe `renders/sheet.png` and `renders/form_sheet.png`; compare the
-reference-matched view when emitted. Pass silhouette, cross-section/volume,
-negative space, attachments, and continuity in all useful views. Bad body
-family → rewrite its primary builder, not its dimensions or decoration. Allow
-at most two probe corrections. If it still fails, stop/request better views
-or report the limitation; never advance to detail. Otherwise transfer the
-accepted form constants and builders into the full program. Details:
+Read the probe sheet; curved/mixed also read `form_sheet.png`; image-conditioned
+also read the registered render/overlay/report. Pass primitive family, local
+silhouette, camera/frame, rigid/articulated pose, cross-section, negative space,
+and attachments in all useful views. Wrong family → revise the prior and rewrite
+that builder in either direction; wrong pose → repair camera/root/joint
+transforms, not dimensions. Allow at most two probe corrections. If it still
+fails, stop/request better views or report the limitation; never decorate a
+rejected reconstruction. Details: `references/reconstruction-planning.md` and
 `references/complex-forms.md`.
 
 **3 — Synthesize.** Write `<out>/<slug>.py`: constants → one
@@ -125,11 +142,14 @@ not render, export, or touch files/network — the harness does that. Choose
 geometry by the form table: primitive CSG for assembled solids; profile
 extrusion for intentional facets; loft/sweep/revolve/subdivision/grid for
 continuous or shell forms; modifiers for edge treatment and instanced arrays
-for repetition. **Size sanity before building**: reference-grade programs
-median ~490 LOC; vehicles often run 100–340 parts. A showcase draft under
-~300 LOC or under the tier's secondary-detail floor means the design table was
-too coarse, but never fragment an accepted continuous surface to inflate the
-count. Detail cannot be retrofitted through the repair budget.
+for repetition. Implement feature groups region by region in priority order:
+identity/structural → secondary → micro → inferred. Before building, verify
+every required plan pattern/count exists in source, every declared occupied
+object region has visible structure/detail, and the adaptive complexity floor
+is plausible. LOC and raw part count are not quality targets: repeated
+spokes can make a simple object large, while a complex car/mecha can remain
+underdesigned. Never fragment an accepted surface to inflate counts. Detail
+cannot be retrofitted through the repair budget.
 
 **4 — Build.** Run `procagen3d build <out>/<slug>.py --out <out>`; add
 `--form-diagnostics` for curved/mixed. On `PROCAGEN3D_BUILD_ERROR`, read the
@@ -139,20 +159,21 @@ attempts → reconsider the approach instead of patching the same line again.
 **4a — Registered image fit (image-conditioned).** Run
 `procagen3d fit <out> --spec <out>/fit_spec.json`. It renders at the reference's
 exact resolution/aspect and declared camera, then scores mask IoU,
-bbox/centroid alignment, landmarks/ratios, and declared instance relations.
-Every fit gate MUST pass. Read `reference_overlay.png`, both masks, and
-`fit_report.json`; fix camera before geometry, then lock it. Never proceed on
-the legacy auto-centered preview alone.
+bbox/centroid alignment, local silhouettes, geometry-bound landmarks/ratios,
+frame axes, pose chains, and instance relations. Every gate MUST pass. Read the
+overlay, masks, and report; fix camera/frame → rigid pose → articulated pose →
+shape/dimensions in that order, locking each passing layer. Never proceed on the
+legacy auto-centered preview alone.
 
 **5 — Deterministic gates.** Run
 `procagen3d check <out> --tier <tier> --form <profile>`. FAILs are doctrine or
-form-contract violations (unnamed parts, duplicate `.001` names, incompatible
-continuous/box methods, empty meshes, broken joints) — fix them; they are
-never acceptable residue. WARNs are advisory: read each one and either fix it
-or carry a one-line reason. `LOW_DETAIL`, `FORM_SECTIONS`, and
-`FORM_PRIMITIVES` are repair input at showcase and during the form probe;
-`FORM_MACRO_COVERAGE` is the hard gate against a token loft hiding a box-built
-body.
+form/reconstruction violations (unnamed parts, duplicate `.001` names, shape
+family/method mismatch, missing plan features or occupied regions, empty
+meshes, broken joints) — fix them; they are never acceptable residue.
+Version-2 showcase detail floors and feature/region coverage are hard gates.
+`FORM_MACRO_COVERAGE` applies to curved targets; mixed targets require both
+families but never a continuous-volume quota or a large curved token mass.
+WARNs remain advisory only where explicitly printed.
 For image-conditioned outputs, `check` also fails when fit evidence is missing,
 failed, or stale relative to the reference, fit spec, or scene graph.
 
@@ -164,16 +185,23 @@ line per aspect before deciding:
 
 - **shape** — silhouette and construction correct in every useful view (not
   just front); watch for parts that only look right from one angle;
+- **family** (image-conditioned; hard floor) — every planned box/prism retains
+  planar fields/constant sections and every planned curved mass has evidenced
+  curvature; bevels are not ellipsoids and lofts are not default blockouts;
 - **form** (curved/mixed; hard floor) — named swells, pinches, taper/twist,
   cross-sections, negative spaces, and attachment transitions match the form
-  blueprint; no slab collapse, box stacking, or ellipsoid collage;
+  blueprint; no wrong-family collage;
+- **pose** (image-conditioned; hard floor) — camera-relative frame, root lean,
+  joint chains, segment directions, bends, contacts, and overlaps match the
+  reference without deforming part ratios;
 - **scale** — proportions match the stated/derived dimensions;
 - **part coverage** — every part from the design table is visibly present and
   distinct; nothing fused, floating, or missing;
 - **detail** (standard+; hard floor) — band honestly: *toy* = raw primitives;
   *featured* = bevels, seams, arrays, contrasting materials; *designed* = reads
   as the referenced object. Showcase passes only at *designed*: check the
-  priors detail inventory and identity features item by item.
+  plan's required feature groups region by region and identity features item by
+  item; dense repetition cannot compensate for an empty complex region.
 
 Image-conditioned: compare against every saved reference and `priors.md`.
 An admitted residual on an identity-bearing silhouette, compound transition,
@@ -183,8 +211,9 @@ compensate. Never judge from the build log alone.
 **7 — Repair (≤ 3 full-program iterations).** For each failed verdict, name
 the single highest-impact defect, its evidence view, and an explicit PRESERVE
 list of passing dimensions/features/views. Decide whether the blueprint is
-wrong (`refine-priors`) or its implementation is wrong (`refine-code`). Apply
-a minimal source edit; if the representation family is wrong, rewrite only
+wrong (`refine-priors`: camera/pose/family/complexity) or its implementation is
+wrong (`refine-code`). Apply a minimal source edit; if the representation
+family is wrong, rewrite only
 that primary builder rather than adding cosmetic parts. Save the current
 program as `<out>/program.iter<N>.py`, then run
 `procagen3d guard <out>/program.iter<N>.py <out>/<slug>.py`. Use
@@ -192,8 +221,9 @@ program as `<out>/program.iter<N>.py`, then run
 The guard MUST pass before rebuilding from step 4. Hard ceiling: **3 repair
 iterations** (build-error fixes included). If exhausted, keep the best
 successful intermediate and report honestly what remains wrong.
-Image-conditioned repairs must rerun `fit` after every rebuild; an older passing
-report is invalidated by the new scene graph.
+Image-conditioned repairs must rerun `fit` after every rebuild; changes to
+shape/feature plans must also rerun `check`. Older evidence is invalidated by
+the new scene graph/spec.
 
 **8 — Articulation.** If the asset has joints: `procagen3d joints <out>`
 FAILs (bad type, missing child, pivot off the moving part, rest-pose drift)
@@ -215,16 +245,18 @@ faithfully from this input" is a valid outcome — say it instead of faking.
 ## Gates (do not skip)
 
 1. Image-conditioned: every reference image actually used is present at the
-   output root as `reference_NN.<ext>`, mapped in `priors.md`, and measured in
-   `fit_spec.json` before code.
-2. Curved/mixed: tagged form probe passes `check --form <profile>` and both
-   probe sheets are Read before full synthesis; resolve `FORM_*` warnings and
-   add no detail before form pass.
+   output root as `reference_NN.<ext>`, mapped in `priors.md`; version-2
+   `fit_spec.json` and `reconstruction_plan.json` exist before code.
+2. Image-conditioned or curved/mixed: reconstruction probe passes `check`; an
+   image-conditioned probe also passes registered `fit`. Read its canonical and
+   registered evidence before synthesis; add no detail before family/pose/form
+   pass.
 3. Full `build` exit 0 before anything else proceeds.
-4. Image-conditioned: registered `fit` exit 0 after every full build; Read its
-   overlay, scored masks, and report.
+4. Image-conditioned: registered `fit` exit 0 after every full build, including
+   local silhouette and pose gates; Read its overlay, masks, and report.
 5. `check --tier <tier> --form <profile>` exit 0 before visual inspection;
-   form/detail WARNs at showcase are repair input, not acceptable residue.
+   shape-prior, feature-coverage, adaptive showcase detail, and form failures
+   are repair input, never acceptable residue.
 6. `guard` pass between every full-program repair iteration — no exceptions.
 7. `sheet.png` actually Read; curved/mixed also `form_sheet.png`, and use
    `reference_match.png` whenever emitted.
@@ -242,8 +274,9 @@ MUST read `references/local-edits.md` first. Summary: locate the target in
 the kept `program.py` (rebuild base first if artifacts are missing) → apply
 a minimal source-level edit (never mesh-level) → build to a sibling dir →
 `procagen3d edit-gates <base> <edited> --target "<Pattern>"` → read both sheets
-→ report per-gate results. Non-target geometry must not move: that is the
-locality contract.
+→ for image-conditioned bases retain the reference/plan/spec and rerun fit +
+check → report per-gate results. Non-target geometry must not move: that is the
+locality contract. Global detail remediation is regeneration, not a local edit.
 
 ## Bench examples
 

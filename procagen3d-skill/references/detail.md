@@ -1,27 +1,39 @@
 # Detail doctrine — fine-grained geometry
 
-Coarse output is the #1 failure mode of this skill: correct part lists built
-as unbeveled boxes and 16-segment cylinders read as toys. Detail is
-**scheduled work with its own pass and its own gate**, never leftover budget.
-Reference forensics (real Nova3D vehicle, same input image): 351 meshes,
-~99k tris, 17 materials — one wheel alone is 34 named parts.
+Coarse output is a primary failure mode: correct part lists can still read as
+toys, while dense repeated arrays can make a simple object exceed numeric
+floors without adding identity. Detail is **scheduled work with a feature plan
+and its own gate**, never leftover budget. Mesh/triangle/material floors are
+only sanity checks; `reconstruction_plan.json` feature coverage is the real
+completion contract for image-conditioned work.
+
+## Contents
+
+1. Detail tiers and adaptive floors
+2. Decomposition ladder
+3. Reusable recipes
+4. Curvature and form
+5. Materials
+6. Inventory discipline
 
 ## Detail tiers
 
-Declare the tier in the program header at Design time; it sets the floors
-the `check` gate warns against (`--tier`).
+Declare tier and perceptual complexity in the program header at Design time.
+Image-conditioned replication and “detailed/realistic” asks default to
+`showcase`; `quick` has no floors. Count visible feature groups using
+`reconstruction-planning.md`, then use the adaptive floors enforced by `check`:
 
-| tier | when | mesh floor | tri floor | materials |
-|------|------|-----------|-----------|-----------|
-| quick | throwaway drafts, explicit "rough" requests | — | — | — |
-| standard | text-only prompts, functional assets | 40 | 8 000 | 6+ |
-| showcase | image-conditioned replication (DEFAULT), "detailed/realistic" asks | 150 | 25 000 | 12+ |
+| tier | complexity | mesh floor | tri floor | materials |
+|------|------------|-----------:|----------:|----------:|
+| standard | simple / moderate | 24 / 50 | 5k / 10k | 4 / 6 |
+| standard | complex / extreme | 100 / 160 | 20k / 32k | 8 / 10 |
+| showcase | simple / moderate | 60 / 140 | 12k / 28k | 8 / 10 |
+| showcase | complex / extreme | 260 / 420 | 55k / 90k | 14 / 16 |
 
-Tris up to ~150k build and render fine headless — never "optimize" below the
-tier floor. A showcase asset that comes back under floor is unfinished, not
-efficient. These floors measure secondary construction/detail coverage, not
-the quality of a primary surface: never fragment one coherent body shell into
-box/ellipsoid patches just to raise mesh count.
+Legacy assets without a reconstruction plan keep fallback floors (standard
+40/8k/6; showcase 150/25k/12). A version-2 showcase miss is a hard failure.
+Never fragment a coherent surface or inflate a repeated array merely to reach a
+number; fix missing feature groups first.
 
 ## The decomposition ladder
 
@@ -37,6 +49,16 @@ slats, bed grooves, coil rings, spokes, vents) — count them in the reference,
 place them with a loop. Keep a continuous primary mass continuous; panel gaps,
 trim, and attached shells may be separate, but the surface beneath them must
 not become a collage of independently beveled primitives.
+
+For image-conditioned work, every visible group in the ladder is also a
+`detail_features` entry with a semantic `pattern`, `min_count`, priority, and
+object-centric 3×3 region. Repetition is one group with an honest count.
+Complete identity and structural groups before microdetail. Declare the
+actually occupied object regions in `complexity.occupied_regions`; the checker
+requires coverage in at least 1/3/5/6 regions for
+simple/moderate/complex/extreme work and rejects a declared occupied region
+that has no required visible group. This prevents a dense wheel, torso, or
+receiver from numerically excusing blank regions elsewhere.
 
 ## Recipes (patterns, not just vehicles)
 
@@ -92,15 +114,17 @@ the underlying form family.
 
 One material per distinct real-world finish, named by finish, not by color
 slot: `Off-road Rubber`, `Machined Silver`, `Smoked Glass`, `Signal Amber`,
-`Satin Black Trim`. Showcase floor is 12; a two-tone paint job is two
-materials; lens colors (amber / red / clear) are separate; chrome vs satin
-black vs body paint always split. Generic `Black`/`Glass`/`Paint` palettes
-cap perceived quality regardless of geometry.
+`Satin Black Trim`. Use the adaptive tier floor; a two-tone paint job is two
+materials, lens colors (amber / red / clear) are separate, and chrome vs satin
+black vs body paint always split. Generic `Black`/`Glass`/`Paint` palettes cap
+perceived quality regardless of geometry.
 
 ## Detail inventory discipline
 
-The detail pass builds exactly what `priors.md`'s detail inventory lists
-(see image-analysis.md §7): sweep the reference region by region, enumerate
-sub-features with sizes, then check each one off in the render. A feature
-visible in the reference and absent in the sheet is a **detail verdict
-failure** even when silhouette, scale, and part coverage all pass.
+The detail pass builds exactly what `priors.md` and
+`reconstruction_plan.json` list (see image-analysis.md §7): sweep the reference
+region by region, enumerate feature groups with sizes/counts, then check each
+one in the render. The checker verifies semantic pattern/count coverage; vision
+verifies that the geometry actually reads correctly. A visible feature absent
+from the sheet is a **detail verdict failure** even when numeric floors,
+silhouette, scale, and part coverage pass.

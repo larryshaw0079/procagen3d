@@ -9,7 +9,7 @@ Stages:
     build   Execute a ProcAgen3D program, dump scene_graph.json, export GLB,
             save scene.blend, render canonical views + contact sheet.
     render  Re-render canonical views from an existing scene.blend.
-    fit     Render a registered reference view and score image-fit gates.
+    fit     Render a registered reference view and score image/pose-fit gates.
     joints  Validate articulation (pivot placement, axis, limits, sweep
             collisions, rest-pose restore) against an existing scene.blend.
 
@@ -843,6 +843,30 @@ def uv_distance(a, b, axis):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def directed_angle_deg(a, b):
+    """Directed image-plane angle from a to b, in degrees."""
+    if math.hypot(b[0] - a[0], b[1] - a[1]) <= 1e-9:
+        raise ValueError("pose segment has zero image length")
+    return math.degrees(math.atan2(b[1] - a[1], b[0] - a[0]))
+
+
+def angle_error_deg(a, b):
+    """Smallest absolute error between two directed angles."""
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def joint_angle_deg(a, pivot, b):
+    """Unsigned image-plane bend angle at pivot, in degrees."""
+    va = (a[0] - pivot[0], a[1] - pivot[1])
+    vb = (b[0] - pivot[0], b[1] - pivot[1])
+    la = math.hypot(*va)
+    lb = math.hypot(*vb)
+    if la <= 1e-9 or lb <= 1e-9:
+        raise ValueError("pose joint contains a zero-length segment")
+    cosine = max(-1.0, min(1.0, (va[0] * vb[0] + va[1] * vb[1]) / (la * lb)))
+    return math.degrees(math.acos(cosine))
+
+
 def fit_gate(gates, gate_id, kind, target, measured, passed, note=""):
     gates.append({
         "id": str(gate_id),
@@ -866,6 +890,20 @@ def draw_cross(image, uv, color, radius=4):
     image[y0:y1, x, :3] = color
 
 
+def draw_box(image, bbox, color):
+    height, width = image.shape[:2]
+    left = max(0, min(width - 1, int(round(bbox[0] * (width - 1)))))
+    top = max(0, min(height - 1, int(round(bbox[1] * (height - 1)))))
+    right = max(0, min(width - 1, int(round(bbox[2] * (width - 1)))))
+    bottom = max(0, min(height - 1, int(round(bbox[3] * (height - 1)))))
+    if left >= right or top >= bottom:
+        return
+    image[top:top + 2, left:right + 1, :3] = color
+    image[max(top, bottom - 1):bottom + 1, left:right + 1, :3] = color
+    image[top:bottom + 1, left:left + 2, :3] = color
+    image[top:bottom + 1, max(left, right - 1):right + 1, :3] = color
+
+
 def stage_fit(args):
     import numpy as np
 
@@ -884,7 +922,7 @@ def stage_fit(args):
         (renders_dir / name).unlink(missing_ok=True)
 
     base_report = {
-        "procagen3d_fit_version": 1,
+        "procagen3d_fit_version": 2,
         "fit_spec": spec_path.name,
         "passed": False,
         "gates": [],
@@ -895,8 +933,28 @@ def stage_fit(args):
         if not spec_path.is_file():
             raise ValueError(f"fit spec not found: {spec_path}")
         spec = json.loads(spec_path.read_text())
-        if not isinstance(spec, dict) or spec.get("version") != 1:
-            raise ValueError("fit spec must be a JSON object with version: 1")
+        spec_version = spec.get("version") if isinstance(spec, dict) else None
+        if spec_version not in (1, 2):
+            raise ValueError("fit spec must be a JSON object with version: 1 or 2")
+        base_report["fit_spec_version"] = spec_version
+        pose_config = spec.get("pose")
+        if spec_version == 2:
+            if not isinstance(pose_config, dict):
+                raise ValueError("fit spec version 2 requires a pose object")
+            pose_mode = str(pose_config.get("mode", ""))
+            if pose_mode not in ("rigid", "articulated", "unobservable"):
+                raise ValueError(
+                    "pose.mode must be rigid, articulated, or unobservable")
+            frame_axes = pose_config.get("frame_axes", [])
+            pose_chains = pose_config.get("chains", [])
+            if not isinstance(frame_axes, list) or not isinstance(pose_chains, list):
+                raise ValueError("pose.frame_axes and pose.chains must be lists")
+            if pose_mode == "rigid" and not frame_axes:
+                raise ValueError("rigid pose requires at least one frame axis")
+            if pose_mode == "articulated" and not pose_chains:
+                raise ValueError("articulated pose requires at least one pose chain")
+            if pose_mode == "unobservable" and not str(pose_config.get("reason", "")).strip():
+                raise ValueError("unobservable pose requires a non-empty reason")
         reference_path = fit_path(
             out_dir, spec.get("reference_image"), "reference_image")
         reference_rgba = load_rgba(reference_path)
@@ -984,6 +1042,82 @@ def stage_fit(args):
                     out_dir, mask_config.get("path"), "mask.path")
                 input_hashes["mask_sha256"] = sha256_file(supplied_mask_path)
                 base_report["mask"]["path"] = supplied_mask_path.name
+
+        silhouette_regions = spec.get("silhouette_regions", [])
+        if not isinstance(silhouette_regions, list):
+            raise ValueError("silhouette_regions must be a list")
+        if spec_version == 2 and len(silhouette_regions) < 3:
+            raise ValueError(
+                "fit spec version 2 requires at least three silhouette_regions")
+        if silhouette_regions and reference_fg is None:
+            raise ValueError("silhouette_regions require a foreground mask")
+        region_records = []
+        region_ids = set()
+        region_boxes = set()
+        for index, entry in enumerate(silhouette_regions):
+            if not isinstance(entry, dict):
+                raise ValueError(f"silhouette_regions[{index}] must be an object")
+            region_id = str(entry.get("id", f"silhouette_region_{index + 1}"))
+            if region_id in region_ids:
+                raise ValueError(f"duplicate silhouette region id: {region_id}")
+            region_ids.add(region_id)
+            bbox = finite_values(
+                entry.get("bbox_uv"), 4, f"silhouette region {region_id}.bbox_uv")
+            if (not all(0.0 <= value <= 1.0 for value in bbox)
+                    or bbox[0] >= bbox[2] or bbox[1] >= bbox[3]):
+                raise ValueError(
+                    f"silhouette region {region_id} has an invalid normalized bbox")
+            bbox_key = tuple(round(value, 6) for value in bbox)
+            if bbox_key in region_boxes:
+                raise ValueError(
+                    f"silhouette region {region_id} duplicates another bbox")
+            region_boxes.add(bbox_key)
+            left = max(0, min(width - 1, int(math.floor(bbox[0] * width))))
+            top = max(0, min(height - 1, int(math.floor(bbox[1] * height))))
+            right = max(left + 1, min(width, int(math.ceil(bbox[2] * width))))
+            bottom = max(top + 1, min(height, int(math.ceil(bbox[3] * height))))
+            reference_crop = reference_fg[top:bottom, left:right]
+            render_crop = render_fg[top:bottom, left:right]
+            occupancy = float(reference_crop.mean())
+            if not 0.02 <= occupancy <= 0.98:
+                raise ValueError(
+                    f"silhouette region {region_id} is not contour-informative "
+                    f"(reference occupancy {occupancy:.3f}; need 0.02..0.98)")
+            intersection = int(np.logical_and(reference_crop, render_crop).sum())
+            union = int(np.logical_or(reference_crop, render_crop).sum())
+            region_iou = float(intersection / union) if union else 0.0
+            reference_area = int(reference_crop.sum())
+            render_area = int(render_crop.sum())
+            area_error = (abs(render_area / reference_area - 1.0)
+                          if reference_area else math.inf)
+            min_iou = float(entry.get(
+                "min_iou", thresholds.get("region_min_iou", 0.75)))
+            max_area = float(entry.get(
+                "max_area_ratio_error",
+                thresholds.get("region_area_ratio_max_error", 0.20)))
+            if spec_version == 2 and not 0.60 <= min_iou <= 1.0:
+                raise ValueError(
+                    f"silhouette region {region_id}.min_iou must be within "
+                    "[0.60, 1.00] for fit spec version 2")
+            if spec_version == 2 and not 0.0 <= max_area <= 0.35:
+                raise ValueError(
+                    f"silhouette region {region_id}.max_area_ratio_error must "
+                    "be within [0.00, 0.35] for fit spec version 2")
+            fit_gate(gates, f"{region_id}.iou", "silhouette_region",
+                     f">= {min_iou:.4f}", round(region_iou, 6),
+                     region_iou >= min_iou)
+            fit_gate(gates, f"{region_id}.area", "silhouette_region",
+                     f"<= {max_area:.4f}", round(area_error, 6),
+                     area_error <= max_area)
+            region_records.append({
+                "id": region_id,
+                "bbox_uv": bbox,
+                "reference_occupancy": occupancy,
+                "iou": region_iou,
+                "area_ratio_error": area_error,
+            })
+            draw_box(overlay, bbox, (1.0, 0.2, 0.9))
+        base_report["silhouette_regions"] = region_records
 
         dg = depsgraph()
         landmark_records = []
@@ -1074,6 +1208,154 @@ def stage_fit(args):
                          False, str(exc))
             ratio_records.append(record)
         base_report["ratios"] = ratio_records
+
+        pose_records = {"mode": None, "frame_axes": [], "chains": []}
+        if isinstance(pose_config, dict):
+            pose_records["mode"] = str(pose_config.get("mode", ""))
+            pose_ids = set()
+            default_axis_error = float(
+                thresholds.get("pose_axis_max_angle_error_deg", 4.0))
+            for index, entry in enumerate(pose_config.get("frame_axes", [])):
+                if not isinstance(entry, dict):
+                    raise ValueError(f"pose.frame_axes[{index}] must be an object")
+                axis_id = str(entry.get("id", f"frame_axis_{index + 1}"))
+                if axis_id in pose_ids:
+                    raise ValueError(f"duplicate pose gate id: {axis_id}")
+                pose_ids.add(axis_id)
+                ids = entry.get("landmarks")
+                try:
+                    if not isinstance(ids, list) or len(ids) != 2:
+                        raise ValueError("frame axis needs exactly two landmark ids")
+                    points = [landmark_map.get(str(item)) for item in ids]
+                    if any(point is None for point in points):
+                        raise ValueError("frame axis references an unresolved landmark")
+                    reference_angle = directed_angle_deg(
+                        points[0]["reference_uv"], points[1]["reference_uv"])
+                    render_angle = directed_angle_deg(
+                        points[0]["render_uv"], points[1]["render_uv"])
+                    error = angle_error_deg(reference_angle, render_angle)
+                    maximum = float(entry.get(
+                        "max_angle_error_deg", default_axis_error))
+                    if spec_version == 2 and not 0.0 < maximum <= 12.0:
+                        raise ValueError(
+                            "pose frame-axis max_angle_error_deg must be within "
+                            "(0, 12] for fit spec version 2")
+                    record = {
+                        "id": axis_id,
+                        "landmarks": ids,
+                        "reference_angle_deg": reference_angle,
+                        "render_angle_deg": render_angle,
+                        "error_deg": error,
+                    }
+                    fit_gate(gates, axis_id, "pose_axis",
+                             f"angle error <= {maximum:.3f} deg",
+                             round(error, 6), error <= maximum,
+                             f"reference={reference_angle:.2f}, render={render_angle:.2f}")
+                except ValueError as exc:
+                    record = {"id": axis_id, "landmarks": ids, "error": str(exc)}
+                    fit_gate(gates, axis_id, "pose_axis", "measurable",
+                             "unmeasurable", False, str(exc))
+                pose_records["frame_axes"].append(record)
+
+            default_segment_error = float(
+                thresholds.get("pose_segment_max_angle_error_deg", 5.0))
+            default_joint_error = float(
+                thresholds.get("pose_joint_max_angle_error_deg", 7.0))
+            default_length_error = float(
+                thresholds.get("pose_length_fraction_max_error", 0.04))
+            for index, entry in enumerate(pose_config.get("chains", [])):
+                if not isinstance(entry, dict):
+                    raise ValueError(f"pose.chains[{index}] must be an object")
+                chain_id = str(entry.get("id", f"pose_chain_{index + 1}"))
+                if chain_id in pose_ids:
+                    raise ValueError(f"duplicate pose gate id: {chain_id}")
+                pose_ids.add(chain_id)
+                ids = entry.get("landmarks")
+                try:
+                    if not isinstance(ids, list) or len(ids) < 3:
+                        raise ValueError("pose chain needs at least three landmark ids")
+                    points = [landmark_map.get(str(item)) for item in ids]
+                    if any(point is None for point in points):
+                        raise ValueError("pose chain references an unresolved landmark")
+                    reference_points = [point["reference_uv"] for point in points]
+                    render_points = [point["render_uv"] for point in points]
+                    reference_segments = [
+                        directed_angle_deg(a, b)
+                        for a, b in zip(reference_points, reference_points[1:])]
+                    render_segments = [
+                        directed_angle_deg(a, b)
+                        for a, b in zip(render_points, render_points[1:])]
+                    segment_errors = [
+                        angle_error_deg(a, b)
+                        for a, b in zip(reference_segments, render_segments)]
+                    reference_joints = [
+                        joint_angle_deg(reference_points[i - 1],
+                                        reference_points[i], reference_points[i + 1])
+                        for i in range(1, len(reference_points) - 1)]
+                    render_joints = [
+                        joint_angle_deg(render_points[i - 1],
+                                        render_points[i], render_points[i + 1])
+                        for i in range(1, len(render_points) - 1)]
+                    joint_errors = [abs(a - b)
+                                    for a, b in zip(reference_joints, render_joints)]
+                    reference_lengths = [uv_distance(a, b, "distance")
+                                         for a, b in zip(
+                                             reference_points, reference_points[1:])]
+                    render_lengths = [uv_distance(a, b, "distance")
+                                      for a, b in zip(render_points, render_points[1:])]
+                    reference_total = sum(reference_lengths)
+                    render_total = sum(render_lengths)
+                    if reference_total <= 1e-9 or render_total <= 1e-9:
+                        raise ValueError("pose chain has zero total length")
+                    length_errors = [
+                        abs(a / reference_total - b / render_total)
+                        for a, b in zip(reference_lengths, render_lengths)]
+                    maximum_segment = float(entry.get(
+                        "max_segment_angle_error_deg", default_segment_error))
+                    maximum_joint = float(entry.get(
+                        "max_joint_angle_error_deg", default_joint_error))
+                    maximum_length = float(entry.get(
+                        "max_length_fraction_error", default_length_error))
+                    if spec_version == 2 and not 0.0 < maximum_segment <= 15.0:
+                        raise ValueError(
+                            "pose chain max_segment_angle_error_deg must be "
+                            "within (0, 15] for fit spec version 2")
+                    if spec_version == 2 and not 0.0 < maximum_joint <= 20.0:
+                        raise ValueError(
+                            "pose chain max_joint_angle_error_deg must be within "
+                            "(0, 20] for fit spec version 2")
+                    if spec_version == 2 and not 0.0 < maximum_length <= 0.15:
+                        raise ValueError(
+                            "pose chain max_length_fraction_error must be within "
+                            "(0, 0.15] for fit spec version 2")
+                    measured_segment = max(segment_errors, default=0.0)
+                    measured_joint = max(joint_errors, default=0.0)
+                    measured_length = max(length_errors, default=0.0)
+                    fit_gate(gates, f"{chain_id}.segments", "pose_chain",
+                             f"angle error <= {maximum_segment:.3f} deg",
+                             round(measured_segment, 6),
+                             measured_segment <= maximum_segment)
+                    fit_gate(gates, f"{chain_id}.joints", "pose_chain",
+                             f"bend error <= {maximum_joint:.3f} deg",
+                             round(measured_joint, 6), measured_joint <= maximum_joint)
+                    fit_gate(gates, f"{chain_id}.lengths", "pose_chain",
+                             f"fraction error <= {maximum_length:.4f}",
+                             round(measured_length, 6),
+                             measured_length <= maximum_length)
+                    record = {
+                        "id": chain_id,
+                        "landmarks": ids,
+                        "segment_angle_errors_deg": segment_errors,
+                        "joint_angle_errors_deg": joint_errors,
+                        "length_fraction_errors": length_errors,
+                    }
+                except ValueError as exc:
+                    record = {"id": chain_id, "landmarks": ids,
+                              "error": str(exc)}
+                    fit_gate(gates, chain_id, "pose_chain", "measurable",
+                             "unmeasurable", False, str(exc))
+                pose_records["chains"].append(record)
+        base_report["pose"] = pose_records
 
         instance_records = []
         instance_map = {}
@@ -1204,7 +1486,8 @@ def stage_fit(args):
 
         if not gates:
             raise ValueError(
-                "fit spec defines no gates; add mask, landmarks, instances, or relations")
+                "fit spec defines no gates; add mask, silhouette regions, landmarks, "
+                "pose, instances, or relations")
         save_rgba(renders_dir / "reference_overlay.png", overlay)
         passed_count = sum(1 for gate in gates if gate["pass"])
         base_report.update({

@@ -10,7 +10,9 @@ transform, and place in the hierarchy.
 1. **Base.** Locate the asset's directory with its kept `program.py`. If
    artifacts are stale or missing, rebuild the base first:
    `procagen3d build <base>/program.py --out <base>` — gates must pass before
-   editing on top.
+   editing on top. If the base is image-conditioned, retain its references,
+   `priors.md`, `reconstruction_plan.json`, and `fit_spec.json`; a local edit
+   does not erase the reference-fidelity contract.
 2. **Classify the instruction.** *Additive* (new part: "add a bell",
    "mount a rear rack") or *modify-existing* ("make the seat wider",
    "recolor the doors"). This picks the edit-gate mode and where the edit
@@ -32,7 +34,10 @@ transform, and place in the hierarchy.
 5. **Deterministic gates.**
    `procagen3d edit-gates <base> <base>_edit1 --target "<Pattern>"`
    (`--mode add|modify` if auto-detection guesses wrong; `--tol` defaults
-   to 0.1 mm.)
+   to 0.1 mm.) For an image-conditioned base, copy the retained perception
+   files to the sibling, rerun `fit` and `check`, and read the new overlay. A
+   geometry-local change can still break silhouette, pose, shape-family, or
+   required-feature gates.
 6. **Visual check.** Read both `renders/sheet.png` files; confirm the edit
    reads correctly *and* nothing else visibly changed. A shared-material
    recolor can pass geometric gates while being wrong (or vice versa) —
@@ -62,4 +67,6 @@ A failed gate routes back to step 3 with a smaller diff — the same ≤3
 iteration budget as generation. If the instruction is genuinely non-local
 ("make everything 20% bigger", "turn the chair into a bench"), say so and
 treat it as regeneration with the old program as the starting point, not as
-a local edit; don't fight the locality gate.
+a local edit; don't fight the locality gate. Likewise, “make this complex
+car/mecha substantially more detailed” is a reconstruction-plan revision
+across many regions, not a neck/part-local edit.

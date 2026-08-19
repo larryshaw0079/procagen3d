@@ -8,7 +8,7 @@ blender_stages.py running under Blender's bundled Python; everything else
 Subcommands:
     build      <program.py> --out DIR    build, export GLB, render views
     render     <dir>                     re-render canonical views
-    fit        <dir> --spec FILE         registered image-fit gates
+    fit        <dir> --spec FILE         registered image/pose-fit gates
     check      <dir>                     deterministic scene-graph gates
     joints     <dir>                     validate articulation (Blender)
     score      <dir> --spec FILE         measure constraints against spec
@@ -114,6 +114,40 @@ def cmd_fit(args):
     kept = out / "fit_spec.json"
     if source.resolve() != kept.resolve():
         shutil.copyfile(source, kept)
+        try:
+            spec = json.loads(source.read_text())
+        except json.JSONDecodeError as exc:
+            sys.exit(f"ProcAgen3D: invalid fit spec JSON: {exc}")
+        if not isinstance(spec, dict):
+            sys.exit("ProcAgen3D: fit spec must be a JSON object")
+
+        def copy_dependency(relative, label):
+            if not isinstance(relative, str) or not relative:
+                return
+            rel = Path(relative)
+            if rel.is_absolute() or ".." in rel.parts:
+                sys.exit(f"ProcAgen3D: {label} must be a safe relative path")
+            dependency = source.parent / rel
+            if not dependency.is_file():
+                sys.exit(f"ProcAgen3D: {label} not found beside fit spec: "
+                         f"{dependency}")
+            destination = out / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if dependency.resolve() != destination.resolve():
+                shutil.copyfile(dependency, destination)
+
+        copy_dependency(spec.get("reference_image"), "reference_image")
+        mask = spec.get("mask")
+        if isinstance(mask, dict) and str(mask.get("source", "")).lower() == "file":
+            copy_dependency(mask.get("path"), "mask.path")
+        if spec.get("version") == 2:
+            plan = source.parent / "reconstruction_plan.json"
+            if not plan.is_file():
+                sys.exit("ProcAgen3D: fit spec version 2 requires "
+                         "reconstruction_plan.json beside the fit spec")
+            plan_destination = out / "reconstruction_plan.json"
+            if plan.resolve() != plan_destination.resolve():
+                shutil.copyfile(plan, plan_destination)
     stage = ["fit", "--out", str(out), "--spec", str(kept),
              "--engine", args.engine]
     return run_blender(stage, args.blender)
@@ -163,10 +197,14 @@ def image_fit_errors(dir_path):
         report = json.loads(report_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         return [f"invalid fit evidence JSON: {exc}"]
+    if not isinstance(spec, dict) or not isinstance(report, dict):
+        return ["fit spec and report must be JSON objects"]
     reference_name = spec.get("reference_image")
     reference_path = root / reference_name if isinstance(reference_name, str) else None
     if reference_path is None or not reference_path.is_file():
         errors.append(f"fit reference is missing: {reference_name!r}")
+    if spec.get("version") == 2 and not (root / "reconstruction_plan.json").is_file():
+        errors.append("fit spec version 2 requires reconstruction_plan.json")
     if not report.get("passed"):
         summary = report.get("summary", {})
         errors.append(
@@ -234,18 +272,124 @@ FORM_TOPOLOGIES = {"continuous", "shell", "assembled", "strand", "relief"}
 FORM_METHODS = {
     "loft", "sweep", "revolve", "subdivision", "surface-grid", "nurbs",
     "curve", "solidify", "profile-extrude", "primitive-csg", "boolean",
-    "decal",
+    "analytic-primitive", "decal",
 }
 TOPOLOGY_METHODS = {
     "continuous": {"loft", "sweep", "revolve", "subdivision",
-                   "surface-grid", "nurbs"},
+                   "surface-grid", "nurbs", "analytic-primitive"},
     "shell": {"loft", "sweep", "subdivision", "surface-grid", "nurbs",
               "solidify"},
-    "assembled": {"primitive-csg", "profile-extrude", "boolean", "revolve"},
+    "assembled": {"primitive-csg", "profile-extrude", "boolean", "revolve",
+                  "analytic-primitive"},
     "strand": {"sweep", "curve", "nurbs"},
     "relief": {"curve", "profile-extrude", "primitive-csg", "boolean",
                "decal"},
 }
+
+SHAPE_FAMILIES = {
+    "box", "prism", "cylinder", "cone", "sphere", "ellipsoid", "capsule",
+    "revolve", "loft", "sweep", "surface-grid", "shell", "strand",
+}
+SHAPE_FAMILY_METHODS = {
+    "box": {"primitive-csg", "profile-extrude", "boolean"},
+    "prism": {"primitive-csg", "profile-extrude", "boolean"},
+    "cylinder": {"primitive-csg", "revolve", "boolean",
+                 "analytic-primitive"},
+    "cone": {"primitive-csg", "revolve", "analytic-primitive"},
+    "sphere": {"analytic-primitive", "revolve", "subdivision"},
+    "ellipsoid": {"analytic-primitive", "loft", "subdivision"},
+    "capsule": {"analytic-primitive", "loft", "sweep", "subdivision"},
+    "revolve": {"revolve"},
+    "loft": {"loft"},
+    "sweep": {"sweep"},
+    "surface-grid": {"surface-grid", "subdivision", "nurbs"},
+    "shell": {"solidify", "surface-grid", "loft", "subdivision", "nurbs"},
+    "strand": {"curve", "sweep", "nurbs"},
+}
+COMPLEXITY_BANDS = {
+    "simple": (1, 7),
+    "moderate": (8, 15),
+    "complex": (16, 27),
+    "extreme": (28, None),
+}
+ADAPTIVE_DETAIL_FLOORS = {
+    "standard": {
+        "simple": (24, 5000, 4),
+        "moderate": (50, 10000, 6),
+        "complex": (100, 20000, 8),
+        "extreme": (160, 32000, 10),
+    },
+    "showcase": {
+        "simple": (60, 12000, 8),
+        "moderate": (140, 28000, 10),
+        "complex": (260, 55000, 14),
+        "extreme": (420, 90000, 16),
+    },
+}
+DETAIL_PRIORITIES = {"identity", "structural", "secondary", "micro", "inferred"}
+OBJECT_REGIONS = {
+    "top-left", "top-center", "top-right",
+    "middle-left", "middle-center", "middle-right",
+    "bottom-left", "bottom-center", "bottom-right",
+}
+MIN_OCCUPIED_REGIONS = {
+    "simple": 1,
+    "moderate": 3,
+    "complex": 5,
+    "extreme": 6,
+}
+
+
+def load_reconstruction_plan(dir_path):
+    """Load the v2 image-reconstruction contract, when present/required."""
+    root = Path(dir_path)
+    path = root / "reconstruction_plan.json"
+    required = False
+    fit_path = root / "fit_spec.json"
+    if fit_path.is_file():
+        try:
+            fit_spec = json.loads(fit_path.read_text())
+            required = (isinstance(fit_spec, dict)
+                        and fit_spec.get("version") == 2)
+        except (OSError, json.JSONDecodeError):
+            pass
+    if not path.is_file():
+        return None, (["reconstruction_plan.json missing"] if required else [])
+    try:
+        plan = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, [f"invalid reconstruction_plan.json: {exc}"]
+    errors = []
+    if not isinstance(plan, dict):
+        return None, ["reconstruction plan must be a JSON object"]
+    if plan.get("version") != 1:
+        errors.append("reconstruction plan must be a JSON object with version: 1")
+    complexity = plan.get("complexity")
+    if not isinstance(complexity, dict):
+        errors.append("complexity must be an object")
+    else:
+        complexity_class = complexity.get("class")
+        if complexity_class not in COMPLEXITY_BANDS:
+            errors.append(
+                "complexity.class must be simple, moderate, complex, or extreme")
+        drivers = complexity.get("drivers")
+        if (not isinstance(drivers, list) or not drivers
+                or any(not isinstance(item, str) or not item.strip() for item in drivers)):
+            errors.append("complexity.drivers must be a non-empty string list")
+        occupied_regions = complexity.get("occupied_regions")
+        if (not isinstance(occupied_regions, list) or not occupied_regions
+                or any(region not in OBJECT_REGIONS for region in occupied_regions)):
+            errors.append(
+                "complexity.occupied_regions must be a non-empty list of "
+                "object-centric 3x3 regions")
+        elif len(set(occupied_regions)) != len(occupied_regions):
+            errors.append("complexity.occupied_regions contains duplicates")
+    if not isinstance(plan.get("shape_priors"), list) or not plan.get("shape_priors"):
+        errors.append("shape_priors must be a non-empty list")
+    if (not isinstance(plan.get("detail_features"), list)
+            or not plan.get("detail_features")):
+        errors.append("detail_features must be a non-empty list")
+    return plan, errors
 
 
 def form_prop(obj, name):
@@ -296,6 +440,11 @@ def cmd_check(args):
     if fit_errors:
         failures += 1
         fail("REFERENCE_FIT", "; ".join(fit_errors))
+
+    reconstruction_plan, plan_errors = load_reconstruction_plan(args.dir)
+    if plan_errors:
+        failures += 1
+        fail("RECONSTRUCTION_PLAN", "; ".join(plan_errors))
 
     root_names = set(graph.get("roots") or [])
     if not root_names:
@@ -458,7 +607,10 @@ def cmd_check(args):
         )[:12]
         contracted_macro = [o for o in macro if o["name"] in valid_contract_names]
         contract_ratio = len(contracted_macro) / len(macro) if macro else 1.0
-        required_contract_ratio = 0.75 if form_profile == "curved" else 0.60
+        required_contract_ratio = (
+            0.75 if form_profile == "curved" or reconstruction_plan is not None
+            else 0.60
+        )
         if contract_ratio < required_contract_ratio:
             failures += 1
             untagged = [o["name"] for o in macro
@@ -472,17 +624,38 @@ def cmd_check(args):
             and form_prop(o, "procagen3d_topology") in ("continuous", "shell")
             and not is_shallow_form_cage(o)
         ]
-        macro_volume = sum(bbox_proxy_volume(o) for o in macro)
-        shaped_volume = sum(bbox_proxy_volume(o) for o in macro_shaped)
-        macro_shaped_ratio = shaped_volume / macro_volume if macro_volume else 1.0
-        required_macro_shaped = 0.50 if form_profile == "curved" else 0.30
-        if macro_shaped_ratio < required_macro_shaped:
-            failures += 1
-            fail("FORM_MACRO_COVERAGE", f"genuine continuous/shell forms cover "
-                 f"only {macro_shaped_ratio:.0%} of the top structural envelope "
-                 f"(need {required_macro_shaped:.0%}; {len(macro_shaped)}/"
-                 f"{len(macro)} masses); a small token loft cannot excuse a "
-                 "box-built body")
+        mixed_shaped = [
+            o for o in structural
+            if o["name"] in valid_contract_names
+            and form_prop(o, "procagen3d_topology") in ("continuous", "shell")
+            and not is_shallow_form_cage(o)
+        ]
+        mixed_assembled = [
+            o for o in structural
+            if o["name"] in valid_contract_names
+            and form_prop(o, "procagen3d_topology") == "assembled"
+        ]
+        if form_profile == "curved":
+            macro_volume = sum(bbox_proxy_volume(o) for o in macro)
+            shaped_volume = sum(bbox_proxy_volume(o) for o in macro_shaped)
+            macro_shaped_ratio = shaped_volume / macro_volume if macro_volume else 1.0
+            if macro_shaped_ratio < 0.50:
+                failures += 1
+                fail("FORM_MACRO_COVERAGE", f"genuine continuous/shell forms cover "
+                     f"only {macro_shaped_ratio:.0%} of the top structural envelope "
+                     f"(need 50%; {len(macro_shaped)}/{len(macro)} masses); a "
+                     "small token loft cannot excuse a box-built curved body")
+        elif not mixed_shaped or not mixed_assembled:
+            message = ("mixed means evidence-backed coexistence, not a "
+                       "continuous-form quota: structural masses need at least "
+                       f"one continuous/shell ({len(mixed_shaped)}) and one "
+                       f"assembled ({len(mixed_assembled)}) representative")
+            if reconstruction_plan is not None:
+                failures += 1
+                fail("FORM_MIXED_FAMILIES", message)
+            else:
+                warn("FORM_MIXED_FAMILIES_LEGACY", message
+                     + "; legacy asset has no reconstruction plan")
         if not primary:
             failures += 1
             fail("FORM_CONTRACT", f"--form {form_profile} requires primary masses "
@@ -493,8 +666,7 @@ def cmd_check(args):
                       if form_prop(o, "procagen3d_topology") in
                       ("continuous", "shell")]
             shaped_ratio = len(shaped) / len(primary)
-            required = 0.50 if form_profile == "curved" else 0.30
-            if shaped_ratio < required:
+            if form_profile == "curved" and shaped_ratio < 0.50:
                 failures += 1
                 fail("FORM_COVERAGE", f"{form_profile} target has only "
                      f"{len(shaped)}/{len(primary)} ({shaped_ratio:.0%}) primary "
@@ -526,13 +698,225 @@ def cmd_check(args):
                 warn("FORM_SECTIONS", "continuous forms have weak authored "
                      f"cross-section variation: {weak_sections[:6]}")
 
-        primitive_limit = 0.35 if form_profile == "curved" else 0.45
-        if primitive_cage_ratio > primitive_limit:
+        if form_profile == "curved" and primitive_cage_ratio > 0.35:
             warn("FORM_PRIMITIVES", f"{primitive_cage_ratio:.0%} of structural "
-                 f"meshes are eight-vertex/six-face cages (limit "
-                 f"{primitive_limit:.0%}; e.g. {primitive_cages[:6]})")
+                 "meshes are eight-vertex/six-face cages (limit 35%; e.g. "
+                 f"{primitive_cages[:6]})")
+
+    complexity_class = None
+    if reconstruction_plan is not None and not plan_errors:
+        complexity = reconstruction_plan["complexity"]
+        complexity_class = complexity["class"]
+        occupied_regions = set(complexity["occupied_regions"])
+        shape_prior_ids = set()
+        shape_prior_patterns = set()
+        planned_shape_names = set()
+        for index, entry in enumerate(reconstruction_plan["shape_priors"]):
+            if not isinstance(entry, dict):
+                failures += 1
+                fail("SHAPE_PRIOR", f"shape_priors[{index}] must be an object")
+                continue
+            prior_id = entry.get("id")
+            if not isinstance(prior_id, str) or not prior_id.strip():
+                failures += 1
+                fail("SHAPE_PRIOR", f"shape_priors[{index}].id must be a "
+                     "non-empty string")
+                continue
+            if prior_id in shape_prior_ids:
+                failures += 1
+                fail("SHAPE_PRIOR", f"duplicate shape prior id: {prior_id}")
+                continue
+            shape_prior_ids.add(prior_id)
+            pattern = entry.get("pattern")
+            family = entry.get("family")
+            confidence = entry.get("confidence")
+            evidence = entry.get("evidence")
+            rejected = entry.get("rejected_alternatives")
+            edge_treatment = entry.get("edge_treatment")
+            schema_errors = []
+            if (not isinstance(pattern, str) or not pattern
+                    or re.search(r"[A-Za-z0-9]", pattern) is None):
+                schema_errors.append(
+                    "pattern must contain a semantic alphanumeric literal")
+            elif pattern in shape_prior_patterns:
+                schema_errors.append(f"duplicate pattern {pattern!r}")
+            if family not in SHAPE_FAMILIES:
+                schema_errors.append(f"unknown family {family!r}")
+            if confidence not in ("high", "medium", "low"):
+                schema_errors.append("confidence must be high, medium, or low")
+            if (not isinstance(evidence, list) or not evidence
+                    or any(not isinstance(item, str) or not item.strip()
+                           for item in evidence)):
+                schema_errors.append("evidence must be a non-empty string list")
+            if (not isinstance(rejected, list) or not rejected
+                    or any(not isinstance(item, str) or not item.strip()
+                           for item in rejected)):
+                schema_errors.append(
+                    "rejected_alternatives must be a non-empty string list")
+            elif family in SHAPE_FAMILIES and any(re.match(
+                    rf"^\s*{re.escape(family)}(?:\s|:|$)", item,
+                    flags=re.IGNORECASE) for item in rejected):
+                schema_errors.append(
+                    "chosen family cannot also be a rejected alternative")
+            if not isinstance(edge_treatment, str) or not edge_treatment.strip():
+                schema_errors.append("edge_treatment must be a non-empty string")
+            if schema_errors:
+                failures += 1
+                fail("SHAPE_PRIOR", f"{prior_id}: " + "; ".join(schema_errors))
+                continue
+            shape_prior_patterns.add(pattern)
+            matched = [obj for obj in meshes
+                       if fnmatch.fnmatchcase(obj["name"], pattern)]
+            if not matched:
+                failures += 1
+                fail("SHAPE_PRIOR", f"{prior_id}: pattern {pattern!r} matches "
+                     "no renderable mesh")
+                continue
+            planned_shape_names.update(obj["name"] for obj in matched)
+            wrong_family = [
+                f"{obj['name']}={form_prop(obj, 'procagen3d_shape_family')!r}"
+                for obj in matched
+                if form_prop(obj, "procagen3d_shape_family") != family
+            ]
+            if wrong_family:
+                failures += 1
+                fail("SHAPE_PRIOR", f"{prior_id}: planned family {family!r} does "
+                     f"not match program tags {wrong_family[:8]}")
+            wrong_method = [
+                f"{obj['name']}={form_prop(obj, 'procagen3d_form_method')!r}"
+                for obj in matched
+                if form_prop(obj, "procagen3d_form_method")
+                not in SHAPE_FAMILY_METHODS[family]
+            ]
+            if wrong_method:
+                failures += 1
+                fail("SHAPE_METHOD", f"{prior_id}: family {family!r} is "
+                     f"incompatible with construction {wrong_method[:8]}")
+
+        uncovered_primary = [obj["name"] for obj in primary
+                             if obj["name"] not in planned_shape_names]
+        if uncovered_primary:
+            failures += 1
+            fail("SHAPE_PRIOR_COVERAGE", "primary masses missing from the "
+                 f"shape-prior plan: {uncovered_primary[:10]}")
+        plan_macro = sorted(structural, key=bbox_proxy_volume, reverse=True)[:12]
+        covered_macro = [obj for obj in plan_macro
+                         if obj["name"] in planned_shape_names]
+        plan_macro_ratio = len(covered_macro) / len(plan_macro) if plan_macro else 1.0
+        if plan_macro_ratio < 0.75:
+            failures += 1
+            fail("SHAPE_PRIOR_COVERAGE", f"only {len(covered_macro)}/"
+                 f"{len(plan_macro)} largest structural masses occur in "
+                 "shape_priors (need 75%); uncovered: "
+                 f"{[obj['name'] for obj in plan_macro if obj not in covered_macro][:8]}")
+
+        feature_ids = set()
+        feature_patterns = set()
+        visible_feature_count = 0
+        identity_count = 0
+        planned_visible_regions = set()
+        missing_features = []
+        for index, entry in enumerate(reconstruction_plan["detail_features"]):
+            if not isinstance(entry, dict):
+                failures += 1
+                fail("DETAIL_PLAN", f"detail_features[{index}] must be an object")
+                continue
+            feature_id = entry.get("id")
+            if not isinstance(feature_id, str) or not feature_id.strip():
+                failures += 1
+                fail("DETAIL_PLAN", f"detail_features[{index}].id must be a "
+                     "non-empty string")
+                continue
+            if feature_id in feature_ids:
+                failures += 1
+                fail("DETAIL_PLAN", f"duplicate detail feature id: {feature_id}")
+                continue
+            feature_ids.add(feature_id)
+            pattern = entry.get("pattern")
+            priority = entry.get("priority")
+            region = entry.get("region")
+            minimum = entry.get("min_count", 1)
+            required_value = entry.get("required", priority != "inferred")
+            if (not isinstance(pattern, str) or not pattern
+                    or re.search(r"[A-Za-z0-9]", pattern) is None
+                    or priority not in DETAIL_PRIORITIES
+                    or not isinstance(region, str) or not region.strip()
+                    or not isinstance(minimum, int) or isinstance(minimum, bool)
+                    or minimum < 1 or not isinstance(required_value, bool)):
+                failures += 1
+                fail("DETAIL_PLAN", f"{feature_id}: requires non-empty pattern/"
+                     "region, a valid priority, integer min_count >= 1, and a "
+                     "boolean required value")
+                continue
+            if pattern in feature_patterns:
+                failures += 1
+                fail("DETAIL_PLAN", f"{feature_id}: duplicate feature pattern "
+                     f"{pattern!r}; each visible group needs a distinct semantic "
+                     "mesh pattern")
+                continue
+            feature_patterns.add(pattern)
+            if priority != "inferred" and region not in OBJECT_REGIONS:
+                failures += 1
+                fail("DETAIL_PLAN", f"{feature_id}: visible feature region "
+                     f"{region!r} is not an object-centric 3x3 region")
+                continue
+            if priority != "inferred" and region not in occupied_regions:
+                failures += 1
+                fail("DETAIL_PLAN", f"{feature_id}: region {region!r} is not "
+                     "declared in complexity.occupied_regions")
+                continue
+            if priority != "inferred" and not required_value:
+                failures += 1
+                fail("DETAIL_PLAN", f"{feature_id}: every visible/non-inferred "
+                     "feature group must be required")
+                continue
+            if priority != "inferred":
+                visible_feature_count += 1
+                planned_visible_regions.add(region)
+            if priority == "identity":
+                identity_count += 1
+            required = required_value
+            count = sum(1 for obj in meshes
+                        if fnmatch.fnmatchcase(obj["name"], pattern))
+            if args.tier != "quick" and required and count < minimum:
+                missing_features.append(
+                    f"{feature_id} {count}/{minimum} ({pattern})")
+        if args.tier != "quick" and missing_features:
+            failures += 1
+            fail("DETAIL_COVERAGE", "required reference feature groups missing: "
+                 + "; ".join(missing_features[:12]))
+        lower, upper = COMPLEXITY_BANDS[complexity_class]
+        if visible_feature_count < lower or (
+                upper is not None and visible_feature_count > upper):
+            failures += 1
+            interval = f"{lower}+" if upper is None else f"{lower}..{upper}"
+            fail("COMPLEXITY_CLASS", f"{complexity_class} requires {interval} "
+                 f"visible feature groups; plan declares {visible_feature_count}")
+        minimum_regions = MIN_OCCUPIED_REGIONS[complexity_class]
+        if len(occupied_regions) < minimum_regions:
+            failures += 1
+            fail("COMPLEXITY_REGIONS", f"{complexity_class} requires at least "
+                 f"{minimum_regions} occupied object regions; plan declares "
+                 f"{len(occupied_regions)}")
+        uncovered_regions = sorted(occupied_regions - planned_visible_regions)
+        if uncovered_regions:
+            failures += 1
+            fail("DETAIL_REGIONS", "occupied regions without a required visible "
+                 f"feature group: {uncovered_regions}")
+        identity_minimum = {
+            "simple": 1, "moderate": 2, "complex": 3, "extreme": 4,
+        }[complexity_class]
+        if identity_count < identity_minimum:
+            failures += 1
+            fail("DETAIL_IDENTITY", f"{complexity_class} plan needs at least "
+                 f"{identity_minimum} identity feature groups; found {identity_count}")
 
     floors = {"standard": (40, 8000, 6), "showcase": (150, 25000, 12)}
+    if complexity_class is not None and args.tier in ADAPTIVE_DETAIL_FLOORS:
+        floors = {
+            **floors,
+            args.tier: ADAPTIVE_DETAIL_FLOORS[args.tier][complexity_class],
+        }
     if args.tier in floors:
         mesh_floor, tri_floor, mat_floor = floors[args.tier]
         misses = []
@@ -546,10 +930,17 @@ def cmd_check(args):
             misses.append(f"unbeveled-box meshes {boxy_ratio:.0%} "
                           f"(e.g. {boxy[:4]})")
         if misses:
-            warn("LOW_DETAIL", f"{args.tier} floors not met: "
-                 + "; ".join(misses)
-                 + " — fix the named form/detail deficit "
-                 "(references/detail.md; references/complex-forms.md)")
+            message = (f"{args.tier} floors not met"
+                       + (f" for {complexity_class} complexity" if complexity_class
+                          else "")
+                       + ": " + "; ".join(misses)
+                       + " — fix the named form/detail deficit "
+                       "(references/detail.md; references/complex-forms.md)")
+            if reconstruction_plan is not None and args.tier == "showcase":
+                failures += 1
+                fail("LOW_DETAIL", message)
+            else:
+                warn("LOW_DETAIL", message)
 
     world = graph.get("world_bbox", {}).get("size", ["?"] * 3)
     print(f"{OK if not failures else '[PROCAGEN3D:SUMMARY]'} {totals['meshes']} meshes, "
@@ -980,7 +1371,8 @@ def main():
                    help="also render a neutral clay six-view form sheet")
     p.set_defaults(func=cmd_render)
 
-    p = sub.add_parser("fit", help="render and score a registered reference fit")
+    p = sub.add_parser(
+        "fit", help="render and score registered silhouette/pose reference fit")
     p.add_argument("dir")
     p.add_argument("--spec", required=True,
                    help="fit_spec.json (copied into the asset directory)")

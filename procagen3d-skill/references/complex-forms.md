@@ -6,6 +6,10 @@ non-rectangular armor/panels. A sports-car body and biomechanical mecha are
 form-dominant even though both are "hard surface." More parts, bevels, and
 triangles cannot repair the wrong representation family.
 
+Read `reconstruction-planning.md` first for image-conditioned work. This file
+describes genuine complex forms; it does not authorize replacing evidence-backed
+boxes/prisms with lofts or ellipsoids.
+
 ## Contents
 
 1. Route topology before geometry
@@ -30,7 +34,9 @@ Classify every silhouette-bearing macro/meso part before choosing a helper:
 Declare the overall form profile as `rectilinear`, `curved`, or `mixed`.
 Choose `curved` when continuous/shell forms dominate; choose `mixed` for
 mecha and machinery that deliberately combine sculpted masses with assembled
-solids. Run `check --form <profile>` later.
+solids. `mixed` means both families are present because the evidence says so;
+it is not a minimum continuous-volume percentage. Run `check --form <profile>`
+later.
 
 Set the same profile on the program root so plain `check` auto-detects it:
 
@@ -44,10 +50,11 @@ volume, and identity forms; use `secondary` for supports, contacts, and
 deliberately assembled structure:
 
 ```python
-def mark_form(obj, role, topology, method, section_count=None):
+def mark_form(obj, role, topology, method, family, section_count=None):
     obj["procagen3d_form_role"] = role          # primary | secondary
     obj["procagen3d_topology"] = topology      # table above
     obj["procagen3d_form_method"] = method     # checker vocabulary below
+    obj["procagen3d_shape_family"] = family     # reconstruction plan value
     if section_count is not None:
         obj["procagen3d_section_count"] = int(section_count)
     return obj
@@ -55,24 +62,36 @@ def mark_form(obj, role, topology, method, section_count=None):
 
 Use these exact method values: `loft`, `sweep`, `revolve`, `subdivision`,
 `surface-grid`, `nurbs`, `curve`, `solidify`, `profile-extrude`,
-`primitive-csg`, `boolean`, or `decal`. Tag every structural mass that enters
-form review, but do not inflate coverage by tagging seams, fasteners, decals,
-or trim. Those are detail, not structural form.
+`primitive-csg`, `boolean`, `analytic-primitive`, or `decal`. Use
+`analytic-primitive` only for a genuine sphere/ellipsoid/capsule. Tag every
+structural mass that enters form review, but do not inflate coverage by tagging
+seams, fasteners, decals, or trim. Those are detail, not structural form.
 
-The checker audits valid contracts on the largest structural masses and uses
-their bounding-envelope volume as a macro-form proxy. A small token loft does
-not compensate for a body assembled from rounded boxes; legitimately blocky
-mechanisms remain valid `assembled` structure in a mixed target.
+The checker audits contract coverage on the largest structural masses. A
+curved target still needs real continuous macro coverage. A mixed target only
+needs genuine continuous/shell and assembled structural representatives, then
+checks every version-2 mass against `reconstruction_plan.json`; neither family
+must be among the largest masses and no volume percentage is rewarded.
+Legitimately blocky mechanisms remain assembled.
+
+### Rectilinear/prismatic guard
+
+Long straight/parallel edges, broad planar fields, and constant sections are
+positive evidence for `box`/`prism`, even when corners are beveled. Bevel is
+edge treatment, not topology. If those cues dominate, route the part to
+primitive CSG or polygon profile extrusion. Do not make a six-ring loft whose
+stations differ only enough to satisfy a form warning; that is a rounded-box
+proxy and a prior failure.
 
 ## 2. Build the form blueprint
 
 Do not infer a curve from adjectives. Measure a compact guide from the saved
 reference:
 
-1. Estimate and register the full reference camera in `fit_spec.json` as
-   required by `image-fit.md`: projection, position/target (or
-   azimuth/elevation/distance), roll, FOV or orthographic scale, and image
-   shift. Optionally put the coarse three-value preview contract on the root:
+1. Reuse the camera and pose already solved in version-2 `fit_spec.json` as
+   required by `reconstruction-planning.md` and `image-fit.md`. Do not tune
+   section dimensions until frame-axis and pose-chain evidence is credible.
+   Optionally put the coarse three-value preview contract on the root:
 
    ```python
    root["procagen3d_reference_projection"] = "perspective"
@@ -83,20 +102,23 @@ reference:
    Treat that root property as a backward-compatible preview only: it
    auto-centers the asset and cannot prove registration. Run `procagen3d fit`
    for the scored `renders/reference_match.png`. Mark estimates approximate
-   until the registered mask/landmark gates pass.
-2. Trace 6–12 normalized `(u, v)` landmarks along each identity-bearing
+   until the registered local-silhouette/pose gates pass.
+2. Copy each chosen structural family from `reconstruction_plan.json`; the
+   form blueprint only expands masses planned as loft/sweep/shell. Do not
+   promote a box/prism because this reference discusses curves.
+3. Trace 6–12 normalized `(u, v)` landmarks along each identity-bearing
    contour. Convert them to meters with one explicit image-to-world mapping.
-3. For a loft, choose a longitudinal axis and 5–12 stations. At each station
+4. For a loft, choose a longitudinal axis and 5–12 stations. At each station
    record center, half-width, bottom, shoulder/belt height, crown/top, local
    depth, twist, and the evidence view. Add stations at every curvature
    extremum, hard crease, opening boundary, and attachment.
-4. For a polygon panel, record its ordered outline and thickness. For a sweep,
+5. For a polygon panel, record its ordered outline and thickness. For a sweep,
    record spine points plus width/height/twist per station. Small semantic
    control arrays are constructive parameters, not forbidden vertex soup.
-5. Record negative spaces separately: wheel arches, limb-to-torso gaps,
+6. Record negative spaces separately: wheel arches, limb-to-torso gaps,
    undercuts, vents, and joint clearances. A correct outer AABB can still hide
    a solid-filled opening.
-6. Name 3–5 **macro identity forms** separately from detail identity features:
+7. Name 3–5 **macro identity forms** separately from detail identity features:
    e.g. a continuous nose-to-canopy arc, paired rear haunch shoulders, or an
    EVA thigh swell that pinches sharply into the knee.
 
@@ -115,6 +137,7 @@ fasteners, tread, and material variation.
 
 ```sh
 procagen3d build <out>/form_probe.py --out <out>/form_probe --form-diagnostics
+procagen3d fit <out>/form_probe --spec <out>/fit_spec.json
 procagen3d check <out>/form_probe --tier quick --form <profile>
 ```
 
@@ -122,15 +145,18 @@ Read both `renders/sheet.png` and `renders/form_sheet.png`. Pass only when:
 
 - `check` has no `FORM_*` failure, and each `FORM_*` warning is fixed or
   justified by named, deliberately assembled structure;
-- front/right/top/iso silhouettes agree with the form blueprint;
+- front/right/top/iso silhouettes agree with the primitive plan/form blueprint;
+- local silhouette, frame-axis, and articulated pose-chain gates pass;
 - cross-sections swell, pinch, taper, and twist at the named stations;
 - negative spaces remain open and attachment patches meet cleanly;
 - primary transitions read as one intended surface, not overlapping lumps;
 - the reference-matched view agrees without collapsing in unseen views.
 
-Allow at most two probe corrections. If the body family is wrong, rewrite the
-single primary builder (box → loft/sweep/surface), not its dimensions or
-decoration. If the probe still fails, stop or request better views; do not
+Allow at most two probe corrections. If a family is wrong, revisit evidence in
+the reconstruction plan, then rewrite that single builder in either direction
+(ellipsoid/loft → box/prism is as valid as box → loft). Do not tune dimensions
+or decoration around the wrong family. If the probe still fails, stop or
+request better views; do not
 decorate a rejected form. Once passed, transfer those builders and station
 constants to the full program before adding secondary structure and detail.
 For repeated complex modules, validate one master (one fender, thigh shell,
@@ -185,7 +211,7 @@ def loft_rings(name, rings, mat, *, cap=True, subdivision=0,
         mod.subdivision_type = "CATMULL_CLARK"
         mod.levels = subdivision
         mod.render_levels = subdivision
-    mark_form(obj, role, topology, "loft", len(rings))
+    mark_form(obj, role, topology, "loft", "loft", len(rings))
     obj["procagen3d_ring_points"] = ring_size
     return obj
 ```
@@ -228,7 +254,7 @@ def sweep_profile(name, spine, profile, scales, mat, *, role="primary"):
                       for u, v in profile])
         previous = tangent
     obj = loft_rings(name, rings, mat, role=role, topology="continuous")
-    mark_form(obj, role, "continuous", "sweep", len(rings))
+    mark_form(obj, role, "continuous", "sweep", "sweep", len(rings))
     return obj
 ```
 
@@ -271,11 +297,17 @@ sweep meets a housing—do not leave a pinched point contact.
 
 ### Biomechanical or irregular mecha
 
-- Build anatomical/biomechanical cores as tapered capsules, lofts, or sweeps.
-- Build thigh, shin, forearm, shoulder, and torso armor as separate asymmetric
-  4–8 ring loft shells so joints and gaps remain articulated.
-- Use polygon profile extrusions for intentionally faceted chest, knee, ankle,
-  and pylon plates; primitives remain valid for joint hubs and hard mechanisms.
+- Build genuinely anatomical/biomechanical cores as tapered capsules, lofts,
+  or sweeps; compact joint hubs may use analytic primitives.
+- Route each armor mass independently from visible evidence. Broad planar
+  faces, hard crease networks, and constant thickness use polygon prisms or
+  faceted shells. Use 4–8 ring loft shells only where the armor itself visibly
+  swells/pinches across the face.
+- Do not wrap an ellipsoid around every upper arm, thigh, shin, or shoulder.
+  Many mecha derive identity from layered faceted plates over a much smaller
+  curved inner core; preserve those plate boundaries and gaps.
+- Use polygon profile extrusions for faceted chest, knee, ankle, pylon, forearm,
+  and calf plates; primitives remain valid for joint hubs and hard mechanisms.
 - Use sweeps for horns, cables, and curved spines. Preserve collars and visible
   gaps at every joint; do not let armor shells fuse across pivots.
 
@@ -287,8 +319,9 @@ Judge form before materials and microdetail:
   iso views; no view may collapse into a slab;
 - **volume/cross-section:** confirm the named swells, pinches, crowns, undercuts,
   and thickness changes—broadside similarity alone is insufficient;
-- **continuity/highlight flow:** read `form_sheet.png`; unwanted flat runs,
-  segmented ellipsoid joins, and box corners are failures;
+- **family/highlight flow:** read `form_sheet.png`; unwanted flat runs or box
+  corners fail planned continuous forms, while unwanted bulges/face curvature
+  fail planned boxes and prisms; segmented ellipsoid joins always fail;
 - **negative space:** verify every wheel arch, limb gap, undercut, and cavity;
 - **attachment:** inspect collars, root blends, seams, and load/contact patches.
 

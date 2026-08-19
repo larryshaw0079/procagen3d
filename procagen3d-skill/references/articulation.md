@@ -44,6 +44,22 @@ defaults. The validator warns at ≥300°; have a physical reason or narrow it.
   (`Base ← Joint_Shoulder ← Upper_Arm ← Joint_Elbow ← Forearm`); pivots at
   the physical joint constants (`SHOULDER`, `ELBOW`).
 
+## Image-conditioned reference pose
+
+Solve the visible pose before estimating link dimensions (see
+`reconstruction-planning.md`). For a reference-matched asset, build each child
+assembly in the visible pose first, then insert joints with keep-world
+parenting; joint value 0 is that reference/rest pose and limits bracket it.
+Do not leave the geometry neutral and fake bends by shortening or offsetting
+links.
+
+Create fit markers from the same pivot/end constants as the hierarchy and list
+each visible chain in version-2 `fit_spec.json`. The fit gate compares segment
+directions, joint bend angles, and normalized link lengths. The joint validator
+then checks mechanical validity around the accepted visual rest pose. Remember
+that joint axes are world-space at rest pose, so a tilted limb may require an
+axis different from a canonical neutral figure.
+
 ## Validator semantics — `procagen3d joints <out>`
 
 Reads `scene.blend`, writes `joints_report.json`. FAIL ⇒ exit 1 ⇒ must fix:

@@ -4,6 +4,13 @@ What makes a program a *ProcAgen3D* program, as opposed to a script that happens
 to emit a mesh. The build harness and `check` enforce most of this; the rest
 is on you. Violations found by gates are never acceptable residue.
 
+## Contents
+
+1. Program, units, dimensions, names, pivots, and hierarchy
+2. Canonical helpers and program skeleton
+3. Geometry and reconstruction strategy
+4. Repair doctrine and pre-build checklist
+
 ## Program contract
 
 - Defines `def build()` that constructs the whole scene into the (empty)
@@ -18,6 +25,9 @@ is on you. Violations found by gates are never acceptable residue.
   wheels, bases touch z = 0). The object faces **-Y** — the canonical
   "front" render looks from -Y toward +Y, so a car's windshield, a face, a
   drawer front must point toward -Y.
+- Keep load-bearing dimensions in this canonical object frame. For a reference
+  image, solve camera and rigid/articulated pose separately; never bake image
+  tilt or foreshortening into part size.
 
 ## Named constants for dimensions
 
@@ -67,9 +77,9 @@ naive `obj.parent = x` shifts the child by the parent's transform.
 
 ## Materials
 
-A small set of physically based families assigned by part meaning (Wood,
+A purposeful set of physically based families assigned by part meaning (Wood,
 PaintedSteel, Rubber, Glass, Brass...), not per-mesh one-offs. Reuse via the
-helper; keep 3–8 materials per asset.
+helper and meet the complexity-adaptive floor in `detail.md`.
 
 ## Canonical helpers (paste into every program)
 
@@ -105,6 +115,17 @@ def box(name, size, location, mat):
     obj.dimensions = size
     bpy.ops.object.transform_apply(scale=True)
     obj.data.materials.append(mat)
+    return obj
+
+
+def mark_form(obj, role, topology, method, family, section_count=None):
+    """Bind a structural mesh to the form + reconstruction-plan contract."""
+    obj["procagen3d_form_role"] = role
+    obj["procagen3d_topology"] = topology
+    obj["procagen3d_form_method"] = method
+    obj["procagen3d_shape_family"] = family
+    if section_count is not None:
+        obj["procagen3d_section_count"] = int(section_count)
     return obj
 
 
@@ -181,8 +202,10 @@ if __name__ == "__main__":
 
 ## Geometry strategy, briefly
 
-Prefer constructive solid modeling with primitives, arrays of instances,
-booleans (bmesh or modifier), bevels, and simple bmesh extrusions. A shape
+Choose the simplest evidence-backed family from
+`references/reconstruction-planning.md`, then use constructive solid modeling
+with primitives, arrays of instances, booleans (bmesh or modifier), bevels,
+and simple bmesh extrusions. A shape
 you can name (flange, strut, rim, shell) should come from a parameterized
 builder function, not from magic vertex dumps. Compact, semantic control
 arrays—profile points, section rings, sweep spines, and surface-grid
@@ -195,6 +218,10 @@ buildable with these tools — route compound/changing-section forms through
 `references/detail.md`; reserve the "stylized" disclaimer for genuinely
 organic subjects (faces, animals, cloth).
 
+A bevel is edge treatment, not a license to change the volume family. Preserve
+broad planar fields and constant sections as boxes/prisms. Use
+`analytic-primitive` only for a genuinely spherical/ellipsoidal/capsule mass.
+
 ## Repair doctrine
 
 Repairs are minimal source edits. The guard (`procagen3d guard old new`)
@@ -206,10 +233,14 @@ Renames/merges that are genuinely intended: pass `--allow-drop <name>` /
 ## Checklist before first build
 
 - [ ] constants block, meters, z=0 ground, front faces -Y
+- [ ] image-conditioned: canonical frame + camera + rigid/articulated pose
+      solved before dimensions; fit v2 and reconstruction plan authored
 - [ ] detail tier declared; standard+: part table decomposed to the
-      detail.md ladder, floors met by design not by hope
+      detail.md ladder; complexity class and feature groups declared
 - [ ] form profile declared; curved/mixed: form blueprint + probe passed,
       structural macro/meso meshes tagged with compatible role/topology/method
+- [ ] every image-conditioned primary/macro mass has an evidence-backed
+      `procagen3d_shape_family` matching `reconstruction_plan.json`
 - [ ] every part has a semantic PascalCase name, instances numbered
 - [ ] one root empty; groups for real sub-assemblies; keep-world parenting
 - [ ] movable parts: origin at pivot, joint declared via `add_joint`
