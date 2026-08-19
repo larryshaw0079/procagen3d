@@ -214,6 +214,27 @@ def cmd_fit(args):
     return run_blender(stage, args.blender)
 
 
+def cmd_solve_camera(args):
+    out = Path(args.dir)
+    spec = Path(args.spec)
+    if not spec.is_file():
+        sys.exit(f"ProcAgen3D: fit spec not found: {spec}")
+    if not (out / "scene.blend").is_file():
+        sys.exit(f"ProcAgen3D: {out / 'scene.blend'} not found (run build first)")
+    kept = out / "fit_spec.json"
+    if spec.resolve() != kept.resolve():
+        shutil.copyfile(spec, kept)
+    stage = ["solve-camera", "--out", str(out), "--spec", str(kept),
+             "--max-rms", str(args.max_rms)]
+    if args.free_shift:
+        stage.append("--free-shift")
+    if args.solve_root:
+        stage.append("--solve-root")
+    if args.fix:
+        stage.extend(["--fix", *args.fix])
+    return run_blender(stage, args.blender)
+
+
 def cmd_joints(args):
     stage = ["joints", "--out", args.dir]
     if args.strict:
@@ -617,13 +638,94 @@ def shape_signature(obj):
     return sig if isinstance(sig, dict) else None
 
 
+# Bilateral symmetry is the strongest depth constraint a single reference view
+# offers.  One image cannot say how far forward a shoulder sits, but it can say
+# that the left one sits exactly as far forward as the right.  Tying the pairs
+# together removes roughly half the free depth parameters in a humanoid or a
+# vehicle, which is where "correct from this camera, wrong in 3D" comes from.
+SIDE_TOKENS = (
+    (re.compile(r"^(?P<base>.+?)_L(?P<tail>_\d{1,3})?$"), "L"),
+    (re.compile(r"^(?P<base>.+?)_R(?P<tail>_\d{1,3})?$"), "R"),
+    (re.compile(r"^(?P<base>.+?)_Left(?P<tail>_\d{1,3})?$"), "L"),
+    (re.compile(r"^(?P<base>.+?)_Right(?P<tail>_\d{1,3})?$"), "R"),
+    (re.compile(r"^Left(?P<base>[A-Z].*?)(?P<tail>_\d{1,3})?$"), "L"),
+    (re.compile(r"^Right(?P<base>[A-Z].*?)(?P<tail>_\d{1,3})?$"), "R"),
+)
+SYMMETRY_AXES = {"x": 0, "y": 1, "z": 2}
+SYMMETRY_WARN = 0.004
+SYMMETRY_FAIL = 0.015
+SYMMETRY_MIN_PAIRS = 3
+
+
+def mirror_side(name):
+    """Split a mesh name into its side-independent base and its side, if any."""
+    for pattern, side in SIDE_TOKENS:
+        match = pattern.match(name)
+        if match:
+            return match.group("base") + (match.group("tail") or ""), side
+    return None, None
+
+
+def mirror_pairs(meshes):
+    """Group meshes into left/right counterparts by name."""
+    sides = {}
+    for obj in meshes:
+        base, side = mirror_side(obj["name"])
+        if side is None:
+            continue
+        sides.setdefault(base, {})[side] = obj
+    return {base: (entry["L"], entry["R"])
+            for base, entry in sides.items() if "L" in entry and "R" in entry}
+
+
+def world_centroid(obj):
+    lo = obj.get("bbox_world_min")
+    hi = obj.get("bbox_world_max")
+    if not (isinstance(lo, list) and isinstance(hi, list)
+            and len(lo) >= 3 and len(hi) >= 3):
+        return None
+    return [(lo[i] + hi[i]) / 2.0 for i in range(3)]
+
+
+def mirror_mismatch(left, right, axis, origin, major):
+    """Positional and size disagreement between a mirrored pair, in object scale.
+
+    Returns (offset per axis, size difference) both normalised, or None when
+    either part cannot be measured.
+    """
+    a = world_centroid(left)
+    b = world_centroid(right)
+    if a is None or b is None or major <= 1e-9:
+        return None
+    expected = list(a)
+    expected[axis] = 2.0 * origin - a[axis]
+    offset = [abs(expected[i] - b[i]) / major for i in range(3)]
+    size = 0.0
+    sig_a, sig_b = shape_signature(left), shape_signature(right)
+    if sig_a and sig_b:
+        for key, power in (("volume", 1.0 / 3.0), ("surface_area", 0.5)):
+            va, vb = sig_a.get(key), sig_b.get(key)
+            if isinstance(va, (int, float)) and isinstance(vb, (int, float)):
+                la, lb = max(va, 0.0) ** power, max(vb, 0.0) ** power
+                mean = (la + lb) / 2.0
+                if mean > 1e-12:
+                    size = max(size, abs(la - lb) / mean)
+    return offset, size
+
+
 # A rifle, spear, mast, axle, or pipe run is one straight object.  Its parts
 # only bend apart when each endpoint is placed independently to hit a position
 # in the reference image, because a single view cannot see the depth that the
 # bend hides in.
 RIGID_AXIS_FAIL_DEG = 5.0
-RIGID_AXIS_WARN_DEG = 8.0
 RIGID_AXIS_MIN_ELONGATION = 1.8
+# An assembly whose elongated parts disagree by more than this needs a stated
+# decision: it either bends at a joint or it is broken.  Silence is not an
+# answer, because an opt-in contract is one nobody opts into.
+RIGID_AXIS_DECLARE_DEG = 8.0
+# Only assemblies that are themselves long and thin are asked the question.  A
+# whole standing figure is not (roughly 1.2:1); a rifle, a limb, or a mast is.
+RIGID_AXIS_GROUP_ASPECT = 2.5
 
 
 def elongated_axis(obj):
@@ -659,6 +761,97 @@ def rigid_axis_spread(members):
             if angle > worst:
                 worst, culprit = angle, f"{name_a} vs {name_b}"
     return worst, culprit
+
+
+def top_two_eigenvalues(points):
+    """Two largest covariance eigenvalues, by power iteration with deflation."""
+    count = len(points)
+    if count < 3:
+        return None
+    centre = [sum(p[i] for p in points) / count for i in range(3)]
+    cov = [[0.0] * 3 for _ in range(3)]
+    for point in points:
+        d = [point[i] - centre[i] for i in range(3)]
+        for i in range(3):
+            for j in range(3):
+                cov[i][j] += d[i] * d[j]
+
+    def iterate(matrix, seed):
+        vector = seed
+        value = 0.0
+        for _ in range(60):
+            nxt = [sum(matrix[i][j] * vector[j] for j in range(3))
+                   for i in range(3)]
+            length = math.sqrt(sum(c * c for c in nxt))
+            if length <= 1e-18:
+                return None, 0.0
+            vector = [c / length for c in nxt]
+            value = length
+        return vector, value
+
+    first, lambda1 = iterate(cov, [0.5773, 0.5774, 0.5775])
+    if first is None:
+        return None
+    for i in range(3):
+        for j in range(3):
+            cov[i][j] -= lambda1 * first[i] * first[j]
+    seed = [0.0, 1.0, 0.0] if abs(first[0]) > 0.9 else [1.0, 0.0, 0.0]
+    _, lambda2 = iterate(cov, seed)
+    return lambda1, lambda2
+
+
+def group_aspect(members):
+    """How long and thin an assembly is, independent of world orientation.
+
+    Built from each part's own axis and length rather than the union bounding
+    box: a rod lying diagonally has a fat axis-aligned box and would otherwise
+    read as compact.  A radial array such as wheel spokes correctly reads as a
+    disc and is not treated as a long assembly at all.
+    """
+    points = []
+    for obj in members:
+        centroid = world_centroid(obj)
+        axis = elongated_axis(obj)
+        signature = shape_signature(obj)
+        if centroid is None or axis is None or signature is None:
+            continue
+        dims = signature.get("local_dims")
+        if not isinstance(dims, list) or len(dims) != 3:
+            continue
+        half = max(dims) / 2.0
+        points.append([centroid[i] + axis[i] * half for i in range(3)])
+        points.append([centroid[i] - axis[i] * half for i in range(3)])
+    eigen = top_two_eigenvalues(points)
+    if eigen is None:
+        return 0.0
+    lambda1, lambda2 = eigen
+    if lambda2 <= 1e-15:
+        return 999.0
+    return math.sqrt(lambda1 / lambda2)
+
+
+def bent_assemblies(meshes):
+    """Elongated assemblies whose parts point in visibly different directions.
+
+    Grouped by transform parent, which is what "assembly" means in a ProcAgen3D
+    program.  Each one returned here is a question the plan has to answer: does
+    this thing bend at a joint, or is it a straight object that came out bent?
+    """
+    groups = {}
+    for obj in meshes:
+        parent = obj.get("parent")
+        if parent and elongated_axis(obj) is not None:
+            groups.setdefault(parent, []).append(obj)
+    out = []
+    for parent, members in sorted(groups.items()):
+        if len(members) < 2:
+            continue
+        if group_aspect(members) < RIGID_AXIS_GROUP_ASPECT:
+            continue
+        spread, culprit = rigid_axis_spread(members)
+        if spread is not None and spread >= RIGID_AXIS_DECLARE_DEG:
+            out.append((parent, members, spread, culprit))
+    return out
 
 
 CAMERA_LOCK_TOLERANCE = {
@@ -1050,14 +1243,89 @@ def cmd_check(args):
         for entry in reconstruction_plan.get("instance_arrays") or []:
             if isinstance(entry, dict) and isinstance(entry.get("pattern"), str):
                 declared_arrays.append(entry)
-    # Rigid single-axis assemblies must actually be straight in 3D.  A group is
-    # only checked when the plan names it, because an articulated chain (thigh
-    # plus shin) is elongated too and is supposed to bend.
+    pairs = mirror_pairs(meshes)
+    symmetry = (reconstruction_plan or {}).get("symmetry")
+    if len(pairs) >= SYMMETRY_MIN_PAIRS and reconstruction_plan is not None:
+        if not isinstance(symmetry, dict):
+            failures += 1
+            fail("SYMMETRY", f"{len(pairs)} left/right part pairs exist but the "
+                 "plan declares no symmetry contract — add "
+                 '"symmetry": {"plane": "x", "origin_m": 0.0, "asymmetric": [...]}, '
+                 'or "plane": null with a reason if the subject really is not '
+                 "bilateral. Mirrored pairs are the only thing a single view "
+                 "offers to pin part depth down")
+        elif symmetry.get("plane") is not None:
+            axis_name = str(symmetry.get("plane", "x")).lower()
+            if axis_name not in SYMMETRY_AXES:
+                failures += 1
+                fail("SYMMETRY", f"symmetry.plane must be x, y, z, or null "
+                     f"(got {symmetry.get('plane')!r})")
+            else:
+                axis = SYMMETRY_AXES[axis_name]
+                origin = symmetry.get("origin_m", 0.0)
+                if not isinstance(origin, (int, float)):
+                    origin = 0.0
+                exempt = [p for p in symmetry.get("asymmetric") or []
+                          if isinstance(p, str)]
+                tolerance = symmetry.get("tolerance", SYMMETRY_FAIL)
+                if not isinstance(tolerance, (int, float)):
+                    tolerance = SYMMETRY_FAIL
+                broken, drifting = [], []
+                for base, (left, right) in sorted(pairs.items()):
+                    if any(fnmatch.fnmatchcase(left["name"], pattern)
+                           or fnmatch.fnmatchcase(right["name"], pattern)
+                           for pattern in exempt):
+                        continue
+                    result = mirror_mismatch(left, right, axis, origin, major_dim)
+                    if result is None:
+                        continue
+                    offset, size = result
+                    worst = max(max(offset), size)
+                    if worst <= SYMMETRY_WARN:
+                        continue
+                    along = max(offset[i] for i in range(3) if i != axis)
+                    parts = []
+                    if along > SYMMETRY_WARN:
+                        parts.append(f"sits {along:.1%} of object size apart "
+                                     "along the mirror plane (a depth or height "
+                                     "difference the reference camera cannot see)")
+                    if offset[axis] > SYMMETRY_WARN:
+                        parts.append(f"{offset[axis]:.1%} unequal across the "
+                                     "mirror plane")
+                    if size > SYMMETRY_WARN:
+                        parts.append(f"{size:.1%} different in size")
+                    detail = f"{base}: " + ", ".join(parts)
+                    (broken if worst > tolerance else drifting).append(detail)
+                if drifting:
+                    warn("SYMMETRY", "mirrored pairs drifting: "
+                         + "; ".join(drifting[:6]))
+                if broken:
+                    failures += 1
+                    fail("SYMMETRY", "left/right pairs are not mirror images: "
+                         + "; ".join(broken[:8]) + " — build both sides from one "
+                         "builder and one set of constants with the side as a "
+                         "sign, so a part's depth cannot be chosen independently "
+                         "per side; list genuinely one-sided parts in "
+                         "symmetry.asymmetric")
+
+    # Rigid single-axis assemblies must actually be straight in 3D.  An
+    # articulated chain is elongated too and is supposed to bend, so the plan
+    # says which is which — but every bent assembly must be classified, because
+    # a contract nobody is required to fill in is a contract nobody fills in.
+    declared_axes = []
     for entry in (reconstruction_plan or {}).get("rigid_axes") or []:
         if not isinstance(entry, dict) or not isinstance(entry.get("pattern"), str):
             failures += 1
-            fail("RIGID_AXIS", "rigid_axes entries need a pattern and an "
-                 "optional max_deviation_deg")
+            fail("RIGID_AXIS", 'rigid_axes entries need {"pattern": ..., '
+                 '"rigid": true|false} and, when not rigid, a reason')
+            continue
+        if entry.get("rigid") is False and not str(entry.get("reason", "")).strip():
+            failures += 1
+            fail("RIGID_AXIS", f"{entry['pattern']}: a non-rigid assembly needs "
+                 "a reason naming the joint that bends")
+            continue
+        declared_axes.append(entry)
+        if entry.get("rigid") is False:
             continue
         members = [o for o in meshes
                    if fnmatch.fnmatchcase(o["name"], entry["pattern"])]
@@ -1074,6 +1342,27 @@ def cmd_check(args):
                  f"worst: {culprit}) — author the assembly from a single origin "
                  "and direction and place every station along it, never by "
                  "positioning each endpoint to match the image separately")
+
+    if reconstruction_plan is not None:
+        undeclared_bends = []
+        for parent, members, spread, culprit in bent_assemblies(meshes):
+            if any(fnmatch.fnmatchcase(obj["name"], entry["pattern"])
+                   for entry in declared_axes for obj in members):
+                continue
+            undeclared_bends.append(
+                f"{parent} ({len(members)} elongated parts) bends {spread:.1f}° "
+                f"at {culprit}")
+        if undeclared_bends:
+            failures += 1
+            fail("RIGID_AXIS", "long assemblies whose parts point in different "
+                 "directions, with no decision on record: "
+                 + "; ".join(undeclared_bends[:6]) + " — add a "
+                 'reconstruction_plan.rigid_axes entry for each: {"pattern": '
+                 '"Rifle_*", "rigid": true} to require one straight axis, or '
+                 '{"pattern": "Leg_*", "rigid": false, "reason": "knee joint"} '
+                 "when the bend is a real joint. A weapon, mast, or axle that "
+                 "bends is the signature of placing each endpoint separately to "
+                 "match the image while depth was free")
 
     incongruent = []
     undeclared = []
@@ -1931,6 +2220,22 @@ def main():
     p.add_argument("--engine", default="workbench",
                    choices=["workbench", "eevee", "cycles"])
     p.set_defaults(func=cmd_fit)
+
+    p = sub.add_parser(
+        "solve-camera",
+        help="resect the reference camera from observed image landmarks")
+    p.add_argument("dir")
+    p.add_argument("--spec", required=True, help="fit_spec.json with landmarks")
+    p.add_argument("--max-rms", type=float, default=0.02,
+                   help="fail above this RMS reprojection error in uv units")
+    p.add_argument("--free-shift", action="store_true",
+                   help="also solve lens shift (only for a cropped reference)")
+    p.add_argument("--fix", nargs="*", default=[],
+                   help="camera parameters to hold at their declared values")
+    p.add_argument("--solve-root", action="store_true",
+                   help="also estimate a rigid root lean (pitch/yaw/roll): if "
+                        "this drops the residual, the subject is not upright")
+    p.set_defaults(func=cmd_solve_camera)
 
     p = sub.add_parser("check", help="deterministic scene-graph gates")
     p.add_argument("dir")

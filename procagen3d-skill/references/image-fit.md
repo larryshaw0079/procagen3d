@@ -110,6 +110,35 @@ Record a real root lean separately only when ground/contact or articulation
 evidence proves it; a single floating product view cannot distinguish camera
 rotation from rigid object rotation.
 
+Do not eyeball the viewpoint. Once the blockout carries `Fit_*` markers and you
+have read six or more landmarks off the image, **compute** it:
+
+```sh
+procagen3d solve-camera <out> --spec <out>/fit_spec.json [--solve-root]
+```
+
+This resects the camera from the correspondences — linear DLT for a
+globally-consistent starting point, then damped least squares — and writes
+`camera_solution.json` with the solved azimuth, elevation, roll, field of view,
+distance, and target, plus the per-landmark reprojection error. Paste the result
+into `camera_solve.camera` and `fit_spec.camera`.
+
+Read the residual, because it tells you which layer is at fault:
+
+- **RMS falls to a few thousandths.** The camera was the problem and is now
+  solved. Proceed to shape.
+- **RMS stays high and no camera improves it.** No viewpoint explains these
+  landmarks, so the fault is in the model's proportions or per-limb pose, or in
+  the landmark readings. Do not keep tuning the camera; it is already optimal.
+  The landmarks with the largest individual errors name the parts to fix.
+
+`--solve-root` additionally estimates a rigid lean (pitch, yaw, roll) about the
+ground contact. Use it to settle the question "is the subject upright?" with a
+number. Be aware that root pitch and camera elevation are gauge-equivalent for
+an unsupported subject: if freeing the lean leaves the residual unchanged and
+merely trades pitch against elevation, the subject is *not* leaning and the
+residual lies somewhere a rigid transform cannot reach.
+
 The camera is solved once, at probe time, and then **locked** into
 `reconstruction_plan.json` under `camera_solve`. `check` compares the fit
 spec's camera against that lock and fails on `CAMERA_LOCK` if they drift.

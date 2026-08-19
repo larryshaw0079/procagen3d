@@ -30,7 +30,7 @@ from pathlib import Path
 
 import bpy
 from bpy_extras.object_utils import world_to_camera_view
-from mathutils import Matrix, Quaternion, Vector
+from mathutils import Euler, Matrix, Quaternion, Vector
 from mathutils.bvhtree import BVHTree
 
 OK = "[PROCAGEN3D:OK]"
@@ -973,6 +973,397 @@ def fit_camera(scene, camera_config, width, height):
            if projection == "perspective" else
            {"ortho_scale_m": float(camera_config["ortho_scale_m"])}),
     }
+
+
+def place_camera(camera, params):
+    """Point an existing camera using the fit-spec parameter convention.
+
+    Same maths as fit_camera, but reusing one camera object so the solver can
+    evaluate thousands of candidate viewpoints without leaking datablocks.
+    """
+    azimuth = math.radians(params["azimuth_deg"])
+    elevation = math.radians(params["elevation_deg"])
+    direction = Vector((
+        math.sin(azimuth) * math.cos(elevation),
+        -math.cos(azimuth) * math.cos(elevation),
+        math.sin(elevation),
+    )).normalized()
+    target = Vector((params["target_x"], params["target_y"], params["target_z"]))
+    location = target + direction * params["distance_m"]
+    camera.location = location
+    look = (target - location).normalized()
+    base_rotation = look.to_track_quat("-Z", "Y")
+    roll_rotation = Quaternion(look, math.radians(params["roll_deg"]))
+    camera.rotation_euler = (roll_rotation @ base_rotation).to_euler()
+    camera.data.angle = math.radians(params["fov_y_deg"])
+    camera.data.shift_x = params["shift_x"]
+    camera.data.shift_y = params["shift_y"]
+    camera.data.clip_start = max(1e-5, min(0.1, params["distance_m"] * 0.01))
+    camera.data.clip_end = max(100.0, params["distance_m"] * 10.0)
+
+
+CAMERA_SOLVE_BOUNDS = {
+    "azimuth_deg": (-180.0, 180.0),
+    "elevation_deg": (-88.0, 88.0),
+    "roll_deg": (-45.0, 45.0),
+    "root_pitch_deg": (-40.0, 40.0),
+    "root_yaw_deg": (-60.0, 60.0),
+    "root_roll_deg": (-40.0, 40.0),
+    "fov_y_deg": (5.0, 120.0),
+    "distance_m": (1e-3, 1e6),
+    "target_x": (-1e6, 1e6),
+    "target_y": (-1e6, 1e6),
+    "target_z": (-1e6, 1e6),
+    "shift_x": (-2.0, 2.0),
+    "shift_y": (-2.0, 2.0),
+}
+
+
+def solve_symmetric(matrix, rhs):
+    """Gaussian elimination with partial pivoting on a small dense system."""
+    n = len(rhs)
+    a = [row[:] + [rhs[i]] for i, row in enumerate(matrix)]
+    for column in range(n):
+        pivot = max(range(column, n), key=lambda r: abs(a[r][column]))
+        if abs(a[pivot][column]) < 1e-18:
+            return None
+        a[column], a[pivot] = a[pivot], a[column]
+        inverse = 1.0 / a[column][column]
+        for row in range(column + 1, n):
+            factor = a[row][column] * inverse
+            if factor:
+                for k in range(column, n + 1):
+                    a[row][k] -= factor * a[column][k]
+    out = [0.0] * n
+    for row in range(n - 1, -1, -1):
+        total = a[row][n] - sum(a[row][k] * out[k] for k in range(row + 1, n))
+        out[row] = total / a[row][row]
+    return out
+
+
+def levenberg_marquardt(residual_vector, start, scales, iterations=120):
+    """Damped least squares over a residual vector, with numerical Jacobians.
+
+    Camera resection has a long curved valley — distance trades against field
+    of view, elevation against target height — which a simplex method crawls
+    along and stalls in.  Gauss-Newton with Marquardt damping follows it.
+    """
+    params = list(start)
+    residuals = residual_vector(params)
+    cost = sum(r * r for r in residuals)
+    n = len(params)
+    damping = 1e-3
+    for _ in range(iterations):
+        jacobian = []
+        for index in range(n):
+            step = scales[index]
+            forward = list(params)
+            forward[index] += step
+            shifted = residual_vector(forward)
+            jacobian.append([(shifted[k] - residuals[k]) / step
+                             for k in range(len(residuals))])
+        jtj = [[sum(jacobian[i][k] * jacobian[j][k]
+                    for k in range(len(residuals)))
+                for j in range(n)] for i in range(n)]
+        jtr = [sum(jacobian[i][k] * residuals[k] for k in range(len(residuals)))
+               for i in range(n)]
+        improved = False
+        for _ in range(12):
+            damped = [row[:] for row in jtj]
+            for i in range(n):
+                damped[i][i] += damping * max(jtj[i][i], 1e-12)
+            delta = solve_symmetric(damped, [-value for value in jtr])
+            if delta is None:
+                damping *= 10.0
+                continue
+            candidate = [params[i] + delta[i] for i in range(n)]
+            trial = residual_vector(candidate)
+            trial_cost = sum(r * r for r in trial)
+            if trial_cost < cost:
+                params, residuals, cost = candidate, trial, trial_cost
+                damping = max(damping * 0.3, 1e-12)
+                improved = True
+                break
+            damping *= 10.0
+            if damping > 1e12:
+                break
+        if not improved:
+            break
+    return params, cost
+
+
+def nelder_mead(objective, start, steps, iterations=4000, tolerance=1e-12):
+    """Derivative-free simplex minimisation over a fixed parameter ordering."""
+    n = len(start)
+    simplex = [list(start)]
+    for index in range(n):
+        point = list(start)
+        point[index] += steps[index]
+        simplex.append(point)
+    scores = [objective(point) for point in simplex]
+    for _ in range(iterations):
+        order = sorted(range(n + 1), key=lambda i: scores[i])
+        simplex = [simplex[i] for i in order]
+        scores = [scores[i] for i in order]
+        if abs(scores[-1] - scores[0]) <= tolerance * (abs(scores[0]) + tolerance):
+            break
+        centroid = [sum(point[i] for point in simplex[:-1]) / n for i in range(n)]
+        worst = simplex[-1]
+        reflected = [centroid[i] + (centroid[i] - worst[i]) for i in range(n)]
+        score = objective(reflected)
+        if score < scores[0]:
+            expanded = [centroid[i] + 2.0 * (centroid[i] - worst[i])
+                        for i in range(n)]
+            expanded_score = objective(expanded)
+            if expanded_score < score:
+                simplex[-1], scores[-1] = expanded, expanded_score
+            else:
+                simplex[-1], scores[-1] = reflected, score
+        elif score < scores[-2]:
+            simplex[-1], scores[-1] = reflected, score
+        else:
+            contracted = [centroid[i] + 0.5 * (worst[i] - centroid[i])
+                          for i in range(n)]
+            contracted_score = objective(contracted)
+            if contracted_score < scores[-1]:
+                simplex[-1], scores[-1] = contracted, contracted_score
+            else:
+                best = simplex[0]
+                for i in range(1, n + 1):
+                    simplex[i] = [best[j] + 0.5 * (simplex[i][j] - best[j])
+                                  for j in range(n)]
+                    scores[i] = objective(simplex[i])
+    order = sorted(range(n + 1), key=lambda i: scores[i])
+    return simplex[order[0]], scores[order[0]]
+
+
+def resect_dlt(correspondences, width, height):
+    """Linear camera resection: the globally-consistent starting point.
+
+    Solves the 3x4 projection matrix by SVD (no local minima), then splits it
+    into intrinsics, rotation, and centre.  Iterative refinement afterwards
+    only has to polish, instead of hunting for the right basin among the
+    distance/field-of-view and elevation/height ambiguities.
+    """
+    import numpy as np
+
+    if len(correspondences) < 6:
+        return None
+    world = np.array([[p[0], p[1], p[2]] for _, p, _ in correspondences],
+                     dtype=np.float64)
+    pixels = np.array([[uv[0] * width, uv[1] * height]
+                       for _, _, uv in correspondences], dtype=np.float64)
+
+    # Hartley normalisation: raw metres and pixels differ by orders of
+    # magnitude and make the design matrix badly conditioned.
+    world_centre = world.mean(axis=0)
+    world_scale = np.sqrt(3.0) / max(
+        1e-12, np.linalg.norm(world - world_centre, axis=1).mean())
+    pixel_centre = pixels.mean(axis=0)
+    pixel_scale = np.sqrt(2.0) / max(
+        1e-12, np.linalg.norm(pixels - pixel_centre, axis=1).mean())
+    normalized_world = (world - world_centre) * world_scale
+    normalized_pixels = (pixels - pixel_centre) * pixel_scale
+
+    rows = []
+    for (x, y, z), (u, v) in zip(normalized_world, normalized_pixels):
+        rows.append([x, y, z, 1, 0, 0, 0, 0, -u * x, -u * y, -u * z, -u])
+        rows.append([0, 0, 0, 0, x, y, z, 1, -v * x, -v * y, -v * z, -v])
+    _, _, vt = np.linalg.svd(np.array(rows, dtype=np.float64))
+    projection = vt[-1].reshape(3, 4)
+
+    unnormalize = np.array([[1.0 / pixel_scale, 0, pixel_centre[0]],
+                            [0, 1.0 / pixel_scale, pixel_centre[1]],
+                            [0, 0, 1.0]])
+    scale_world = np.eye(4) * world_scale
+    scale_world[3, 3] = 1.0
+    scale_world[:3, 3] = -world_centre * world_scale
+    projection = unnormalize @ projection @ scale_world
+
+    m = projection[:, :3]
+    if abs(np.linalg.det(m)) < 1e-18:
+        return None
+    centre = -np.linalg.inv(m) @ projection[:, 3]
+
+    # RQ decomposition of M into upper-triangular K and rotation R.
+    reverse = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=np.float64)
+    q, r = np.linalg.qr((reverse @ m).T)
+    intrinsics = reverse @ r.T @ reverse
+    rotation = reverse @ q.T
+    signs = np.diag(np.sign(np.diag(intrinsics)))
+    intrinsics = intrinsics @ signs
+    rotation = signs @ rotation
+    if np.linalg.det(rotation) < 0:
+        rotation = -rotation
+    if abs(intrinsics[2, 2]) < 1e-18:
+        return None
+    intrinsics = intrinsics / intrinsics[2, 2]
+
+    focal_y = abs(intrinsics[1, 1])
+    if focal_y < 1e-9:
+        return None
+    fov_y = math.degrees(2.0 * math.atan(height / (2.0 * focal_y)))
+    if not 1.0 < fov_y < 170.0:
+        return None
+
+    # Image-convention rotation rows: x right, y down, z along the view ray.
+    forward = Vector(rotation[2, :].tolist()).normalized()
+    up = -Vector(rotation[1, :].tolist()).normalized()
+    centre_vec = Vector(centre.tolist())
+    # Keep the subject in front of the camera; DLT is sign-ambiguous.
+    ahead = sum((Vector(p) - centre_vec).dot(forward)
+                for _, p, _ in correspondences)
+    if ahead < 0:
+        forward, up = -forward, -up
+    mean_point = Vector((0.0, 0.0, 0.0))
+    for _, point, _ in correspondences:
+        mean_point += Vector(point)
+    mean_point /= len(correspondences)
+    distance = max(1e-3, (mean_point - centre_vec).dot(forward))
+    target = centre_vec + forward * distance
+
+    direction = (centre_vec - target).normalized()
+    elevation = math.degrees(math.asin(max(-1.0, min(1.0, direction.z))))
+    azimuth = math.degrees(math.atan2(direction.x, -direction.y))
+    look = -direction
+    base_up = look.to_track_quat("-Z", "Y") @ Vector((0.0, 1.0, 0.0))
+    roll = math.degrees(math.atan2(base_up.cross(up).dot(look),
+                                   base_up.dot(up)))
+    return {
+        "azimuth_deg": azimuth,
+        "elevation_deg": max(-88.0, min(88.0, elevation)),
+        "roll_deg": ((roll + 180.0) % 360.0) - 180.0,
+        "fov_y_deg": max(5.0, min(120.0, fov_y)),
+        "distance_m": distance,
+        "target_x": target.x, "target_y": target.y, "target_z": target.z,
+    }
+
+
+def solve_camera(scene, camera, correspondences, initial, free_names,
+                 width, height):
+    """Least-squares camera resection against observed image landmarks.
+
+    ``correspondences`` are (id, world point, observed uv) triples read off the
+    reference.  The camera that best explains them is computed rather than
+    guessed, so a tilted or rotated subject no longer has to be imitated by
+    deforming geometry.
+    """
+    order = [name for name in free_names]
+    params = dict(initial)
+    report_seed = []
+
+    # A standing subject leans about its ground contact, so that is the pivot
+    # for any root rotation the caller asks us to estimate.
+    pivot = Vector((
+        sum(p[0] for _, p, _ in correspondences) / len(correspondences),
+        sum(p[1] for _, p, _ in correspondences) / len(correspondences),
+        min(p[2] for _, p, _ in correspondences),
+    ))
+    root_names = ("root_pitch_deg", "root_yaw_deg", "root_roll_deg")
+
+    def posed(point):
+        if not any(abs(params.get(name, 0.0)) > 1e-12 for name in root_names):
+            return Vector(point)
+        rotation = Euler((
+            math.radians(params.get("root_pitch_deg", 0.0)),
+            math.radians(params.get("root_roll_deg", 0.0)),
+            math.radians(params.get("root_yaw_deg", 0.0)),
+        ), "XYZ").to_matrix()
+        return pivot + rotation @ (Vector(point) - pivot)
+
+    def residuals(values=None):
+        if values is not None:
+            for name, value in zip(order, values):
+                low, high = CAMERA_SOLVE_BOUNDS[name]
+                params[name] = min(high, max(low, value))
+        place_camera(camera, params)
+        scene.view_layers[0].update()
+        out = []
+        for name, point, observed in correspondences:
+            projected = world_to_camera_view(scene, camera, posed(point))
+            if projected.z <= 0.0:
+                out.append((name, 10.0))
+                continue
+            uv = (float(projected.x), float(1.0 - projected.y))
+            out.append((name, math.hypot(uv[0] - observed[0],
+                                         uv[1] - observed[1])))
+        return out
+
+    def objective(values):
+        return sum(error * error for _, error in residuals(values))
+
+    def residual_vector(values):
+        for name, value in zip(order, values):
+            low, high = CAMERA_SOLVE_BOUNDS[name]
+            params[name] = min(high, max(low, value))
+        place_camera(camera, params)
+        scene.view_layers[0].update()
+        out = []
+        for _, point, observed in correspondences:
+            projected = world_to_camera_view(scene, camera, posed(point))
+            if projected.z <= 0.0:
+                out.extend((10.0, 10.0))
+                continue
+            out.append(float(projected.x) - observed[0])
+            out.append(float(1.0 - projected.y) - observed[1])
+        return out
+
+    jacobian_steps = {
+        "azimuth_deg": 0.02, "elevation_deg": 0.02, "roll_deg": 0.02,
+        "fov_y_deg": 0.02, "shift_x": 1e-4, "shift_y": 1e-4,
+        "root_pitch_deg": 0.02, "root_yaw_deg": 0.02, "root_roll_deg": 0.02,
+        "distance_m": max(1e-4, initial["distance_m"] * 1e-4),
+        "target_x": max(1e-4, initial["distance_m"] * 1e-4),
+        "target_y": max(1e-4, initial["distance_m"] * 1e-4),
+        "target_z": max(1e-4, initial["distance_m"] * 1e-4),
+    }
+
+    steps = {
+        "azimuth_deg": 6.0, "elevation_deg": 4.0, "roll_deg": 3.0,
+        "fov_y_deg": 4.0, "shift_x": 0.05, "shift_y": 0.05,
+        "root_pitch_deg": 4.0, "root_yaw_deg": 4.0, "root_roll_deg": 3.0,
+        "distance_m": max(1e-3, initial["distance_m"] * 0.12),
+        "target_x": max(1e-3, initial["distance_m"] * 0.03),
+        "target_y": max(1e-3, initial["distance_m"] * 0.03),
+        "target_z": max(1e-3, initial["distance_m"] * 0.03),
+    }
+    best_values, best_score = None, math.inf
+    seeds = [dict(initial)]
+    linear = resect_dlt(correspondences, width, height)
+    if linear is not None:
+        seed = dict(initial)
+        seed.update({name: value for name, value in linear.items()
+                     if name in order or name in initial})
+        seeds.insert(0, seed)
+        report_seed.append(linear)
+    # The linear solution is the reliable start.  A few offsets around the
+    # declared guess are kept as a fallback for the case where too few or too
+    # coplanar correspondences make resection degenerate.
+    for azimuth_offset in (-20.0, 0.0, 20.0):
+        for elevation_offset in (-10.0, 0.0, 10.0):
+            seed = dict(initial)
+            seed["azimuth_deg"] = initial["azimuth_deg"] + azimuth_offset
+            seed["elevation_deg"] = max(
+                -88.0, min(88.0, initial["elevation_deg"] + elevation_offset))
+            seeds.append(seed)
+    for index, seed in enumerate(seeds):
+        start = [seed[name] for name in order]
+        if index > 0:
+            # Simplex first to land in a basin, then damped least squares.
+            start, _ = nelder_mead(
+                objective, start, [steps[name] for name in order],
+                iterations=500)
+        values, score = levenberg_marquardt(
+            residual_vector, start, [jacobian_steps[n] for n in order])
+        if score < best_score:
+            best_values, best_score = values, score
+    for name, value in zip(order, best_values):
+        low, high = CAMERA_SOLVE_BOUNDS[name]
+        params[name] = min(high, max(low, value))
+    final = residuals()
+    errors = [error for _, error in final]
+    rms = math.sqrt(sum(e * e for e in errors) / len(errors))
+    return params, final, rms, (report_seed[0] if report_seed else None)
 
 
 def matched_geometry(scene, pattern):
@@ -1964,6 +2355,155 @@ def stage_fit(args):
         finish(1)
 
 
+def stage_solve_camera(args):
+    """Resect the reference camera from observed landmarks instead of guessing it."""
+    out_dir = Path(args.out).resolve()
+    blend = out_dir / "scene.blend"
+    spec_path = Path(args.spec).resolve()
+    if not blend.is_file():
+        print(f"{FAIL}:NO_SCENE] {blend} not found (run build first)")
+        finish(1)
+    try:
+        spec = json.loads(spec_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"{FAIL}:FIT_SPEC] {exc}")
+        finish(1)
+
+    bpy.ops.wm.open_mainfile(filepath=str(blend))
+    scene = bpy.context.scene
+    data = bpy.data.cameras.new("ProcAgen3D_SolveCam")
+    data.sensor_fit = "VERTICAL"
+    data.type = "PERSP"
+    camera = bpy.data.objects.new("ProcAgen3D_SolveCam", data)
+    scene.collection.objects.link(camera)
+    scene.camera = camera
+    reference = out_dir / str(spec.get("reference_image", ""))
+    if reference.is_file():
+        rgba = load_rgba(reference)
+        scene.render.resolution_y = rgba.shape[0]
+        scene.render.resolution_x = rgba.shape[1]
+    scene.render.resolution_percentage = 100
+    scene.render.pixel_aspect_x = 1.0
+    scene.render.pixel_aspect_y = 1.0
+
+    dg = depsgraph()
+    correspondences = []
+    skipped = []
+    for index, entry in enumerate(spec.get("landmarks") or []):
+        if not isinstance(entry, dict):
+            continue
+        landmark_id = str(entry.get("id", f"landmark_{index + 1}"))
+        observed = entry.get("reference_uv")
+        if not (isinstance(observed, list) and len(observed) == 2):
+            skipped.append(f"{landmark_id} (no reference_uv)")
+            continue
+        try:
+            if "world_point_m" in entry:
+                point = Vector(finite_values(
+                    entry["world_point_m"], 3, "landmark.world_point_m"))
+            else:
+                matched, _ = matched_geometry(scene, str(entry.get("pattern", "")))
+                if len(matched) != 1:
+                    raise ValueError("pattern must match exactly one object")
+                point = matched[0].matrix_world.translation.copy()
+        except ValueError as exc:
+            skipped.append(f"{landmark_id} ({exc})")
+            continue
+        correspondences.append(
+            (landmark_id, point, (float(observed[0]), float(observed[1]))))
+
+    if len(correspondences) < 6:
+        print(f"{FAIL}:CAMERA_SOLVE] need at least 6 resolvable landmarks with "
+              f"reference_uv, found {len(correspondences)}; skipped: {skipped[:6]}")
+        finish(1)
+
+    declared = spec.get("camera") or {}
+    if str(declared.get("projection", "perspective")).lower() != "perspective":
+        print(f"{FAIL}:CAMERA_SOLVE] only perspective cameras can be resected")
+        finish(1)
+    target = declared.get("target_m") or [0.0, 0.0, 0.0]
+    initial = {
+        "azimuth_deg": float(declared.get("azimuth_deg", 0.0)),
+        "elevation_deg": float(declared.get("elevation_deg", 0.0)),
+        "roll_deg": float(declared.get("roll_deg", 0.0)),
+        "fov_y_deg": float(declared.get("fov_y_deg", 40.0)),
+        "distance_m": float(declared.get("distance_m", 0.0)) or 10.0,
+        "target_x": float(target[0]), "target_y": float(target[1]),
+        "target_z": float(target[2]),
+        "shift_x": float(declared.get("shift_x", 0.0)),
+        "shift_y": float(declared.get("shift_y", 0.0)),
+    }
+    initial.update({"root_pitch_deg": 0.0, "root_yaw_deg": 0.0,
+                    "root_roll_deg": 0.0})
+    free = ["azimuth_deg", "elevation_deg", "roll_deg", "fov_y_deg",
+            "distance_m", "target_x", "target_y", "target_z"]
+    if args.free_shift:
+        free.extend(["shift_x", "shift_y"])
+    if args.solve_root:
+        free.extend(["root_pitch_deg", "root_yaw_deg", "root_roll_deg"])
+    if args.fix:
+        free = [name for name in free if name not in set(args.fix)]
+    if not free:
+        print(f"{FAIL}:CAMERA_SOLVE] every parameter is fixed")
+        finish(1)
+
+    params, residuals, rms, linear = solve_camera(
+        scene, camera, correspondences, initial, free,
+        scene.render.resolution_x, scene.render.resolution_y)
+    solved = {
+        "projection": "perspective",
+        "azimuth_deg": round(params["azimuth_deg"], 4),
+        "elevation_deg": round(params["elevation_deg"], 4),
+        "roll_deg": round(params["roll_deg"], 4),
+        "fov_y_deg": round(params["fov_y_deg"], 4),
+        "distance_m": round(params["distance_m"], 6),
+        "target_m": [round(params["target_x"], 6), round(params["target_y"], 6),
+                     round(params["target_z"], 6)],
+        "shift_x": round(params["shift_x"], 6),
+        "shift_y": round(params["shift_y"], 6),
+    }
+    root_pose = {name: round(params.get(name, 0.0), 4)
+                 for name in ("root_pitch_deg", "root_yaw_deg", "root_roll_deg")}
+    report = {
+        "procagen3d_camera_solve_version": 1,
+        "landmarks_used": len(correspondences),
+        "root_pose_deg": root_pose if args.solve_root else None,
+        "landmarks_skipped": skipped,
+        "free_parameters": free,
+        "declared_camera": declared,
+        "linear_resection": ({k: round(v, 4) for k, v in linear.items()}
+                             if linear else None),
+        "solved_camera": solved,
+        "rms_uv_error": round(rms, 6),
+        "residuals": {name: round(error, 6) for name, error in residuals},
+    }
+    (out_dir / "camera_solution.json").write_text(json.dumps(report, indent=2))
+
+    print(f"ProcAgen3D camera solve — {len(correspondences)} landmarks")
+    for name, error in sorted(residuals, key=lambda item: -item[1]):
+        print(f"  {name:<28} reprojection error {error:.4f}")
+    print(f"  -> RMS {rms:.4f} uv")
+    for key in ("azimuth_deg", "elevation_deg", "roll_deg", "fov_y_deg",
+                "distance_m"):
+        was = declared.get(key)
+        print(f"  {key:<16} declared {str(was):>10}   solved {solved[key]:>10}")
+    print(f"  target_m         declared {declared.get('target_m')}   "
+          f"solved {solved['target_m']}")
+    if args.solve_root:
+        print(f"  root lean        pitch {root_pose['root_pitch_deg']:+.2f}  "
+              f"yaw {root_pose['root_yaw_deg']:+.2f}  "
+              f"roll {root_pose['root_roll_deg']:+.2f} deg")
+    if rms > args.max_rms:
+        print(f"{FAIL}:CAMERA_SOLVE] RMS {rms:.4f} exceeds {args.max_rms:.4f}: no "
+              "single camera explains these landmarks, so the proportions or the "
+              "landmark readings are wrong, not the viewpoint")
+        finish(1)
+    print(f"{OK} camera solved; paste solved_camera into reconstruction_plan"
+          f".camera_solve.camera and fit_spec.camera -> "
+          f"{out_dir / 'camera_solution.json'}")
+    finish(0)
+
+
 # ---------------------------------------------------------------- build stage
 
 BANNED_PATTERNS = [
@@ -2286,12 +2826,21 @@ def main():
     p_fit.add_argument("--engine", default="workbench",
                        choices=["workbench", "eevee", "cycles"])
 
+    p_solve = sub.add_parser("solve-camera")
+    p_solve.add_argument("--out", required=True)
+    p_solve.add_argument("--spec", required=True)
+    p_solve.add_argument("--max-rms", type=float, default=0.02)
+    p_solve.add_argument("--free-shift", action="store_true")
+    p_solve.add_argument("--fix", nargs="*", default=[])
+    p_solve.add_argument("--solve-root", action="store_true")
+
     p_joints = sub.add_parser("joints")
     p_joints.add_argument("--out", required=True)
     p_joints.add_argument("--strict", action="store_true")
 
     args = parser.parse_args(script_args())
     {"build": stage_build, "render": stage_render, "fit": stage_fit,
+     "solve-camera": stage_solve_camera,
      "joints": stage_joints}[args.stage](args)
 
 

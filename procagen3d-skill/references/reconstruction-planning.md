@@ -38,6 +38,47 @@ Estimate dimensions only after this decomposition. Measure along object axes
 or with pose-corrected ratios. Mark depth and occluded links inferred when one
 view cannot determine them.
 
+### Symmetry is where depth comes from
+
+One view cannot tell you how far forward a shoulder sits. It can tell you that
+the left one sits exactly as far forward as the right. For a bilateral subject
+that single fact removes about half the free depth parameters, and those free
+parameters are the whole reason a model can look correct from the reference
+camera and be wrong in 3D.
+
+So build both sides from one builder and one set of constants, with the side as
+a sign:
+
+```python
+for side, sign in (("L", 1.0), ("R", -1.0)):
+    hip = Vector((sign * HIP_HALF_SPAN, HIP_DEPTH, HIP_HEIGHT))
+    build_leg(f"Thigh_{side}", hip, ...)
+```
+
+Never author `Thigh_L` and `Thigh_R` as two independent sets of coordinates.
+The moment their depths are typed separately, one of them is wrong and the
+front view will not show you which.
+
+Declare the contract in the plan:
+
+```json
+"symmetry": {
+  "plane": "x",
+  "origin_m": 0.0,
+  "tolerance": 0.015,
+  "asymmetric": ["Shield_*", "Rifle_*"]
+}
+```
+
+`SYMMETRY` pairs meshes by name (`Foo_L`/`Foo_R`, `Foo_Left`/`Foo_Right`,
+`LeftFoo`/`RightFoo`) and compares each pair's mirrored centroid and size
+against the object's own scale. It reports the mismatch *along* the mirror
+plane separately, because that component is exactly the depth or height error
+the reference camera cannot see. Genuinely one-sided equipment goes in
+`asymmetric`; a subject that is really not bilateral declares `"plane": null`
+with a reason. Once three or more left/right pairs exist, the contract is
+required — silence is not an answer.
+
 ### Rigid equipment is authored from one axis, not from endpoints
 
 A rifle, spear, mast, axle, or pipe run is a single straight object. Author it
@@ -61,17 +102,23 @@ receiver and barrel 22° apart, with the muzzle sitting 3.2 units off the
 receiver's own axis on a 10.7-unit weapon, and it looked fine from the
 reference camera.
 
-Declare the assembly so the checker can hold it straight:
+`RIGID_AXIS` finds every long assembly — grouped by transform parent, measured
+from the parts' own axes so a diagonal rod is not mistaken for a compact one —
+whose parts point more than 8° apart, and requires a stated decision for each.
+A radial array such as wheel spokes reads as a disc and is never asked.
 
 ```json
 "rigid_axes": [
-  {"pattern": "Rifle_*", "max_deviation_deg": 5}
+  {"pattern": "Rifle_*", "rigid": true, "max_deviation_deg": 5},
+  {"pattern": "Leg_L_*", "rigid": false, "reason": "knee joint bends in the reference"}
 ]
 ```
 
-`RIGID_AXIS` compares the parts' measured long axes and fails past the
-tolerance. Declare only genuinely rigid groups: an articulated chain such as
-thigh-plus-shin is elongated too and is supposed to bend.
+`"rigid": true` holds the parts to one axis and fails past the tolerance.
+`"rigid": false` exempts a genuine articulated chain and requires a reason
+naming the joint. Leaving a bent assembly undeclared is itself a failure: the
+question is not whether you want to answer it, it is which answer is true. A
+weapon, mast, or axle that bends has no true "articulated" answer.
 
 Use `fit_spec.json` version 2. Its `pose.frame_axes` gates projected object-axis
 directions; `pose.chains` gates segment directions, bend angles, and normalized

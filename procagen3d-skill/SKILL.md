@@ -129,7 +129,21 @@ before detail:
 
 `procagen3d build <out>/form_probe.py --out <out>/form_probe --form-diagnostics`
 
-Image-conditioned: `procagen3d fit <out>/form_probe --spec <out>/fit_spec.json`
+Image-conditioned: solve the camera before scoring anything against it —
+
+`procagen3d solve-camera <out>/form_probe --spec <out>/fit_spec.json [--solve-root]`
+
+resects it from six or more image-read landmarks and writes
+`camera_solution.json`; paste the result into `camera_solve.camera` and
+`fit_spec.camera`. Never hand-tune the viewpoint. Read the residual: a low RMS
+means the camera was the fault and is now fixed; an RMS that stays high under
+every viewpoint means the proportions or per-limb pose are wrong and no camera
+will rescue them — the worst individual landmarks name the parts. `--solve-root`
+estimates a rigid lean, but root pitch and camera elevation are
+gauge-equivalent, so treat an unchanged residual as evidence that the subject is
+*not* leaning.
+
+`procagen3d fit <out>/form_probe --spec <out>/fit_spec.json`
 
 `procagen3d check <out>/form_probe --tier quick --form <profile>`
 
@@ -224,10 +238,18 @@ reveal:
   meshes; naming a cube `Vent_03` no longer counts as a vent.
 - `FORM_PROMISED_CURVATURE` — masses declared `continuous`/`shell` must be
   measurably curved.
-- `RIGID_AXIS` — parts of an assembly the plan declares rigid and single-axis
-  (rifle, spear, mast, axle) must actually be collinear in 3D. Author such an
-  assembly as one origin plus one direction; placing each endpoint separately
-  to match the image is how a straight weapon comes out bent.
+- `SYMMETRY` — left/right pairs must be mirror images in the canonical frame.
+  One view cannot see how far forward a shoulder sits, but it can insist the
+  two shoulders agree, which is where per-part depth discipline comes from.
+  Author both sides from one builder with the side as a sign; never type two
+  independent sets of coordinates.
+- `RIGID_AXIS` — every long assembly whose parts point more than 8° apart must
+  be classified in the plan as rigid (then held collinear) or articulated (then
+  given the joint that bends). Undeclared is a failure; a rifle, mast, or axle
+  has no true articulated answer. Author a rigid assembly as one origin plus
+  one direction and derive every station along it — placing each endpoint
+  separately to match the image, with depth free, is how a straight weapon
+  comes out bent.
 
 Nothing here asks for curved mass. `FORM_PROFILE_EVIDENCE` fires only when a
 `curved` profile shows almost no measurable curvature, and its remedy is to
