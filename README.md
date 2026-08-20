@@ -30,8 +30,7 @@ git clone https://github.com/larryshaw0079/procagen3d.git ~/.claude/skills/proca
 
 ## Showcase
 
-Representative reference-conditioned results selected from successful
-`procagen3d_out/` runs. Each pair shows the closest available source-image
+Representative reference-conditioned results. Each pair shows the closest available source-image
 angle on the left and a studio-lit Eevee render of the exported `model.glb` on
 the right. Every model starts as an executable Blender Python program and is
 compiled to a portable GLB by the ProcAgen3D pipeline.
@@ -99,6 +98,38 @@ compiled to a portable GLB by the ProcAgen3D pipeline.
       </a><br>
       <sub>Reference → ProcAgen3D GLB</sub><br>
       <strong>Toyota SR5</strong>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="assets/showcase/compact-carbine-reference.png">
+        <img src="assets/showcase/compact-carbine-reference.png" width="135" alt="Reference image of a compact carbine">
+      </a>
+      <a href="assets/showcase/compact-carbine.png">
+        <img src="assets/showcase/compact-carbine.png" width="135" alt="ProcAgen3D GLB render of a compact carbine">
+      </a><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
+      <strong>Compact Carbine</strong>
+    </td>
+    <td align="center" width="33%">
+      <a href="assets/showcase/city-bicycle-reference.png">
+        <img src="assets/showcase/city-bicycle-reference.png" width="135" alt="Reference image of a city bicycle with a wicker basket">
+      </a>
+      <a href="assets/showcase/city-bicycle.png">
+        <img src="assets/showcase/city-bicycle.png" width="135" alt="ProcAgen3D GLB render of a city bicycle with a wicker basket">
+      </a><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
+      <strong>City Bicycle</strong>
+    </td>
+    <td align="center" width="33%">
+      <a href="assets/showcase/fujifilm-x-t3-reference.png">
+        <img src="assets/showcase/fujifilm-x-t3-reference.png" width="135" alt="Reference image of a Fujifilm X-T3 camera">
+      </a>
+      <a href="assets/showcase/fujifilm-x-t3.png">
+        <img src="assets/showcase/fujifilm-x-t3.png" width="135" alt="ProcAgen3D GLB render of a Fujifilm X-T3 camera">
+      </a><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
+      <strong>Fujifilm X-T3</strong>
     </td>
   </tr>
 </table>
