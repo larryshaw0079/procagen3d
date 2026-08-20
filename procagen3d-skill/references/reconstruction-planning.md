@@ -38,6 +38,18 @@ Estimate dimensions only after this decomposition. Measure along object axes
 or with pose-corrected ratios. Mark depth and occluded links inferred when one
 view cannot determine them.
 
+### Everything must be joined to something
+
+`DETACHED_PARTS` treats the asset as one connected solid: any mesh island
+separated from the rest by more than 1% of the object's size is a floating
+part. This catches what a single registered view structurally cannot — a head
+with no neck under it projects exactly like a head with one, and the gap only
+appears when you look from somewhere else.
+
+The fix is almost always a missing connector rather than a wrong position:
+build the neck, the stem, the mount, the axle. Pieces that really are separate
+in the reference go in `"detached_groups": ["FloatingBit_*"]`.
+
 ### Symmetry is where depth comes from
 
 One view cannot tell you how far forward a shoulder sits. It can tell you that
@@ -382,6 +394,12 @@ every structural mass listed in `shape_priors` (primary plus necessary
 secondary structure), important negative spaces, contact parts, and pose/joint
 markers. For rectilinear/mixed targets this is also the primitive-family probe;
 for curved targets it remains the section/continuity probe.
+
+Correction budget: **2** for simple/moderate, **3** for complex, **4** for
+extreme. On exhaustion with two or more reference views, stop — the evidence
+was sufficient, so the reconstruction is what is wrong. On exhaustion with a
+single view, continue on the best probe and deliver it as approximate, with
+`limitations.md` naming every failing gate and the views that would resolve it.
 
 Run `build`, registered `fit`, and `check` on the probe. Read the canonical and
 registered views. Pass only when:

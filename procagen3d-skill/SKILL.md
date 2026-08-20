@@ -42,7 +42,8 @@ asks): `program.py` (the deliverable), `model.glb`, `scene.blend`,
 areas), `diagnostics.json`, `renders/` (six canonical views +
 `sheet.png`; curved/mixed also `form_sheet.png`), and when applicable
 `form_probe/`, `spec.yaml`, `joints_report.json`,
-`score_report.json`. Image-conditioned assets also contain `priors.md`,
+`score_report.json`, and `limitations.md` whenever a single-view reconstruction
+is delivered as approximate. Image-conditioned assets also contain `priors.md`,
 `reconstruction_plan.json`, version-2 `fit_spec.json`, `fit_report.json`,
 registered `reference_match.png` and `reference_overlay.png`, scored
 reference/render masks, and an
@@ -152,9 +153,29 @@ also read the registered render/overlay/report. Pass primitive family, local
 silhouette, camera/frame, rigid/articulated pose, cross-section, negative space,
 and attachments in all useful views. Wrong family → revise the prior and rewrite
 that builder in either direction; wrong pose → repair camera/root/joint
-transforms, not dimensions. Allow at most two probe corrections. If it still
-fails, stop/request better views or report the limitation; never decorate a
-rejected reconstruction.
+transforms, not dimensions. Probe correction budget scales with the plan's
+complexity class: **2** for simple/moderate, **3** for complex, **4** for
+extreme.
+
+On exhaustion, what happens next depends on how much evidence the input
+actually contained:
+
+- **Two or more reference views.** Stop. The evidence was sufficient, so a
+  failing probe means the reconstruction is wrong. Report the limitation and
+  never decorate a rejected reconstruction.
+- **One reference view.** Depth is unobservable from one image, so some
+  residual is the input's fault rather than the model's. Continue to synthesis
+  on the best probe, but the asset is **approximate**: write
+  `<out>/limitations.md` naming every failing gate with its measured value,
+  carry those residuals verbatim into the final report, and ask for the
+  specific views that would resolve them. `check` enforces this — the
+  single-view shortfall is only accepted when `limitations.md` names each
+  failing gate, and it is never accepted for a `threshold_policy` or
+  `landmark_provenance` failure, which are integrity faults rather than
+  evidence limits.
+
+Delivering an approximate model with an honest account of what is unverified is
+more useful than delivering nothing. Claiming it is faithful is not.
 
 **`complex` and `extreme` plans probe one assembly at a time.** Split the object
 into five to nine named assemblies, give each its own silhouette region, and
@@ -194,11 +215,13 @@ shape/dimensions in that order, locking each passing layer. Never proceed on the
 legacy auto-centered preview alone.
 
 Thresholds are the harness's, not yours. Mask IoU floors run 0.88/0.84/0.80/0.76
-for simple/moderate/complex/extreme, with an automatic allowance of up to 0.15
-for genuinely wiry subjects, measured by eroding the reference mask. The
-`threshold_policy` gate fails and lists every value the spec tried to loosen. A
-floor you cannot reach is a real finding: fix the geometry or report the
-limitation honestly.
+for simple/moderate/complex/extreme, then move with the evidence: **−0.08 for a
+single view**, unchanged at two, **+0.03 at three or more**. One image cannot
+determine depth, so demanding multi-view registration from it asks for
+something the input does not contain; more views make the problem better posed
+and raise the bar. A further allowance of up to 0.15 applies to genuinely wiry
+subjects, measured by eroding the reference mask. The `threshold_policy` gate
+fails and lists every value the spec tried to loosen.
 
 Targets are the image's, not yours either. Every `reference_uv` must be read
 off the saved reference; deriving one by projecting your own model makes that
@@ -238,6 +261,10 @@ reveal:
   meshes; naming a cube `Vent_03` no longer counts as a vent.
 - `FORM_PROMISED_CURVATURE` — masses declared `continuous`/`shell` must be
   measurably curved.
+- `DETACHED_PARTS` — an assembled object is one connected solid. A part that
+  touches nothing is floating, and from the one camera you fitted it can look
+  perfectly attached. Build the piece that joins them (a neck, a stem, a
+  mount); list genuinely separate pieces in `detached_groups`.
 - `SYMMETRY` — left/right pairs must be mirror images in the canonical frame.
   One view cannot see how far forward a shoulder sits, but it can insist the
   two shoulders agree, which is where per-part depth discipline comes from.
@@ -323,8 +350,13 @@ this output, and failures stay in the final report.
 
 **10 — Deliver.** Final message: artifact paths, part/joint counts, the
 constraint table if any, and named residual mismatches. "Approximate" where
-you eyeballed; "verified" only where a gate ran. "This cannot be built
-faithfully from this input" is a valid outcome — say it instead of faking.
+you eyeballed; "verified" only where a gate ran. For a single-view
+reconstruction, say so, quote `limitations.md`, and name the specific extra
+views that would resolve each residual — "a side or rear view would fix the
+shield depth" is actionable; "please provide better images" is not. "This
+cannot be built faithfully from this input" is a valid outcome, but on a single
+view prefer an approximate model plus an honest account of what is unverified:
+that is more useful than nothing, and it is what the input supports.
 
 ## Gates (do not skip)
 
@@ -338,7 +370,10 @@ faithfully from this input" is a valid outcome — say it instead of faking.
    pass.
 3. Full `build` exit 0 before anything else proceeds.
 4. Image-conditioned: registered `fit` exit 0 after every full build, including
-   local silhouette and pose gates; Read its overlay, masks, and report.
+   local silhouette and pose gates; Read its overlay, masks, and report. On a
+   single-view input a shortfall may instead be carried as an approximate
+   delivery, but only with `limitations.md` naming every failing gate — never
+   for a `threshold_policy` or `landmark_provenance` failure.
 5. `check --tier <tier> --form <profile>` exit 0 before visual inspection;
    shape-prior, feature-coverage, adaptive showcase detail, and form failures
    are repair input, never acceptable residue.

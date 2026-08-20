@@ -1571,6 +1571,22 @@ FIT_ERROR_CEILINGS = {
 # from the reference mask itself, so it cannot be claimed by declaration.
 FIT_THINNESS_RELIEF = 0.20
 FIT_THINNESS_RELIEF_CAP = 0.15
+# How much evidence the reconstruction actually had to work from.  From one
+# view the depth of every part is unobservable, so silhouette error accumulates
+# out of depth choices that are each individually defensible; demanding the
+# same registration as a multi-view reconstruction asks for something the input
+# does not contain.  More views make the problem better posed, so the bar rises.
+FIT_VIEW_ADJUSTMENT = {1: -0.08, 2: 0.0, 3: 0.03}
+FIT_VIEW_ADJUSTMENT_MAX = 0.03
+
+
+def count_reference_views(out_dir):
+    """Distinct reference images saved for this asset, by content."""
+    digests = set()
+    for path in sorted(Path(out_dir).glob("reference_[0-9][0-9].*")):
+        if path.is_file():
+            digests.add(sha256_file(path))
+    return max(1, len(digests))
 # Reading a point off an image is worth roughly a pixel at best.  Below this,
 # the target was computed from the model rather than observed.
 LANDMARK_PROVENANCE_FLOOR = 0.001
@@ -1609,10 +1625,11 @@ def mask_thinness(mask):
 class FitThresholdPolicy:
     """Resolve every fit threshold as the stricter of policy and spec."""
 
-    def __init__(self, complexity_class):
+    def __init__(self, complexity_class, views=1):
         self.complexity = (complexity_class
                            if complexity_class in FIT_MASK_IOU_FLOOR
                            else FIT_DEFAULT_COMPLEXITY)
+        self.views = max(1, int(views))
         self.thinness = 0.0
         self.violations = []
         self.applied = {}
@@ -1623,11 +1640,16 @@ class FitThresholdPolicy:
     def _relief(self):
         return min(FIT_THINNESS_RELIEF_CAP, FIT_THINNESS_RELIEF * self.thinness)
 
+    def view_adjustment(self):
+        return FIT_VIEW_ADJUSTMENT.get(self.views, FIT_VIEW_ADJUSTMENT_MAX)
+
     def mask_iou_floor(self):
-        return round(FIT_MASK_IOU_FLOOR[self.complexity] - self._relief(), 4)
+        return round(FIT_MASK_IOU_FLOOR[self.complexity]
+                     + self.view_adjustment() - self._relief(), 4)
 
     def region_iou_floor(self):
-        return round(FIT_REGION_IOU_FLOOR[self.complexity] - self._relief(), 4)
+        return round(FIT_REGION_IOU_FLOOR[self.complexity]
+                     + self.view_adjustment() - self._relief(), 4)
 
     def floor(self, label, requested, limit):
         """Minimum-style threshold: the spec may raise it, never lower it."""
@@ -1743,7 +1765,8 @@ def stage_fit(args):
         thresholds = spec.get("thresholds", {})
         if not isinstance(thresholds, dict):
             raise ValueError("thresholds must be an object")
-        policy = FitThresholdPolicy(load_complexity_class(out_dir))
+        policy = FitThresholdPolicy(load_complexity_class(out_dir),
+                                    count_reference_views(out_dir))
         gates = []
         mask_config = spec.get("mask")
         reference_fg = None
@@ -2310,11 +2333,20 @@ def stage_fit(args):
                 "pose, instances, or relations")
         base_report["threshold_policy"] = {
             "complexity_class": policy.complexity,
+            "reference_views": policy.views,
+            "view_adjustment": policy.view_adjustment(),
+            "single_view_reconstruction": policy.views == 1,
             "reference_thinness": policy.thinness,
             "mask_iou_floor": policy.mask_iou_floor(),
             "region_iou_floor": policy.region_iou_floor(),
             "loosening_attempts": policy.violations,
         }
+        if policy.views == 1:
+            print(f"{WARN}:SINGLE_VIEW] one reference view: depth is "
+                  "unobservable, so registration floors are relaxed by "
+                  f"{-FIT_VIEW_ADJUSTMENT[1]:.2f}. Anything this run cannot "
+                  "verify must be reported as approximate, and more views "
+                  "raise the bar rather than lower it")
         if policy.violations:
             fit_gate(
                 gates, "threshold_policy", "policy", "spec may only tighten",

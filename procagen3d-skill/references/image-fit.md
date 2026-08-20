@@ -64,6 +64,22 @@ Whole-frame mask IoU floors, by the plan's complexity class:
 | `complex` | 0.80 | 0.78 |
 | `extreme` | 0.76 | 0.74 |
 
+These then move with how much evidence the input actually carried, counted from
+the distinct reference images saved for the asset:
+
+| views | adjustment |
+|---|---:|
+| 1 | −0.08 |
+| 2 | 0.00 |
+| 3 or more | +0.03 |
+
+One image cannot determine depth. Every part's distance from the camera is a
+choice, and reasonable choices accumulate into silhouette error that no amount
+of care removes, so holding a single-view reconstruction to a multi-view
+standard demands something the input does not contain. More views make the
+problem better posed, and the bar rises to match. The adjustment is the
+harness's, keyed to a fact about the input rather than to anything you declare.
+
 Error ceilings are fixed: bbox 0.05, centroid 0.04, whole-frame area ratio
 0.20, region area ratio 0.18, landmark 0.04, ratio 0.10, pose axis 4°, chain
 segment 5°, chain joint 7°, chain length fraction 0.04, instance bbox 0.05,
@@ -78,6 +94,16 @@ floors actually applied.
 A floor you cannot reach is information. Fix the geometry, or report honestly
 that the reference does not support the reconstruction — never negotiate the
 bar.
+
+From a **single view**, a shortfall that survives the probe budget may be
+delivered as an approximate reconstruction instead of abandoned, provided
+`<out>/limitations.md` names every failing gate with its measured value. `check`
+verifies that each failing gate id appears in the file, downgrades the failure
+to `REFERENCE_FIT_APPROXIMATE`, and still hard-fails when the shortfall is a
+`threshold_policy` or `landmark_provenance` violation — those are integrity
+faults, not evidence limits, and no number of missing views excuses them. Name
+the views that would resolve each residual; "a rear view would settle the
+shield depth" is actionable, "better images please" is not.
 
 ## 2. Register the camera and mask
 

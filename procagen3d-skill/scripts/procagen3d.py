@@ -260,27 +260,32 @@ def sha256_file(path):
 
 
 def image_fit_errors(dir_path):
-    """Validate required, passing, hash-bound fit evidence for image inputs."""
+    """Validate required, passing, hash-bound fit evidence for image inputs.
+
+    Returns (errors, warnings); a warning is only ever issued for a documented
+    single-view shortfall.
+    """
     root = Path(dir_path)
     references = sorted(root.glob("reference_[0-9][0-9].*"))
     if not references:
-        return []
+        return [], []
     spec_path = root / "fit_spec.json"
     report_path = root / "fit_report.json"
     errors = []
+    warnings = []
     if not spec_path.is_file():
         errors.append("fit_spec.json missing")
     if not report_path.is_file():
         errors.append("fit_report.json missing (run `procagen3d fit`)")
     if errors:
-        return errors
+        return errors, warnings
     try:
         spec = json.loads(spec_path.read_text())
         report = json.loads(report_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        return [f"invalid fit evidence JSON: {exc}"]
+        return [f"invalid fit evidence JSON: {exc}"], warnings
     if not isinstance(spec, dict) or not isinstance(report, dict):
-        return ["fit spec and report must be JSON objects"]
+        return ["fit spec and report must be JSON objects"], warnings
     reference_name = spec.get("reference_image")
     reference_path = root / reference_name if isinstance(reference_name, str) else None
     if reference_path is None or not reference_path.is_file():
@@ -297,13 +302,35 @@ def image_fit_errors(dir_path):
         errors.append("image-conditioned assets require reconstruction_plan.json")
     if not report.get("passed"):
         summary = report.get("summary", {})
-        errors.append(
-            f"registered fit did not pass ({summary.get('passed', 0)}/"
-            f"{summary.get('total', '?')} gates)")
+        message = (f"registered fit did not pass ({summary.get('passed', 0)}/"
+                   f"{summary.get('total', '?')} gates)")
+        # From a single view some residual is the input's fault, not the
+        # model's, and refusing to deliver anything serves nobody.  The escape
+        # is available only in exchange for writing down exactly what is wrong.
+        policy = report.get("threshold_policy") or {}
+        failed_ids = [str(gate.get("id")) for gate in report.get("gates") or []
+                      if not gate.get("pass")]
+        structural = {"threshold_policy", "landmark_provenance"}
+        if (policy.get("single_view_reconstruction")
+                and not structural.intersection(failed_ids)):
+            note = Path(dir_path) / "limitations.md"
+            text = note.read_text() if note.is_file() else ""
+            missing = [gate for gate in failed_ids if gate not in text]
+            if missing:
+                errors.append(
+                    message + " — single-view input allows delivering this as "
+                    "approximate, but only with limitations.md naming every "
+                    f"failing gate; absent from it: {missing[:8]}")
+            else:
+                warnings.append(
+                    message + "; accepted as an approximate single-view "
+                    "reconstruction, documented in limitations.md")
+        else:
+            errors.append(message)
     inputs = report.get("inputs")
     if not isinstance(inputs, dict):
         errors.append("fit report has no input hashes")
-        return errors
+        return errors, warnings
     expected = {
         "fit_spec_sha256": spec_path,
         "scene_graph_sha256": root / "scene_graph.json",
@@ -322,7 +349,7 @@ def image_fit_errors(dir_path):
     for key, path in expected.items():
         if inputs.get(key) != sha256_file(path):
             errors.append(f"stale fit evidence: {key} does not match {path.name}")
-    return errors
+    return errors, warnings
 
 
 def children_map(graph):
@@ -636,6 +663,42 @@ REGION_COLUMNS = ("left", "center", "right")
 def shape_signature(obj):
     sig = obj.get("shape_signature")
     return sig if isinstance(sig, dict) else None
+
+
+# An assembled object is one connected solid.  A part that touches nothing is
+# floating, and a single reference view hides it completely whenever the gap
+# happens to fall behind other geometry.
+DETACHED_GAP_FRACTION = 0.01
+DETACHED_ISLAND_SHARE = 0.12
+
+
+def connected_components(meshes, tolerance):
+    """Group meshes into islands that touch or nearly touch."""
+    boxes = []
+    for obj in meshes:
+        lo = obj.get("bbox_world_min")
+        hi = obj.get("bbox_world_max")
+        if isinstance(lo, list) and isinstance(hi, list) and len(lo) >= 3:
+            boxes.append((obj["name"], lo, hi))
+    parent = {name: name for name, _, _ in boxes}
+
+    def find(name):
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    for index, (name_a, lo_a, hi_a) in enumerate(boxes):
+        for name_b, lo_b, hi_b in boxes[index + 1:]:
+            if all(lo_a[i] - hi_b[i] <= tolerance
+                   and lo_b[i] - hi_a[i] <= tolerance for i in range(3)):
+                root_a, root_b = find(name_a), find(name_b)
+                if root_a != root_b:
+                    parent[root_a] = root_b
+    islands = {}
+    for name, _, _ in boxes:
+        islands.setdefault(find(name), []).append(name)
+    return sorted(islands.values(), key=len, reverse=True)
 
 
 # Bilateral symmetry is the strongest depth constraint a single reference view
@@ -982,10 +1045,12 @@ def cmd_check(args):
     meshes = [o for o in objs if o["type"] == "MESH"]
     failures = 0
 
-    fit_errors = image_fit_errors(args.dir)
+    fit_errors, fit_warnings = image_fit_errors(args.dir)
     if fit_errors:
         failures += 1
         fail("REFERENCE_FIT", "; ".join(fit_errors))
+    for message in fit_warnings:
+        warn("REFERENCE_FIT_APPROXIMATE", message)
 
     reconstruction_plan, plan_errors = load_reconstruction_plan(args.dir)
     if plan_errors:
@@ -1243,6 +1308,59 @@ def cmd_check(args):
         for entry in reconstruction_plan.get("instance_arrays") or []:
             if isinstance(entry, dict) and isinstance(entry.get("pattern"), str):
                 declared_arrays.append(entry)
+    islands = connected_components(meshes, DETACHED_GAP_FRACTION * major_dim)
+    if len(islands) > 1:
+        detached_patterns = [p for p in
+                             ((reconstruction_plan or {}).get("detached_groups") or [])
+                             if isinstance(p, str)]
+        # A floating trim strip or button is cosmetic; a floating head, rail, or
+        # windshield is a broken assembly.  Only islands carrying a structural
+        # mass are hard failures, so the gate does not drown in small parts
+        # sitting a fraction of a millimetre proud of their host surface.
+        structural_names = {o["name"] for o in structural}
+        by_name = {o["name"]: o for o in meshes}
+        object_diagonal = math.sqrt(sum(v * v for v in world_size[:3])) or 1.0
+        stray, trim = [], []
+        for island in islands[1:]:
+            if any(fnmatch.fnmatchcase(name, pattern)
+                   for name in island for pattern in detached_patterns):
+                continue
+            carried = sorted(structural_names.intersection(island))
+            # A rail or a windshield can be made of parts that are each too
+            # slender to count as structural while the assembly plainly is not
+            # trim, so weigh the island as a whole too.
+            lo = [math.inf] * 3
+            hi = [-math.inf] * 3
+            for name in island:
+                obj = by_name.get(name) or {}
+                a, b = obj.get("bbox_world_min"), obj.get("bbox_world_max")
+                if isinstance(a, list) and isinstance(b, list):
+                    for i in range(3):
+                        lo[i] = min(lo[i], a[i])
+                        hi[i] = max(hi[i], b[i])
+            span = (math.sqrt(sum((hi[i] - lo[i]) ** 2 for i in range(3)))
+                    if all(math.isfinite(v) for v in lo + hi) else 0.0)
+            share = span / object_diagonal
+            if carried or share >= DETACHED_ISLAND_SHARE:
+                stray.append(f"{len(island)} part(s) spanning {share:.0%} of the "
+                             f"object, including {(carried or sorted(island))[:4]}")
+            else:
+                trim.append(f"{len(island)}x {sorted(island)[:2]}")
+        if trim:
+            warn("DETACHED_TRIM", f"{len(trim)} small detached island(s) — "
+                 "cosmetic unless the reference shows them touching: "
+                 + "; ".join(trim[:6]))
+        if stray:
+            failures += 1
+            fail("DETACHED_PARTS", "structural geometry is in "
+                 f"{len(islands)} disconnected islands; these touch nothing "
+                 f"(gap over {DETACHED_GAP_FRACTION:.0%} of object size): "
+                 + "; ".join(stray[:5]) + " — build the part that joins them "
+                 "(a neck, a stem, a mount) or move them into contact; a "
+                 "floating assembly can look attached from the one camera you "
+                 "fitted. Genuinely separate pieces go in "
+                 "reconstruction_plan.detached_groups")
+
     pairs = mirror_pairs(meshes)
     symmetry = (reconstruction_plan or {}).get("symmetry")
     if len(pairs) >= SYMMETRY_MIN_PAIRS and reconstruction_plan is not None:
