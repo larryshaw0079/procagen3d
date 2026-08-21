@@ -1,6 +1,6 @@
 # procagen3d-skill
 
-**Version:** 0.2.0 — see the repository [update log](../README.md#update-log).
+**Version:** 0.3.0 — see the repository [update log](../README.md#update-log).
 
 An agent skill implementing **ProcAgen3D: Code-Native Generation of Programmable
 3D Assets** ([arXiv:2607.22738](https://arxiv.org/abs/2607.22738)) for

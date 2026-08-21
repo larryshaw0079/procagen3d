@@ -1,6 +1,6 @@
 # ProcAgen3D
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 
 Code-native generation of programmable 3D assets, implemented as an agent
 skill for Claude Code, Codex, and compatible runtimes.
@@ -179,6 +179,25 @@ procagen3d/
 ## Update log
 
 Entries are newest first.
+
+### 0.3.0 — 2026-08-21
+
+- Added `procagen3d solve-camera` to resect the registered viewpoint from
+  image-read landmarks, lock it into `camera_solve`/`fit_spec`, and fail
+  `CAMERA_SOLVE` when resection does not converge.
+- Added 3D structural gates a single registered view cannot see: `SYMMETRY`
+  for mirrored left/right pairs, `DETACHED_PARTS` for floating mesh islands,
+  `RIGID_AXIS` for collinear long assemblies, and `SCENE_INTERPENETRATION`
+  for declared multi-object instances.
+- Made fit floors evidence-adaptive: IoU thresholds drop 0.08 on a single
+  view, stay put at two, and rise 0.03 at three or more. Harness-owned
+  `threshold_policy` and `landmark_provenance` integrity checks stay in force.
+- Added bounded single-view approximate delivery via `limitations.md` (at
+  most 25% of gates, IoU miss ≤ 0.08, error ≤ 2× ceiling). Multi-view failures
+  still stop, and integrity faults never qualify.
+- Scaled probe and repair budgets by complexity class, and documented Blender
+  5.x / macOS Metal headless requirements.
+- Added city bicycle, compact carbine, and Fujifilm X-T3 showcase pairs.
 
 ### 0.2.0 — 2026-08-17
 
