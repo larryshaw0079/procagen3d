@@ -48,28 +48,6 @@ compiled to a portable GLB by the ProcAgen3D pipeline.
       <strong>Audi Sport Quattro S1</strong>
     </td>
     <td align="center" width="33%">
-      <a href="assets/showcase/china-pavilion-reference.png">
-        <img src="assets/showcase/china-pavilion-reference.png" width="135" alt="Reference image of a traditional Chinese pavilion">
-      </a>
-      <a href="assets/showcase/china-pavilion.png">
-        <img src="assets/showcase/china-pavilion.png" width="135" alt="ProcAgen3D GLB render of a traditional Chinese pavilion">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Traditional Chinese Pavilion</strong>
-    </td>
-    <td align="center" width="33%">
-      <a href="assets/showcase/benben-robot-reference.png">
-        <img src="assets/showcase/benben-robot-reference.png" width="135" alt="Reference image of the Benben robot">
-      </a>
-      <a href="assets/showcase/benben-robot.png">
-        <img src="assets/showcase/benben-robot.png" width="135" alt="ProcAgen3D GLB render of the Benben robot">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Benben Robot</strong>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
       <a href="assets/showcase/nissan-skyline-super-silhouette-reference.png">
         <img src="assets/showcase/nissan-skyline-super-silhouette-reference.png" width="135" alt="Reference image of a Nissan Skyline Super Silhouette race car">
       </a>
@@ -89,6 +67,8 @@ compiled to a portable GLB by the ProcAgen3D pipeline.
       <sub>Reference → ProcAgen3D GLB</sub><br>
       <strong>Pagani Huayra R</strong>
     </td>
+  </tr>
+  <tr>
     <td align="center" width="33%">
       <a href="assets/showcase/toyota-sr5-reference.png">
         <img src="assets/showcase/toyota-sr5-reference.png" width="135" alt="Reference image of a Toyota SR5 pickup with its hood open">
@@ -99,18 +79,6 @@ compiled to a portable GLB by the ProcAgen3D pipeline.
       <sub>Reference → ProcAgen3D GLB</sub><br>
       <strong>Toyota SR5</strong>
     </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="assets/showcase/compact-carbine-reference.png">
-        <img src="assets/showcase/compact-carbine-reference.png" width="135" alt="Reference image of a compact carbine">
-      </a>
-      <a href="assets/showcase/compact-carbine.png">
-        <img src="assets/showcase/compact-carbine.png" width="135" alt="ProcAgen3D GLB render of a compact carbine">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Compact Carbine</strong>
-    </td>
     <td align="center" width="33%">
       <a href="assets/showcase/city-bicycle-reference.png">
         <img src="assets/showcase/city-bicycle-reference.png" width="135" alt="Reference image of a city bicycle with a wicker basket">
@@ -120,6 +88,70 @@ compiled to a portable GLB by the ProcAgen3D pipeline.
       </a><br>
       <sub>Reference → ProcAgen3D GLB</sub><br>
       <strong>City Bicycle</strong>
+    </td>
+    <td align="center" width="33%">
+      <a href="assets/showcase/quadcopter-drone-reference.png">
+        <img src="assets/showcase/quadcopter-drone-reference.png" width="135" alt="Reference image of a quadcopter drone">
+      </a>
+      <a href="assets/showcase/quadcopter-drone.png">
+        <img src="assets/showcase/quadcopter-drone.png" width="135" alt="ProcAgen3D GLB render of a quadcopter drone">
+      </a><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
+      <strong>Quadcopter Drone</strong>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="assets/showcase/china-pavilion-reference.png">
+        <img src="assets/showcase/china-pavilion-reference.png" width="135" alt="Reference image of a traditional Chinese pavilion">
+      </a>
+      <a href="assets/showcase/china-pavilion.png">
+        <img src="assets/showcase/china-pavilion.png" width="135" alt="ProcAgen3D GLB render of a traditional Chinese pavilion">
+      </a><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
+      <strong>Traditional Chinese Pavilion</strong>
+    </td>
+    <td align="center" width="33%">
+      <a href="assets/showcase/spanish-colonial-townhouse-reference.png">
+        <img src="assets/showcase/spanish-colonial-townhouse-reference.png" width="135" alt="Reference image of a Spanish colonial townhouse">
+      </a>
+      <a href="assets/showcase/spanish-colonial-townhouse.png">
+        <img src="assets/showcase/spanish-colonial-townhouse.png" width="135" alt="ProcAgen3D GLB render of a Spanish colonial townhouse">
+      </a><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
+      <strong>Spanish Colonial Townhouse</strong>
+    </td>
+    <td align="center" width="33%">
+      <a href="assets/showcase/cozy-living-room-reference.png">
+        <img src="assets/showcase/cozy-living-room-reference.png" width="135" alt="Reference image of a cozy living room set">
+      </a>
+      <a href="assets/showcase/cozy-living-room.png">
+        <img src="assets/showcase/cozy-living-room.png" width="135" alt="ProcAgen3D GLB render of a cozy living room set">
+      </a><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
+      <strong>Cozy Living Room</strong>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="assets/showcase/benben-robot-reference.png">
+        <img src="assets/showcase/benben-robot-reference.png" width="135" alt="Reference image of the Benben robot">
+      </a>
+      <a href="assets/showcase/benben-robot.png">
+        <img src="assets/showcase/benben-robot.png" width="135" alt="ProcAgen3D GLB render of the Benben robot">
+      </a><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
+      <strong>Benben Robot</strong>
+    </td>
+    <td align="center" width="33%">
+      <a href="assets/showcase/compact-carbine-reference.png">
+        <img src="assets/showcase/compact-carbine-reference.png" width="135" alt="Reference image of a compact carbine">
+      </a>
+      <a href="assets/showcase/compact-carbine.png">
+        <img src="assets/showcase/compact-carbine.png" width="135" alt="ProcAgen3D GLB render of a compact carbine">
+      </a><br>
+      <sub>Reference → ProcAgen3D GLB</sub><br>
+      <strong>Compact Carbine</strong>
     </td>
     <td align="center" width="33%">
       <a href="assets/showcase/fujifilm-x-t3-reference.png">
@@ -140,10 +172,10 @@ The agent supplies design judgment and visual review; a deterministic,
 stdlib-only harness enforces the paper's pipeline around it:
 
 ```
-shape/pose/detail plan → reconstruction probe → synthesize program
-→ build + canonical renders (headless Blender)
+reconstruction plan → reconstruction probe → camera solve (image-conditioned)
+→ synthesize program → build + canonical renders (headless Blender)
 → registered local-silhouette + pose fit (image-conditioned) → deterministic checks
-→ agent-vision inspection → guarded repair loop (≤3)
+→ agent-vision inspection → guarded repair loop (complexity-scaled)
 → articulation validation → constraint scoring → deliver
 ```
 
@@ -151,9 +183,12 @@ Every stage is a CLI command with exit codes and grep-able
 `[PROCAGEN3D:OK|WARN|FAIL]` tags, so nothing depends on the agent's honesty:
 build errors, doctrine violations, broken joints, failed reference fits, and
 failed dimensional constraints are all caught mechanically. Semantic
-perception is agent vision by design — no learned depth/normal/edge models —
-while registered camera, whole/local masks, landmark, pose-chain, ratio, and
-layout gates verify visible projection offline.
+perception is agent vision by design — no learned depth/normal/edge models.
+Registered camera, mask, landmark, pose-chain, ratio, and layout gates verify
+visible projection; `CAMERA_SOLVE`, `SYMMETRY`, `DETACHED_PARTS`, `RIGID_AXIS`,
+and `SCENE_INTERPENETRATION` catch 3D faults a single view cannot see. Fit
+floors scale with the number of reference views, and a bounded single-view
+shortfall may ship as approximate with `limitations.md`.
 
 ## Repository layout
 
@@ -197,7 +232,10 @@ Entries are newest first.
   still stop, and integrity faults never qualify.
 - Scaled probe and repair budgets by complexity class, and documented Blender
   5.x / macOS Metal headless requirements.
-- Added city bicycle, compact carbine, and Fujifilm X-T3 showcase pairs.
+- Added city bicycle, compact carbine, Fujifilm X-T3, cozy living room,
+  quadcopter drone, and Spanish colonial townhouse showcase pairs; regrouped
+  the grid by category; and re-rendered the pavilion and townhouse in the
+  same studio-lit Eevee style as the other GLB stills.
 
 ### 0.2.0 — 2026-08-17
 
