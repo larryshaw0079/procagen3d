@@ -98,12 +98,28 @@ bar.
 From a **single view**, a shortfall that survives the probe budget may be
 delivered as an approximate reconstruction instead of abandoned, provided
 `<out>/limitations.md` names every failing gate with its measured value. `check`
-verifies that each failing gate id appears in the file, downgrades the failure
-to `REFERENCE_FIT_APPROXIMATE`, and still hard-fails when the shortfall is a
-`threshold_policy` or `landmark_provenance` violation — those are integrity
-faults, not evidence limits, and no number of missing views excuses them. Name
-the views that would resolve each residual; "a rear view would settle the
-shield depth" is actionable, "better images please" is not.
+verifies that each failing gate id appears in the file and downgrades the
+failure to `REFERENCE_FIT_APPROXIMATE`. Name the views that would resolve each
+residual; "a rear view would settle the shield depth" is actionable, "better
+images please" is not.
+
+The escape is bounded, because it exists for the residue of an ill-posed
+problem and not for a wrong model:
+
+- at most **25%** of gates may fail;
+- no minimum-style gate (IoU) may fall more than **0.08** below its floor;
+- no maximum-style gate (error, angle, ratio) may exceed **2×** its ceiling;
+- a `threshold_policy` or `landmark_provenance` failure is never eligible.
+
+A scene that missed 38 of 57 gates with whole-mask IoU 0.46 was shipped this
+way once, with every failure dutifully listed. Listing them is not the point;
+being close is. Past these bounds, fix it or report that it cannot be built.
+
+Likewise, `camera_solution.json` is checked: if resection did not converge,
+`CAMERA_SOLVE` fails. A non-converging solve means no single viewpoint explains
+the landmarks you read, which is a statement about the geometry — keeping the
+rejected seed and continuing is how a scene ships with a chair facing the wrong
+way.
 
 ## 2. Register the camera and mask
 

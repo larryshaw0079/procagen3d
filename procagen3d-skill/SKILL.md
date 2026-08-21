@@ -163,16 +163,20 @@ actually contained:
 - **Two or more reference views.** Stop. The evidence was sufficient, so a
   failing probe means the reconstruction is wrong. Report the limitation and
   never decorate a rejected reconstruction.
-- **One reference view.** Depth is unobservable from one image, so some
-  residual is the input's fault rather than the model's. Continue to synthesis
-  on the best probe, but the asset is **approximate**: write
+- **One reference view, near miss.** Depth is unobservable from one image, so
+  some residual is the input's fault rather than the model's. Continue to
+  synthesis on the best probe, but the asset is **approximate**: write
   `<out>/limitations.md` naming every failing gate with its measured value,
   carry those residuals verbatim into the final report, and ask for the
-  specific views that would resolve them. `check` enforces this — the
-  single-view shortfall is only accepted when `limitations.md` names each
-  failing gate, and it is never accepted for a `threshold_policy` or
-  `landmark_provenance` failure, which are integrity faults rather than
-  evidence limits.
+  specific views that would resolve them.
+- **One reference view, wide miss.** Stop. The approximation escape is bounded:
+  at most **25% of gates** may fail, no IoU gate by more than **0.08**, and no
+  error gate by more than **2×** its ceiling. Past that the model is not
+  approximate, it is wrong, and writing the failures down does not change that.
+
+`check` enforces the bounds and the documentation, and never accepts a
+`threshold_policy` or `landmark_provenance` failure at all — those are
+integrity faults, not evidence limits.
 
 Delivering an approximate model with an honest account of what is unverified is
 more useful than delivering nothing. Claiming it is faithful is not.
@@ -261,6 +265,14 @@ reveal:
   meshes; naming a cube `Vent_03` no longer counts as a vent.
 - `FORM_PROMISED_CURVATURE` — masses declared `continuous`/`shell` must be
   measurably curved.
+- `SCENE_INTERPENETRATION` — objects the fit spec declares as separate
+  instances may touch but must not occupy the same space. Depth is measured by
+  containment, so a lamp standing *on* a table reads ~0% while a lamp sunk into
+  a sofa reads its true burial depth. Scoped to declared instances, because the
+  sub-assemblies of one articulated body are supposed to overlap at every joint.
+- `CAMERA_SOLVE` — a resection that did not converge is a verdict, not a
+  formality: no viewpoint explains your landmarks, so proportions or instance
+  layout are wrong. Re-solve; never carry on with the rejected seed.
 - `DETACHED_PARTS` — an assembled object is one connected solid. A part that
   touches nothing is floating, and from the one camera you fitted it can look
   perfectly attached. Build the piece that joins them (a neck, a stem, a

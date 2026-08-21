@@ -259,6 +259,30 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+# How far past its threshold a gate may sit and still count as "approximate"
+# rather than "wrong".  Minimum-style gates (IoU) are judged on the absolute
+# shortfall; maximum-style gates (errors, angles) on the ratio.
+CAMERA_SOLVE_MAX_RMS = 0.02
+NEAR_MISS_MAX_SHARE = 0.25
+NEAR_MISS_IOU_SHORTFALL = 0.08
+NEAR_MISS_ERROR_MULTIPLE = 2.0
+TARGET_RE = re.compile(r"(>=|<=|>|<)\s*([0-9.]+)")
+
+
+def within_near_miss(gate):
+    """True when a failing gate is close enough to its threshold to be residue."""
+    match = TARGET_RE.search(str(gate.get("target", "")))
+    measured = gate.get("measured")
+    if not match or not isinstance(measured, (int, float)):
+        return False
+    operator, threshold = match.group(1), float(match.group(2))
+    if operator.startswith(">"):
+        return measured >= threshold - NEAR_MISS_IOU_SHORTFALL
+    if threshold <= 1e-9:
+        return measured <= NEAR_MISS_ERROR_MULTIPLE * 1e-9
+    return measured <= threshold * NEAR_MISS_ERROR_MULTIPLE
+
+
 def image_fit_errors(dir_path):
     """Validate required, passing, hash-bound fit evidence for image inputs.
 
@@ -308,11 +332,35 @@ def image_fit_errors(dir_path):
         # model's, and refusing to deliver anything serves nobody.  The escape
         # is available only in exchange for writing down exactly what is wrong.
         policy = report.get("threshold_policy") or {}
-        failed_ids = [str(gate.get("id")) for gate in report.get("gates") or []
-                      if not gate.get("pass")]
+        gates = report.get("gates") or []
+        failed = [gate for gate in gates if not gate.get("pass")]
+        failed_ids = [str(gate.get("id")) for gate in failed]
         structural = {"threshold_policy", "landmark_provenance"}
-        if (policy.get("single_view_reconstruction")
-                and not structural.intersection(failed_ids)):
+        # The escape exists for the residue of an ill-posed problem, not for a
+        # wrong model.  A reconstruction that misses most of its gates, or
+        # misses any one of them by a wide margin, is not "approximate" — it is
+        # incorrect, and documenting that in prose does not make it shippable.
+        share = len(failed) / len(gates) if gates else 1.0
+        blowouts = [f"{gate['id']} {gate.get('measured')} vs {gate.get('target')}"
+                    for gate in failed
+                    if not within_near_miss(gate)]
+        if structural.intersection(failed_ids):
+            errors.append(message + " — an integrity failure "
+                          f"({sorted(structural.intersection(failed_ids))}) is "
+                          "never an evidence limitation")
+        elif not policy.get("single_view_reconstruction"):
+            errors.append(message)
+        elif share > NEAR_MISS_MAX_SHARE:
+            errors.append(
+                message + f" — {share:.0%} of gates failed, over the "
+                f"{NEAR_MISS_MAX_SHARE:.0%} ceiling for a documented "
+                "single-view approximation. This is a wrong reconstruction, "
+                "not depth ambiguity; fix it or report that it cannot be built")
+        elif blowouts:
+            errors.append(
+                message + " — these miss by too much to call approximate: "
+                + "; ".join(blowouts[:5]))
+        else:
             note = Path(dir_path) / "limitations.md"
             text = note.read_text() if note.is_file() else ""
             missing = [gate for gate in failed_ids if gate not in text]
@@ -325,8 +373,6 @@ def image_fit_errors(dir_path):
                 warnings.append(
                     message + "; accepted as an approximate single-view "
                     "reconstruction, documented in limitations.md")
-        else:
-            errors.append(message)
     inputs = report.get("inputs")
     if not isinstance(inputs, dict):
         errors.append("fit report has no input hashes")
@@ -670,6 +716,11 @@ def shape_signature(obj):
 # happens to fall behind other geometry.
 DETACHED_GAP_FRACTION = 0.01
 DETACHED_ISLAND_SHARE = 0.12
+# Separate objects in a scene may touch but must not occupy the same space.
+# Depth is measured by containment, so a lamp standing on a table reads ~0
+# while a lamp sunk into a sofa reads its true burial depth.
+INTERPENETRATION_FAIL = 0.10
+INTERPENETRATION_WARN = 0.03
 
 
 def connected_components(meshes, tolerance):
@@ -1052,6 +1103,27 @@ def cmd_check(args):
     for message in fit_warnings:
         warn("REFERENCE_FIT_APPROXIMATE", message)
 
+    # A camera solve that could not converge is a verdict about the model, not
+    # a formality: it says no single viewpoint explains the landmarks, so the
+    # proportions or the layout are wrong.  Proceeding on the rejected seed is
+    # how a scene with a chair facing the wrong way reaches delivery.
+    solution_path = Path(args.dir) / "camera_solution.json"
+    if solution_path.is_file():
+        try:
+            solution = json.loads(solution_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            solution = None
+        if isinstance(solution, dict):
+            rms = solution.get("rms_uv_error")
+            limit = solution.get("max_rms", CAMERA_SOLVE_MAX_RMS)
+            if isinstance(rms, (int, float)) and rms > limit:
+                failures += 1
+                fail("CAMERA_SOLVE", f"camera resection did not converge (RMS "
+                     f"{rms:.4f} vs {limit:.4f}): no single viewpoint explains "
+                     "the landmarks you read, so the fault is in proportions or "
+                     "instance layout, not the camera. Fix those and re-solve — "
+                     "do not carry on with the rejected seed")
+
     reconstruction_plan, plan_errors = load_reconstruction_plan(args.dir)
     if plan_errors:
         failures += 1
@@ -1308,6 +1380,54 @@ def cmd_check(args):
         for entry in reconstruction_plan.get("instance_arrays") or []:
             if isinstance(entry, dict) and isinstance(entry.get("pattern"), str):
                 declared_arrays.append(entry)
+    # Only objects the fit spec calls separate instances are held apart.  The
+    # sub-assemblies of one articulated body are supposed to interpenetrate at
+    # every joint, and a shoulder inside an arm socket is correct engineering.
+    scene_instances = {}
+    spec_path = Path(args.dir) / "fit_spec.json"
+    if spec_path.is_file():
+        try:
+            spec_data = json.loads(spec_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            spec_data = {}
+        for entry in (spec_data.get("instances") or []):
+            if isinstance(entry, dict) and isinstance(entry.get("pattern"), str):
+                scene_instances[str(entry.get("id"))] = entry["pattern"]
+
+    def instance_of(assembly):
+        for instance_id, pattern in scene_instances.items():
+            if fnmatch.fnmatchcase(assembly, pattern):
+                return instance_id
+        return None
+
+    allowed_overlaps = [p for p in
+                        ((reconstruction_plan or {}).get("allowed_intersections") or [])
+                        if isinstance(p, dict)]
+    clashing, grazing = [], []
+    for entry in graph.get("assembly_intersections") or []:
+        fraction = entry.get("penetration_fraction", 0.0)
+        if not isinstance(fraction, (int, float)) or fraction <= INTERPENETRATION_WARN:
+            continue
+        first, second = instance_of(entry["a"]), instance_of(entry["b"])
+        if first is None or second is None or first == second:
+            continue
+        if any({entry["a"], entry["b"]} == {allowed.get("a"), allowed.get("b")}
+               for allowed in allowed_overlaps):
+            continue
+        detail = (f"{entry['a']} and {entry['b']} overlap by "
+                  f"{entry.get('penetration_m', 0):.3f} m "
+                  f"({fraction:.0%} of the smaller object)")
+        (clashing if fraction > INTERPENETRATION_FAIL else grazing).append(detail)
+    if grazing:
+        warn("SCENE_CONTACT", "objects clip slightly: " + "; ".join(grazing[:5]))
+    if clashing:
+        failures += 1
+        fail("SCENE_INTERPENETRATION", "separate objects occupy the same space: "
+             + "; ".join(clashing[:5]) + " — resting on, leaning against, and "
+             "tucked beside all measure near zero here, so this is real burial: "
+             "move the object until it sits on the surface. Deliberate overlaps "
+             "go in reconstruction_plan.allowed_intersections")
+
     islands = connected_components(meshes, DETACHED_GAP_FRACTION * major_dim)
     if len(islands) > 1:
         detached_patterns = [p for p in

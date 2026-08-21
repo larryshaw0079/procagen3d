@@ -309,6 +309,92 @@ def shape_signature(mesh):
     }
 
 
+def assembly_intersections(dg, limit=12):
+    """Measure real interpenetration between top-level assemblies.
+
+    Bounding boxes are useless here — a side table tucked beside a sofa arm
+    overlaps boxes without the solids touching, while a lamp sunk into a sofa
+    back is a genuine fault.  So this intersects actual triangles and then
+    reports the *thickness* of the intersecting region: resting contact yields
+    a thin sheet whose smallest dimension is near zero, whereas one object
+    buried in another yields a region fat in all three directions.
+    """
+    scene = bpy.context.scene
+    roots = [obj for obj in scene.objects
+             if obj.parent is None and obj.type in ("EMPTY", "MESH")]
+    assemblies = []
+    for root in roots:
+        for child in root.children:
+            members = [child] + descendants(child)
+            meshes = [o for o in members if o.type == "MESH" and not o.hide_render]
+            if meshes:
+                assemblies.append((child.name, meshes))
+    if len(assemblies) < 2:
+        return []
+
+    trees, extents = {}, {}
+    for name, meshes in assemblies:
+        tree = bvh_from_objects(meshes, dg)
+        if tree is None:
+            continue
+        trees[name] = tree
+        lo, hi = union_bbox(meshes, dg)
+        extents[name] = min(hi[i] - lo[i] for i in range(3))
+
+    samples = {}
+    for name, meshes in assemblies:
+        if name not in trees:
+            continue
+        points = []
+        for obj in meshes:
+            evaluated = obj.evaluated_get(dg)
+            mesh = evaluated.to_mesh()
+            matrix = evaluated.matrix_world
+            points.extend(matrix @ v.co for v in mesh.vertices)
+            evaluated.to_mesh_clear()
+        stride = max(1, len(points) // 4000)
+        samples[name] = points[::stride]
+
+    def deepest_inside(points, tree):
+        """How far the deepest point sits inside a closed surface.
+
+        Sign comes from the surface normal at the nearest point, so a vertex
+        resting exactly on another surface scores ~0 while one buried in a
+        solid scores its true depth.
+        """
+        depth = 0.0
+        inside = 0
+        for point in points:
+            location, normal, _, distance = tree.find_nearest(point)
+            if location is None or distance is None:
+                continue
+            if (point - location).dot(normal) < 0.0:
+                inside += 1
+                depth = max(depth, distance)
+        return depth, inside
+
+    out = []
+    names = sorted(trees)
+    for index, first in enumerate(names):
+        for second in names[index + 1:]:
+            if not trees[first].overlap(trees[second]):
+                continue
+            depth_a, count_a = deepest_inside(samples[second], trees[first])
+            depth_b, count_b = deepest_inside(samples[first], trees[second])
+            depth = max(depth_a, depth_b)
+            reference = min(extents.get(first, 0.0), extents.get(second, 0.0))
+            out.append({
+                "a": first,
+                "b": second,
+                "points_inside": count_a + count_b,
+                "penetration_m": round(depth, 6),
+                "penetration_fraction": (round(depth / reference, 4)
+                                         if reference > 1e-9 else 0.0),
+            })
+    out.sort(key=lambda item: -item["penetration_fraction"])
+    return out[:limit]
+
+
 def descendants(obj):
     out = []
     stack = list(obj.children)
@@ -423,6 +509,13 @@ def collect_scene_graph():
             "max": [round(v, 6) for v in hi],
             "size": [round(hi[i] - lo[i], 6) for i in range(3)],
         }
+    try:
+        overlaps = assembly_intersections(dg)
+    except Exception as exc:  # diagnostics must never break a valid build
+        print(f"{WARN}:INTERSECTION_SCAN] skipped: {exc}")
+        overlaps = []
+    if overlaps:
+        graph["assembly_intersections"] = overlaps
     return graph
 
 
@@ -2507,6 +2600,7 @@ def stage_solve_camera(args):
                              if linear else None),
         "solved_camera": solved,
         "rms_uv_error": round(rms, 6),
+        "max_rms": args.max_rms,
         "residuals": {name: round(error, 6) for name, error in residuals},
     }
     (out_dir / "camera_solution.json").write_text(json.dumps(report, indent=2))

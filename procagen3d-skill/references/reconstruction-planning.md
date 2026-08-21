@@ -38,6 +38,26 @@ Estimate dimensions only after this decomposition. Measure along object axes
 or with pose-corrected ratios. Mark depth and occluded links inferred when one
 view cannot determine them.
 
+### Scenes: separate objects share a floor, not a volume
+
+When the reference holds several distinct objects, declare each as an
+`instances` entry in `fit_spec.json`. That declaration is what turns on
+`SCENE_INTERPENETRATION`, which measures how deeply one declared instance is
+buried inside another by containment rather than by bounding box. A lamp
+standing on a side table measures about 0%; a lamp sunk into a sofa back
+measures its true depth. Over 3% warns, over 10% fails.
+
+The scoping matters both ways: without instance declarations the check stays
+off, because the sub-assemblies of one articulated body are *supposed* to
+overlap — a shoulder inside its socket is correct. A deliberate overlap between
+two real instances goes in `"allowed_intersections": [{"a": ..., "b": ...}]`.
+
+Place scene objects by their contact and facing, not by nudging each until its
+projected box lands in the right place. A chair rotated 65° away from the table
+it should face keeps almost the same footprint from one camera, so the bounding
+box tells you nothing — its silhouette region and the camera solve are what
+notice.
+
 ### Everything must be joined to something
 
 `DETACHED_PARTS` treats the asset as one connected solid: any mesh island
