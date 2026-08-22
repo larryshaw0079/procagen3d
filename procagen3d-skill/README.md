@@ -1,6 +1,6 @@
 # procagen3d-skill
 
-**Version:** 0.3.0 — see the repository [update log](../README.md#update-log).
+**Version:** 0.4.0 — see the repository [update log](../README.md#update-log).
 
 An agent skill implementing **ProcAgen3D: Code-Native Generation of Programmable
 3D Assets** ([arXiv:2607.22738](https://arxiv.org/abs/2607.22738)) for
@@ -27,6 +27,8 @@ procagen3d-skill/
 │   ├── doctrine.md           # representation doctrine + canonical helpers
 │   ├── image-analysis.md     # agent-vision perception stage
 │   ├── reconstruction-planning.md # shape family, pose, complexity contract
+│   ├── character-reconstruction.md # opt-in anatomy/deformation routine
+│   ├── character-plan.example.json # reusable organic-v1 contract
 │   ├── image-fit.md          # registered camera/local-mask/pose/layout contract
 │   ├── complex-forms.md      # loft/sweep/shell routing + shape-first probe
 │   ├── detail.md             # tier floors + decomposition recipes
@@ -69,6 +71,7 @@ point the agent at `SKILL.md`.
 python3 scripts/procagen3d.py build program.py --out out/ --form-diagnostics  # curved/mixed
 python3 scripts/procagen3d.py fit out/ --spec out/fit_spec.json               # image-conditioned
 python3 scripts/procagen3d.py check out/ --tier showcase --form auto
+python3 scripts/procagen3d.py check out/ --tier showcase --subject character # organic-v1
 python3 scripts/procagen3d.py joints out/                   # articulation validation
 python3 scripts/procagen3d.py score out/ --spec spec.yaml   # constraint scoring
 python3 scripts/procagen3d.py guard old.py new.py           # repair doctrine guard
@@ -84,6 +87,13 @@ Image-conditioned runs also retain each used input at the output root as
 render/overlay, and scored masks. Image-conditioned runs use a neutral
 reconstruction probe before the full build; curved/mixed runs also add
 `form_sheet.png`.
+
+Humans, humanoids, anthropomorphic figures, and organic creatures can opt into
+the isolated `organic-v1` route with root/reconstruction-plan character domain
+tags and `character_plan.json`. Its gates replace independent-part density with
+anatomy chains, deformation layers, explicit joint-transition hosts, facial
+regions, and optional armature validation. Untagged objects and scenes remain
+on the existing route.
 
 ## Design notes
 

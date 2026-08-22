@@ -35,6 +35,23 @@ Legacy assets without a reconstruction plan keep fallback floors (standard
 Never fragment a coherent surface or inflate a repeated array merely to reach a
 number; fix missing feature groups first.
 
+The opt-in `organic-v1` character route uses a different independent-mesh
+floor because one connected body surface replaces dozens of rigid components:
+
+| tier | character complexity | mesh floor | tri floor | materials |
+|------|----------------------|-----------:|----------:|----------:|
+| standard | simple / moderate | 10 / 16 | 5k / 10k | 4 / 5 |
+| standard | complex / extreme | 24 / 32 | 18k / 26k | 6 / 7 |
+| showcase | simple / moderate | 16 / 24 | 12k / 22k | 6 / 7 |
+| showcase | complex / extreme | 36 / 48 | 40k / 60k | 8 / 10 |
+
+Characters do not use `REGION_DENSITY`'s object-centre mesh floor. They use the
+hard anatomy-chain, deformation-layer, joint-transition, facial-region, and
+optional armature contracts in `character-reconstruction.md`. Feature groups
+and occupied regions still require semantic plan coverage. A suspiciously high
+mesh-to-feature ratio emits `CHARACTER_FRAGMENTATION`; it never earns quality
+credit.
+
 Global counts are the weakest possible detail signal — 260 meshes says nothing
 about *where* they are, and a complex object hits that number easily while its
 identity regions stay empty. The binding constraint is `REGION_DENSITY`, which

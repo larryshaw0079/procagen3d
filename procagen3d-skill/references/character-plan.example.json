@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "archetype": "humanoid",
+  "coverage": "full-body",
+  "body_strategy": "continuous-skin",
+  "rig_strategy": "segmented",
+  "expected_eye_count": 2,
+  "proportion_landmarks": [
+    {"id": "head_top", "pattern": "Fit_HeadTop", "role": "head_top", "side": "center"},
+    {"id": "chin", "pattern": "Fit_Chin", "role": "chin", "side": "center"},
+    {"id": "neck", "pattern": "Fit_Neck", "role": "neck", "side": "center"},
+    {"id": "pelvis", "pattern": "Fit_Pelvis", "role": "pelvis", "side": "center"},
+    {"id": "shoulder_left", "pattern": "Fit_Shoulder_Left", "role": "shoulder", "side": "left"},
+    {"id": "elbow_left", "pattern": "Fit_Elbow_Left", "role": "elbow", "side": "left"},
+    {"id": "wrist_left", "pattern": "Fit_Wrist_Left", "role": "wrist", "side": "left"},
+    {"id": "shoulder_right", "pattern": "Fit_Shoulder_Right", "role": "shoulder", "side": "right"},
+    {"id": "elbow_right", "pattern": "Fit_Elbow_Right", "role": "elbow", "side": "right"},
+    {"id": "wrist_right", "pattern": "Fit_Wrist_Right", "role": "wrist", "side": "right"},
+    {"id": "hip_left", "pattern": "Fit_Hip_Left", "role": "hip", "side": "left"},
+    {"id": "knee_left", "pattern": "Fit_Knee_Left", "role": "knee", "side": "left"},
+    {"id": "ankle_left", "pattern": "Fit_Ankle_Left", "role": "ankle", "side": "left"},
+    {"id": "hip_right", "pattern": "Fit_Hip_Right", "role": "hip", "side": "right"},
+    {"id": "knee_right", "pattern": "Fit_Knee_Right", "role": "knee", "side": "right"},
+    {"id": "ankle_right", "pattern": "Fit_Ankle_Right", "role": "ankle", "side": "right"}
+  ],
+  "proportion_system": {
+    "height_heads": 7.5,
+    "source": "reference",
+    "head_landmarks": ["head_top", "chin"]
+  },
+  "anatomy_chains": [
+    {"id": "spine", "kind": "spine", "side": "center", "landmarks": ["pelvis", "neck", "chin", "head_top"]},
+    {"id": "arm_left", "kind": "arm", "side": "left", "landmarks": ["shoulder_left", "elbow_left", "wrist_left"]},
+    {"id": "arm_right", "kind": "arm", "side": "right", "landmarks": ["shoulder_right", "elbow_right", "wrist_right"]},
+    {"id": "leg_left", "kind": "leg", "side": "left", "landmarks": ["hip_left", "knee_left", "ankle_left"]},
+    {"id": "leg_right", "kind": "leg", "side": "right", "landmarks": ["hip_right", "knee_right", "ankle_right"]}
+  ],
+  "deformation_layers": [
+    {"id": "body_core", "layer": "core_volume", "pattern": "BodyCore", "construction": "implicit-union", "crosses_joints": true},
+    {"id": "shirt_shell", "layer": "cross_joint_shell", "pattern": "ShirtShell", "construction": "offset-shell", "crosses_joints": true},
+    {"id": "belt_hardware", "layer": "rigid_attachment", "pattern": "BeltHardware_*", "construction": "rigid-parent", "crosses_joints": false}
+  ],
+  "joint_transitions": [
+    {"id": "neck_center", "joint": "neck", "side": "center", "mode": "continuous", "host_pattern": "BodyCore", "connects": ["BodyCore", "BodyCore"]},
+    {"id": "shoulder_left", "joint": "shoulder", "side": "left", "mode": "continuous", "host_pattern": "BodyCore", "connects": ["BodyCore", "BodyCore"]},
+    {"id": "shoulder_right", "joint": "shoulder", "side": "right", "mode": "continuous", "host_pattern": "BodyCore", "connects": ["BodyCore", "BodyCore"]},
+    {"id": "elbow_left", "joint": "elbow", "side": "left", "mode": "continuous", "host_pattern": "BodyCore", "connects": ["BodyCore", "BodyCore"]},
+    {"id": "elbow_right", "joint": "elbow", "side": "right", "mode": "continuous", "host_pattern": "BodyCore", "connects": ["BodyCore", "BodyCore"]},
+    {"id": "hip_left", "joint": "hip", "side": "left", "mode": "continuous", "host_pattern": "BodyCore", "connects": ["BodyCore", "BodyCore"]},
+    {"id": "hip_right", "joint": "hip", "side": "right", "mode": "continuous", "host_pattern": "BodyCore", "connects": ["BodyCore", "BodyCore"]},
+    {"id": "knee_left", "joint": "knee", "side": "left", "mode": "continuous", "host_pattern": "BodyCore", "connects": ["BodyCore", "BodyCore"]},
+    {"id": "knee_right", "joint": "knee", "side": "right", "mode": "continuous", "host_pattern": "BodyCore", "connects": ["BodyCore", "BodyCore"]}
+  ],
+  "facial_regions": [
+    {"id": "cranium", "kind": "cranium", "pattern": "BodyCore"},
+    {"id": "eyes", "kind": "eye", "pattern": "Eye_*"},
+    {"id": "nose_or_muzzle", "kind": "nose-muzzle", "pattern": "NoseOrMuzzle"},
+    {"id": "mouth_and_jaw", "kind": "mouth-jaw", "pattern": "MouthJaw"}
+  ]
+}

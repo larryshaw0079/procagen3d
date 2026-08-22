@@ -9,7 +9,8 @@ Subcommands:
     build      <program.py> --out DIR    build, export GLB, render views
     render     <dir>                     re-render canonical views
     fit        <dir> --spec FILE         registered image/pose-fit gates
-    check      <dir>                     deterministic scene-graph gates
+    check      <dir>                     deterministic scene-graph gates;
+                                          opt-in character contract
     joints     <dir>                     validate articulation (Blender)
     score      <dir> --spec FILE         measure constraints against spec
     guard      <old.py> <new.py>         doctrine guard for repair iterations
@@ -148,6 +149,14 @@ def cmd_build(args):
     kept = out / "program.py"
     if program.resolve() != kept.resolve():
         shutil.copyfile(program, kept)
+    # Character reconstruction is deliberately a sidecar contract.  Copy it
+    # when callers build into a sibling directory, just as the executable
+    # program itself is copied, without making it part of the generic route.
+    character_plan = program.parent / "character_plan.json"
+    kept_character_plan = out / "character_plan.json"
+    if (character_plan.is_file()
+            and character_plan.resolve() != kept_character_plan.resolve()):
+        shutil.copyfile(character_plan, kept_character_plan)
     stage = ["build", "--program", str(program), "--out", str(out),
              "--size", str(args.size), "--engine", args.engine]
     if args.no_render:
@@ -502,6 +511,501 @@ MIN_OCCUPIED_REGIONS = {
     "extreme": 6,
 }
 
+# The character path is opt-in.  Generic objects and scenes keep every legacy
+# threshold and gate; only a declared character switches to this contract.
+SUBJECT_DOMAINS = {"object", "scene", "character"}
+CHARACTER_ARCHETYPES = {"humanoid", "anthropomorphic", "creature"}
+CHARACTER_COVERAGE = {"full-body", "upper-body", "head-only"}
+CHARACTER_BODY_STRATEGIES = {"continuous-skin", "hybrid-skin"}
+CHARACTER_RIG_STRATEGIES = {"skinned", "segmented"}
+CHARACTER_SIDES = {"left", "right", "center", "none"}
+CHARACTER_CHAIN_KINDS = {"spine", "arm", "leg", "tail", "wing", "ear", "other"}
+CHARACTER_LAYERS = {
+    "core_volume",
+    "deformable_appendage",
+    "cross_joint_shell",
+    "rigid_attachment",
+    "surface_detail",
+}
+CHARACTER_LAYER_CONSTRUCTIONS = {
+    "core_volume": {
+        "implicit-union", "connected-loft", "subdivision-cage",
+        "sculpted-surface",
+    },
+    "deformable_appendage": {
+        "skinned-sweep", "connected-loft", "subdivision-cage",
+        "sculpted-surface",
+    },
+    "cross_joint_shell": {"offset-shell", "loft-shell", "cloth-shell"},
+    "rigid_attachment": {
+        "single-bone", "rigid-parent", "primitive", "profile-extrude",
+    },
+    "surface_detail": {"relief", "decal", "geometry"},
+}
+CHARACTER_TRANSITION_MODES = {"continuous", "bridge", "covered", "mechanical"}
+CHARACTER_FACE_KINDS = {
+    "cranium", "eye", "brow", "nose-muzzle", "mouth-jaw", "ear", "hair",
+}
+# Characters should spend topology inside a few coherent surfaces.  The
+# generic 260/420-mesh showcase floors actively reward bead-like anatomy, so
+# the character path keeps triangle/material sanity floors while lowering the
+# independent-object floor.  The generic table above remains unchanged.
+CHARACTER_ADAPTIVE_DETAIL_FLOORS = {
+    "standard": {
+        "simple": (10, 5000, 4),
+        "moderate": (16, 10000, 5),
+        "complex": (24, 18000, 6),
+        "extreme": (32, 26000, 7),
+    },
+    "showcase": {
+        "simple": (16, 12000, 6),
+        "moderate": (24, 22000, 7),
+        "complex": (36, 40000, 8),
+        "extreme": (48, 60000, 10),
+    },
+}
+
+
+def adaptive_detail_floor(tier, complexity_class, subject_domain="object"):
+    """Return a route-specific floor without mutating the generic policy."""
+    table = (CHARACTER_ADAPTIVE_DETAIL_FLOORS
+             if subject_domain == "character" else ADAPTIVE_DETAIL_FLOORS)
+    return table[tier][complexity_class]
+
+
+def _string_list(value, minimum=1):
+    return (isinstance(value, list) and len(value) >= minimum
+            and all(isinstance(item, str) and item.strip() for item in value))
+
+
+def load_character_plan(dir_path, required=False):
+    """Load and schema-check the opt-in organic character contract."""
+    path = Path(dir_path) / "character_plan.json"
+    if not path.is_file():
+        return None, (["character_plan.json missing"] if required else [])
+    try:
+        plan = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, [f"invalid character_plan.json: {exc}"]
+    if not isinstance(plan, dict):
+        return None, ["character plan must be a JSON object"]
+
+    errors = []
+    if plan.get("version") != 1:
+        errors.append("character plan must have version: 1")
+    archetype = plan.get("archetype")
+    coverage = plan.get("coverage")
+    if archetype not in CHARACTER_ARCHETYPES:
+        errors.append("archetype must be humanoid, anthropomorphic, or creature")
+    if coverage not in CHARACTER_COVERAGE:
+        errors.append("coverage must be full-body, upper-body, or head-only")
+    if plan.get("body_strategy") not in CHARACTER_BODY_STRATEGIES:
+        errors.append("body_strategy must be continuous-skin or hybrid-skin")
+    if plan.get("rig_strategy") not in CHARACTER_RIG_STRATEGIES:
+        errors.append("rig_strategy must be skinned or segmented")
+
+    landmarks = plan.get("proportion_landmarks")
+    landmark_ids = set()
+    minimum_landmarks = {"head-only": 4, "upper-body": 8, "full-body": 12}.get(
+        coverage, 4)
+    if not isinstance(landmarks, list) or len(landmarks) < minimum_landmarks:
+        errors.append(f"proportion_landmarks needs at least {minimum_landmarks} entries")
+        landmarks = []
+    for index, entry in enumerate(landmarks):
+        if not isinstance(entry, dict):
+            errors.append(f"proportion_landmarks[{index}] must be an object")
+            continue
+        landmark_id = entry.get("id")
+        pattern = entry.get("pattern")
+        role = entry.get("role")
+        side = entry.get("side", "center")
+        if (not isinstance(landmark_id, str) or not landmark_id.strip()
+                or not isinstance(pattern, str) or not pattern.strip()
+                or not isinstance(role, str) or not role.strip()
+                or side not in CHARACTER_SIDES):
+            errors.append(
+                f"proportion_landmarks[{index}] needs non-empty id/pattern/role "
+                "and side left, right, center, or none")
+            continue
+        if landmark_id in landmark_ids:
+            errors.append(f"duplicate proportion landmark id: {landmark_id}")
+        landmark_ids.add(landmark_id)
+
+    proportion_system = plan.get("proportion_system")
+    if not isinstance(proportion_system, dict):
+        errors.append("proportion_system must be an object")
+    else:
+        height_heads = proportion_system.get("height_heads")
+        source = proportion_system.get("source")
+        head_landmarks = proportion_system.get("head_landmarks")
+        if (not isinstance(height_heads, (int, float))
+                or isinstance(height_heads, bool)
+                or not 1.5 <= height_heads <= 12.0):
+            errors.append("proportion_system.height_heads must be between 1.5 and 12")
+        if source not in {"reference", "canonical", "hybrid"}:
+            errors.append("proportion_system.source must be reference, canonical, or hybrid")
+        if not _string_list(head_landmarks, 2) or len(head_landmarks) != 2:
+            errors.append("proportion_system.head_landmarks needs exactly two landmark ids")
+        else:
+            missing = [item for item in head_landmarks if item not in landmark_ids]
+            if missing:
+                errors.append("proportion_system.head_landmarks references "
+                              f"undeclared landmarks: {missing}")
+
+    chains = plan.get("anatomy_chains")
+    chain_semantics = set()
+    chain_ids = set()
+    if not isinstance(chains, list) or not chains:
+        errors.append("anatomy_chains must be a non-empty list")
+        chains = []
+    for index, entry in enumerate(chains):
+        if not isinstance(entry, dict):
+            errors.append(f"anatomy_chains[{index}] must be an object")
+            continue
+        chain_id = entry.get("id")
+        kind = entry.get("kind")
+        side = entry.get("side", "center")
+        members = entry.get("landmarks")
+        if (not isinstance(chain_id, str) or not chain_id.strip()
+                or kind not in CHARACTER_CHAIN_KINDS
+                or side not in CHARACTER_SIDES
+                or not _string_list(members, 2)):
+            errors.append(
+                f"anatomy_chains[{index}] needs id, valid kind/side, and at "
+                "least two landmark ids")
+            continue
+        missing = [item for item in members if item not in landmark_ids]
+        if missing:
+            errors.append(f"anatomy chain {chain_id} references undeclared "
+                          f"landmarks: {missing}")
+        if chain_id in chain_ids:
+            errors.append(f"duplicate anatomy chain id: {chain_id}")
+        chain_ids.add(chain_id)
+        chain_semantics.add((kind, side))
+
+    if archetype in {"humanoid", "anthropomorphic"}:
+        required_chains = {("spine", "center")}
+        if coverage in {"upper-body", "full-body"}:
+            required_chains.update({("arm", "left"), ("arm", "right")})
+        if coverage == "full-body":
+            required_chains.update({("leg", "left"), ("leg", "right")})
+        missing = sorted(required_chains - chain_semantics)
+        if missing:
+            errors.append(f"missing humanoid anatomy chains: {missing}")
+
+    layers = plan.get("deformation_layers")
+    layer_ids = set()
+    core_crosses_joint = False
+    if not isinstance(layers, list) or not layers:
+        errors.append("deformation_layers must be a non-empty list")
+        layers = []
+    for index, entry in enumerate(layers):
+        if not isinstance(entry, dict):
+            errors.append(f"deformation_layers[{index}] must be an object")
+            continue
+        layer_id = entry.get("id")
+        layer = entry.get("layer")
+        pattern = entry.get("pattern")
+        construction = entry.get("construction")
+        crosses = entry.get("crosses_joints")
+        if (not isinstance(layer_id, str) or not layer_id.strip()
+                or not isinstance(pattern, str) or not pattern.strip()
+                or layer not in CHARACTER_LAYERS
+                or construction not in CHARACTER_LAYER_CONSTRUCTIONS.get(layer, set())
+                or not isinstance(crosses, bool)):
+            errors.append(
+                f"deformation_layers[{index}] needs id/pattern, a compatible "
+                "layer/construction pair, and boolean crosses_joints")
+            continue
+        if layer_id in layer_ids:
+            errors.append(f"duplicate deformation layer id: {layer_id}")
+        layer_ids.add(layer_id)
+        if layer == "rigid_attachment" and crosses:
+            errors.append(f"{layer_id}: rigid_attachment cannot cross joints")
+        if layer == "cross_joint_shell" and not crosses:
+            errors.append(f"{layer_id}: cross_joint_shell must cross a joint")
+        if layer == "core_volume" and crosses:
+            core_crosses_joint = True
+    if not any(isinstance(entry, dict) and entry.get("layer") == "core_volume"
+               for entry in layers):
+        errors.append("deformation_layers needs at least one core_volume")
+    if coverage != "head-only" and not core_crosses_joint:
+        errors.append("a body character needs a core_volume that crosses joints")
+
+    transitions = plan.get("joint_transitions")
+    transition_semantics = set()
+    transition_ids = set()
+    if not isinstance(transitions, list) or not transitions:
+        errors.append("joint_transitions must be a non-empty list")
+        transitions = []
+    for index, entry in enumerate(transitions):
+        if not isinstance(entry, dict):
+            errors.append(f"joint_transitions[{index}] must be an object")
+            continue
+        transition_id = entry.get("id")
+        joint = entry.get("joint")
+        side = entry.get("side", "center")
+        mode = entry.get("mode")
+        host = entry.get("host_pattern")
+        connects = entry.get("connects")
+        if (not isinstance(transition_id, str) or not transition_id.strip()
+                or not isinstance(joint, str) or not joint.strip()
+                or side not in CHARACTER_SIDES
+                or mode not in CHARACTER_TRANSITION_MODES
+                or not isinstance(host, str) or not host.strip()
+                or not _string_list(connects, 2) or len(connects) != 2):
+            errors.append(
+                f"joint_transitions[{index}] needs id/joint/side/mode, a host "
+                "pattern, and exactly two connected mesh patterns")
+            continue
+        transition_semantics.add((joint, side))
+        if transition_id in transition_ids:
+            errors.append(f"duplicate joint transition id: {transition_id}")
+        transition_ids.add(transition_id)
+        if (mode == "mechanical" and plan.get("body_strategy") != "hybrid-skin"):
+            errors.append(f"{transition_id}: mechanical transition requires "
+                          "body_strategy hybrid-skin")
+
+    if archetype in {"humanoid", "anthropomorphic"}:
+        required_transitions = set()
+        if coverage in {"upper-body", "full-body"}:
+            required_transitions.update({
+                ("neck", "center"),
+                ("shoulder", "left"), ("shoulder", "right"),
+                ("elbow", "left"), ("elbow", "right"),
+            })
+        if coverage == "full-body":
+            required_transitions.update({
+                ("hip", "left"), ("hip", "right"),
+                ("knee", "left"), ("knee", "right"),
+            })
+        missing = sorted(required_transitions - transition_semantics)
+        if missing:
+            errors.append(f"missing humanoid joint transitions: {missing}")
+
+    face_regions = plan.get("facial_regions")
+    face_kinds = []
+    face_ids = set()
+    if not isinstance(face_regions, list) or not face_regions:
+        errors.append("facial_regions must be a non-empty list")
+        face_regions = []
+    for index, entry in enumerate(face_regions):
+        if (not isinstance(entry, dict)
+                or not isinstance(entry.get("id"), str)
+                or not entry.get("id", "").strip()
+                or entry.get("kind") not in CHARACTER_FACE_KINDS
+                or not isinstance(entry.get("pattern"), str)
+                or not entry.get("pattern", "").strip()):
+            errors.append(f"facial_regions[{index}] needs id, valid kind, and pattern")
+            continue
+        if entry["id"] in face_ids:
+            errors.append(f"duplicate facial region id: {entry['id']}")
+        face_ids.add(entry["id"])
+        face_kinds.append(entry["kind"])
+    required_face = {"cranium", "eye", "nose-muzzle", "mouth-jaw"}
+    missing_face = sorted(required_face - set(face_kinds))
+    if missing_face:
+        errors.append(f"missing facial region kinds: {missing_face}")
+    expected_eye_count = plan.get("expected_eye_count", 2)
+    if (not isinstance(expected_eye_count, int) or isinstance(expected_eye_count, bool)
+            or not 1 <= expected_eye_count <= 8):
+        errors.append("expected_eye_count must be an integer from 1 to 8")
+
+    return plan, errors
+
+
+def resolve_subject_domain(root_objs, reconstruction_plan, requested="auto"):
+    """Resolve the isolated subject route and report declaration conflicts."""
+    errors = []
+    root_values = [form_prop(obj, "procagen3d_subject_domain") for obj in root_objs]
+    root_values = [value for value in root_values if value is not None]
+    invalid = [value for value in root_values if value not in SUBJECT_DOMAINS]
+    root_domains = {value for value in root_values if value in SUBJECT_DOMAINS}
+    if invalid or len(root_domains) > 1:
+        errors.append(f"invalid/conflicting root subject domains: {root_values}")
+    root_domain = next(iter(root_domains)) if len(root_domains) == 1 else None
+    plan_domain = (reconstruction_plan or {}).get("subject_domain")
+    if plan_domain is not None and plan_domain not in SUBJECT_DOMAINS:
+        errors.append(f"invalid reconstruction_plan subject_domain: {plan_domain!r}")
+        plan_domain = None
+    if root_domain and plan_domain and root_domain != plan_domain:
+        errors.append(f"root subject domain {root_domain!r} conflicts with "
+                      f"reconstruction_plan {plan_domain!r}")
+    declared = root_domain or plan_domain
+    if requested != "auto" and declared and requested != declared:
+        errors.append(f"CLI --subject {requested} conflicts with declared "
+                      f"subject domain {declared}")
+    domain = requested if requested != "auto" else (declared or "object")
+    return domain, errors
+
+
+def _tag_values(value):
+    if isinstance(value, str):
+        return {item.strip() for item in value.split(",") if item.strip()}
+    if isinstance(value, (list, tuple)):
+        return {str(item) for item in value}
+    return set()
+
+
+def _boxes_touch(first, second, tolerance):
+    lo_a, hi_a = first.get("bbox_world_min"), first.get("bbox_world_max")
+    lo_b, hi_b = second.get("bbox_world_min"), second.get("bbox_world_max")
+    if not all(isinstance(value, list) and len(value) >= 3
+               for value in (lo_a, hi_a, lo_b, hi_b)):
+        return False
+    return all(lo_a[i] - hi_b[i] <= tolerance
+               and lo_b[i] - hi_a[i] <= tolerance for i in range(3))
+
+
+def character_contract_failures(graph, plan, fit_spec=None):
+    """Validate character semantics against emitted scene geometry."""
+    failures = []
+    objs = graph.get("objects") or []
+    meshes = [obj for obj in objs if obj.get("type") == "MESH"]
+    roots = set(graph.get("roots") or [])
+    root_objs = [obj for obj in objs if obj.get("name") in roots]
+    if not root_objs:
+        root_objs = [obj for obj in objs if obj.get("parent") is None]
+    routines = {form_prop(obj, "procagen3d_character_routine")
+                for obj in root_objs
+                if form_prop(obj, "procagen3d_character_routine") is not None}
+    domains = {form_prop(obj, "procagen3d_subject_domain")
+               for obj in root_objs
+               if form_prop(obj, "procagen3d_subject_domain") is not None}
+    if routines != {"organic-v1"} or domains != {"character"}:
+        failures.append((
+            "CHARACTER_ROUTE",
+            "character root must declare procagen3d_subject_domain='character' "
+            "and procagen3d_character_routine='organic-v1'",
+        ))
+
+    fit_landmarks = set()
+    fit_chains = set()
+    if isinstance(fit_spec, dict):
+        fit_landmarks = {entry.get("id") for entry in fit_spec.get("landmarks") or []
+                         if isinstance(entry, dict)}
+        pose = fit_spec.get("pose") or {}
+        fit_chains = {entry.get("id") for entry in pose.get("chains") or []
+                      if isinstance(entry, dict)}
+
+    landmark_errors = []
+    for entry in plan.get("proportion_landmarks") or []:
+        matches = [obj for obj in objs
+                   if fnmatch.fnmatchcase(obj.get("name", ""), entry["pattern"])]
+        if not matches:
+            landmark_errors.append(f"{entry['id']} ({entry['pattern']}) matches nothing")
+        if fit_landmarks and entry["id"] not in fit_landmarks:
+            landmark_errors.append(f"{entry['id']} is absent from fit_spec landmarks")
+    for chain in plan.get("anatomy_chains") or []:
+        if (fit_chains and chain.get("kind") not in {"spine", "ear", "other"}
+                and chain["id"] not in fit_chains):
+            landmark_errors.append(f"anatomy chain {chain['id']} is absent from "
+                                   "fit_spec pose.chains")
+    if landmark_errors:
+        failures.append(("CHARACTER_ANATOMY", "; ".join(landmark_errors[:12])))
+
+    layer_errors = []
+    core_meshes = set()
+    for entry in plan.get("deformation_layers") or []:
+        matches = [obj for obj in meshes
+                   if fnmatch.fnmatchcase(obj.get("name", ""), entry["pattern"])]
+        if not matches:
+            layer_errors.append(f"{entry['id']} pattern {entry['pattern']!r} "
+                                "matches no mesh")
+            continue
+        wrong = [obj["name"] for obj in matches
+                 if form_prop(obj, "procagen3d_character_layer") != entry["layer"]]
+        if wrong:
+            layer_errors.append(f"{entry['id']} has wrong/missing layer tags: "
+                                f"{wrong[:6]}")
+        wrong_construction = [
+            obj["name"] for obj in matches
+            if form_prop(obj, "procagen3d_character_construction")
+            != entry["construction"]
+        ]
+        if wrong_construction:
+            layer_errors.append(
+                f"{entry['id']} has wrong/missing character construction tags: "
+                f"{wrong_construction[:6]}")
+        if entry["layer"] == "core_volume":
+            core_meshes.update(obj["name"] for obj in matches)
+    if len(core_meshes) > 24:
+        layer_errors.append(f"core body is fragmented across {len(core_meshes)} "
+                            "meshes (limit 24); fuse or bridge the organic envelope")
+    if layer_errors:
+        failures.append(("CHARACTER_LAYERS", "; ".join(layer_errors[:12])))
+
+    major = max((value for value in graph.get("world_bbox", {}).get("size", [])
+                 if isinstance(value, (int, float))), default=1.0)
+    tolerance = 0.01 * major
+    transition_errors = []
+    for entry in plan.get("joint_transitions") or []:
+        hosts = [obj for obj in meshes
+                 if fnmatch.fnmatchcase(obj.get("name", ""), entry["host_pattern"])]
+        sides = [
+            [obj for obj in meshes
+             if fnmatch.fnmatchcase(obj.get("name", ""), pattern)]
+            for pattern in entry["connects"]
+        ]
+        if not hosts:
+            transition_errors.append(f"{entry['id']} host pattern matches no mesh")
+            continue
+        if any(not members for members in sides):
+            transition_errors.append(f"{entry['id']} connected patterns do not "
+                                     "both match meshes")
+            continue
+        tagged_hosts = [obj for obj in hosts if entry["id"] in _tag_values(
+            form_prop(obj, "procagen3d_character_transitions"))]
+        if not tagged_hosts:
+            transition_errors.append(f"{entry['id']} host lacks its "
+                                     "procagen3d_character_transitions tag")
+            continue
+        allowed_host_layers = {
+            "continuous": {"core_volume", "deformable_appendage"},
+            "bridge": {"core_volume", "deformable_appendage"},
+            "covered": {"cross_joint_shell"},
+            "mechanical": {"rigid_attachment"},
+        }[entry["mode"]]
+        wrong_layers = [
+            obj["name"] for obj in tagged_hosts
+            if form_prop(obj, "procagen3d_character_layer") not in allowed_host_layers
+        ]
+        if wrong_layers:
+            transition_errors.append(
+                f"{entry['id']} {entry['mode']} host has incompatible layer: "
+                f"{wrong_layers[:6]}")
+            continue
+        for side_index, members in enumerate(sides):
+            if not any(_boxes_touch(host, member, tolerance)
+                       for host in tagged_hosts for member in members):
+                transition_errors.append(
+                    f"{entry['id']} host does not touch connected side "
+                    f"{side_index + 1} within {tolerance:.4g} m")
+    if transition_errors:
+        failures.append(("CHARACTER_TRANSITIONS", "; ".join(transition_errors[:12])))
+
+    face_errors = []
+    face_counts = {}
+    for entry in plan.get("facial_regions") or []:
+        count = sum(1 for obj in meshes
+                    if fnmatch.fnmatchcase(obj.get("name", ""), entry["pattern"]))
+        face_counts[entry["kind"]] = face_counts.get(entry["kind"], 0) + count
+        if count == 0:
+            face_errors.append(f"{entry['id']} ({entry['pattern']}) matches no mesh")
+    expected_eyes = plan.get("expected_eye_count", 2)
+    if face_counts.get("eye", 0) < expected_eyes:
+        face_errors.append("facial eye regions expose "
+                           f"{face_counts.get('eye', 0)}/{expected_eyes} eye meshes")
+    if face_errors:
+        failures.append(("CHARACTER_FACE", "; ".join(face_errors[:10])))
+
+    if plan.get("rig_strategy") == "skinned":
+        if not any(obj.get("type") == "ARMATURE" for obj in objs):
+            failures.append(("CHARACTER_RIG", "rig_strategy is skinned but the "
+                             "scene graph contains no ARMATURE"))
+
+    return failures
+
 
 def load_reconstruction_plan(dir_path):
     """Load the v2 image-reconstruction contract, when present/required."""
@@ -529,6 +1033,9 @@ def load_reconstruction_plan(dir_path):
         return None, ["reconstruction plan must be a JSON object"]
     if plan.get("version") != 1:
         errors.append("reconstruction plan must be a JSON object with version: 1")
+    subject_domain = plan.get("subject_domain")
+    if subject_domain is not None and subject_domain not in SUBJECT_DOMAINS:
+        errors.append("subject_domain must be object, scene, or character when present")
     complexity = plan.get("complexity")
     if not isinstance(complexity, dict):
         errors.append("complexity must be an object")
@@ -1172,6 +1679,40 @@ def cmd_check(args):
     if not meshes:
         fail("NO_MESHES", "scene contains no mesh objects")
         return 1
+
+    subject_domain, subject_errors = resolve_subject_domain(
+        root_objs, reconstruction_plan, getattr(args, "subject", "auto"))
+    if subject_errors:
+        failures += 1
+        fail("SUBJECT_DOMAIN", "; ".join(subject_errors))
+    if (subject_domain == "character" and reconstruction_plan is not None
+            and reconstruction_plan.get("subject_domain") != "character"):
+        failures += 1
+        fail("CHARACTER_ROUTE", "image reconstruction plans on the character "
+             "route must declare subject_domain='character'")
+
+    character_plan, character_plan_errors = load_character_plan(
+        args.dir, required=subject_domain == "character")
+    if character_plan_errors:
+        failures += 1
+        fail("CHARACTER_PLAN", "; ".join(character_plan_errors))
+    if character_plan is not None and subject_domain != "character":
+        failures += 1
+        fail("CHARACTER_ROUTE", "character_plan.json is present but the root, "
+             "reconstruction plan, or --subject option does not select the "
+             "character route")
+    if subject_domain == "character" and character_plan is not None \
+            and not character_plan_errors:
+        fit_spec_path = Path(args.dir) / "fit_spec.json"
+        try:
+            character_fit_spec = (json.loads(fit_spec_path.read_text())
+                                  if fit_spec_path.is_file() else None)
+        except (OSError, json.JSONDecodeError):
+            character_fit_spec = None
+        for tag, message in character_contract_failures(
+                graph, character_plan, character_fit_spec):
+            failures += 1
+            fail(tag, message)
 
     bad_names = [o["name"] for o in objs if DEFAULT_NAME_RE.match(o["name"])]
     if bad_names:
@@ -1970,7 +2511,7 @@ def cmd_check(args):
         # named after the plan; this counts the meshes that physically occupy
         # each declared region, so an empty torso cannot be paid for with two
         # hundred panel slivers somewhere else.
-        if args.tier != "quick":
+        if args.tier != "quick" and subject_domain != "character":
             occupancy = region_occupancy(graph, meshes)
             floor = REGION_MESH_FLOOR[complexity_class]
             sparse = [f"{region} has {occupancy.get(region, 0)} meshes"
@@ -1990,11 +2531,26 @@ def cmd_check(args):
             fail("DETAIL_IDENTITY", f"{complexity_class} plan needs at least "
                  f"{identity_minimum} identity feature groups; found {identity_count}")
 
-    floors = {"standard": (40, 8000, 6), "showcase": (150, 25000, 12)}
+        if subject_domain == "character":
+            # This is diagnostic rather than a quota: character identity lives
+            # in coherent surfaces and transitions, so a very high object/group
+            # ratio usually means the generic decomposition ladder leaked into
+            # the organic body as beads, rivets, or strand fragments.
+            fragmentation_ceiling = max(160, visible_feature_count * 8)
+            if len(meshes) > fragmentation_ceiling:
+                warn("CHARACTER_FRAGMENTATION", f"{len(meshes)} meshes for "
+                     f"{visible_feature_count} visible feature groups exceeds "
+                     f"the diagnostic ceiling {fragmentation_ceiling}; do not "
+                     "pay for character detail by splitting the body envelope")
+
+    floors = ({"standard": (16, 10000, 5), "showcase": (36, 40000, 8)}
+              if subject_domain == "character"
+              else {"standard": (40, 8000, 6), "showcase": (150, 25000, 12)})
     if complexity_class is not None and args.tier in ADAPTIVE_DETAIL_FLOORS:
         floors = {
             **floors,
-            args.tier: ADAPTIVE_DETAIL_FLOORS[args.tier][complexity_class],
+            args.tier: adaptive_detail_floor(
+                args.tier, complexity_class, subject_domain),
         }
     if args.tier in floors:
         mesh_floor, tri_floor, mat_floor = floors[args.tier]
@@ -2483,6 +3039,10 @@ def main():
     p.add_argument("--form", choices=["auto", "rectilinear", "curved", "mixed"],
                    default="auto",
                    help="primary-form profile (references/complex-forms.md)")
+    p.add_argument("--subject", choices=["auto", "object", "scene", "character"],
+                   default="auto",
+                   help="subject route; character enables character_plan.json "
+                        "anatomy/deformation/transition gates")
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("joints", help="validate articulation")

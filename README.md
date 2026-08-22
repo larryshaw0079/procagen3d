@@ -1,6 +1,6 @@
 # ProcAgen3D
 
-**Version:** 0.3.0
+**Version:** 0.4.0
 
 Code-native generation of programmable 3D assets, implemented as an agent
 skill for Claude Code, Codex, and compatible runtimes.
@@ -214,6 +214,22 @@ procagen3d/
 ## Update log
 
 Entries are newest first.
+
+### 0.4.0 — 2026-08-23
+
+- Added the opt-in `organic-v1` character/humanoid route with an anatomy-first
+  probe, deformation-layer decomposition, explicit major-joint transitions,
+  facial-region planning, and optional armature enforcement.
+- Added `character_plan.json`, root/plan subject-domain routing, and
+  `check --subject character` gates for anatomy markers and chains, connected
+  transition hosts, character mesh layers, facial coverage, and skinned rigs.
+- Replaced object-style 260/420 independent-mesh pressure on characters with
+  character-specific topology/triangle/material floors and a fragmentation
+  diagnostic. Object and scene floors and region-density behavior are
+  unchanged.
+- Added a reusable character plan example and an eleven-test regression suite
+  covering schema, connected character contracts, and preservation of generic
+  thresholds.
 
 ### 0.3.0 — 2026-08-21
 

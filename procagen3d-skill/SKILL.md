@@ -48,12 +48,20 @@ is delivered as approximate. Image-conditioned assets also contain `priors.md`,
 registered `reference_match.png` and `reference_overlay.png`, scored
 reference/render masks, and an
 unaltered copy of every reference image used, named `reference_01.<ext>`,
-`reference_02.<ext>`, etc. in input order.
+`reference_02.<ext>`, etc. in input order. Character-route assets additionally
+contain `character_plan.json`.
 
 ## The Loop
 
 **0 — Intake.** Classify the request: text-only or image-conditioned; new
 asset or edit of an existing ProcAgen3D asset (edit → see Local edits below).
+Classify the **subject domain** as `object | scene | character`. Humans,
+humanoids, anthropomorphic figures, and organic creatures use `character`;
+rigid robots/mecha remain `object` unless visible anatomy genuinely deforms.
+Character work MUST read `references/character-reconstruction.md`, set
+`reconstruction_plan.subject_domain = "character"`, and author
+`character_plan.json` before code. The route is opt-in; object/scene behavior
+and thresholds do not change.
 Declare the **detail tier** (`quick | standard | showcase`, see
 `references/detail.md`): image-conditioned replication and any
 "detailed/realistic" ask default to **showcase**; standard and above MUST
@@ -107,7 +115,11 @@ complexity class, not object category, LOC, or repeated-instance totals. First
 program of a session: MUST read
 `references/doctrine.md` completely. Keep `references/blender-pitfalls.md`
 at hand while writing bpy code — the traps in it are all from real
-failures. For every image-conditioned macro/meso mass, add a table with
+failures. Character plans decompose geometry by deformation layer
+(`core_volume`, `deformable_appendage`, `cross_joint_shell`,
+`rigid_attachment`, `surface_detail`) and explicitly plan neck/shoulder/elbow/
+hip/knee transitions; the body envelope is not decomposed by the generic
+independent-part ladder. For every image-conditioned macro/meso mass, add a table with
 `part | role | topology | method | shape family | guide/outline | evidence |
 rejected alternative`; choose the simplest family supported by visible
 planar/edge/section evidence. Rounded edges do not make a box/prism an
@@ -146,7 +158,7 @@ gauge-equivalent, so treat an unchanged residual as evidence that the subject is
 
 `procagen3d fit <out>/form_probe --spec <out>/fit_spec.json`
 
-`procagen3d check <out>/form_probe --tier quick --form <profile>`
+`procagen3d check <out>/form_probe --tier quick --form <profile> [--subject character]`
 
 Read the probe sheet; curved/mixed also read `form_sheet.png`; image-conditioned
 also read the registered render/overlay/report. Pass primitive family, local
@@ -156,6 +168,11 @@ that builder in either direction; wrong pose → repair camera/root/joint
 transforms, not dimensions. Probe correction budget scales with the plan's
 complexity class: **2** for simple/moderate, **3** for complex, **4** for
 extreme.
+
+Characters use the ordered probe in `references/character-reconstruction.md`:
+landmark/chain scaffold → coherent body envelope and all visible joint
+transitions → major hair/clothing/equipment shells. Do not add facial
+microdetail, rivets, stitches, or strand arrays until those three layers pass.
 
 On exhaustion, what happens next depends on how much evidence the input
 actually contained:
@@ -204,6 +221,15 @@ spokes can make a simple object large, while a complex car/mecha can remain
 underdesigned. Never fragment an accepted surface to inflate counts. Detail
 cannot be retrofitted through the repair budget.
 
+On the character route, build the anatomy scaffold and `core_volume` first;
+then deformable appendages and joint-crossing shells; then single-link rigid
+attachments and surface detail. Tag the root with
+`procagen3d_subject_domain="character"` and
+`procagen3d_character_routine="organic-v1"`, and tag every planned character
+mesh with its `procagen3d_character_layer` and
+`procagen3d_character_construction`; tag transitions exactly as
+`character_plan.json` declares.
+
 **4 — Build.** Run `procagen3d build <out>/<slug>.py --out <out>`; add
 `--form-diagnostics` for curved/mixed. On `PROCAGEN3D_BUILD_ERROR`, read the
 traceback, fix the program, and rebuild. Persistent same-error after two
@@ -237,7 +263,8 @@ is one camera's image plane, so a passing fit says "registers from this view",
 never "is correct in 3D". Depth is gated in step 5.
 
 **5 — Deterministic gates.** Run
-`procagen3d check <out> --tier <tier> --form <profile>`. FAILs are doctrine or
+`procagen3d check <out> --tier <tier> --form <profile> [--subject character]`.
+FAILs are doctrine or
 form/reconstruction violations (unnamed parts, duplicate `.001` names, shape
 family/method mismatch, missing plan features or occupied regions, empty
 meshes, broken joints) — fix them; they are never acceptable residue.
@@ -245,6 +272,10 @@ Version-2 showcase detail floors and feature/region coverage are hard gates.
 WARNs remain advisory only where explicitly printed.
 For image-conditioned outputs, `check` also fails when fit evidence is missing,
 failed, or stale relative to the reference, fit spec, or scene graph.
+Character-route checks additionally enforce the anatomy scaffold, deformation
+layers, paired face regions, major joint-transition hosts, and requested
+armature. Character mesh floors are intentionally lower than object floors;
+coherent topology, not hundreds of separate beads, is the completion signal.
 
 Six of these gates measure the built geometry rather than cross-checking one
 declaration against another, and they are the ones that catch what renders
@@ -380,26 +411,29 @@ that is more useful than nothing, and it is what the input supports.
    image-conditioned probe also passes registered `fit`. Read its canonical and
    registered evidence before synthesis; add no detail before family/pose/form
    pass.
-3. Full `build` exit 0 before anything else proceeds.
-4. Image-conditioned: registered `fit` exit 0 after every full build, including
+3. Character route: `character_plan.json` exists before code; landmark-chain,
+   body-envelope, joint-transition, face-region, and rig contracts pass
+   `check --subject character`. Never substitute generic region mesh density.
+4. Full `build` exit 0 before anything else proceeds.
+5. Image-conditioned: registered `fit` exit 0 after every full build, including
    local silhouette and pose gates; Read its overlay, masks, and report. On a
    single-view input a shortfall may instead be carried as an approximate
    delivery, but only with `limitations.md` naming every failing gate — never
    for a `threshold_policy` or `landmark_provenance` failure.
-5. `check --tier <tier> --form <profile>` exit 0 before visual inspection;
+6. `check --tier <tier> --form <profile>` exit 0 before visual inspection;
    shape-prior, feature-coverage, adaptive showcase detail, and form failures
    are repair input, never acceptable residue.
-6. `guard` pass between every full-program repair iteration — no exceptions.
-7. `sheet.png` actually Read; curved/mixed also `form_sheet.png`, and use
+7. `guard` pass between every full-program repair iteration — no exceptions.
+8. `sheet.png` actually Read; curved/mixed also `form_sheet.png`, and use
    `reference_match.png` whenever emitted.
-8. `joints` exit 0 whenever the design table declares a joint.
-9. `score` output quoted verbatim whenever a spec exists.
-10. Repair ceiling of 3 / 6 / 8 by complexity — on exhaustion, deliver best
+9. `joints` exit 0 whenever the design table declares a joint.
+10. `score` output quoted verbatim whenever a spec exists.
+11. Repair ceiling of 3 / 6 / 8 by complexity — on exhaustion, deliver best
    intermediate + honest residuals, never a silent extra loop.
-11. Repairs preserve what passes: list the passing verdicts in the repair
+12. Repairs preserve what passes: list the passing verdicts in the repair
    note and do not regress them while fixing the failing one — a repair
    that trades a pass for a pass is a regression, revert it.
-12. Never author a fit threshold to make a gate pass. Thresholds belong to the
+13. Never author a fit threshold to make a gate pass. Thresholds belong to the
    harness; the spec may only tighten them. Loosening is itself a failure.
 
 ## Local edits (existing ProcAgen3D asset)
