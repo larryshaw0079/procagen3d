@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "procagen3d"
+version = "1.0.0"
+description = "GLB-guided, agent-orchestrated generation of standalone Blender Python assets"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "ProcAgen3D contributors"}]
+dependencies = ["rich>=13.9"]
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[project.scripts]
+procagen3d = "procagen3d.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+procagen3d = ["blender_scripts/*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires Blender"]

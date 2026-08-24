@@ -1,0 +1,1066 @@
+"""GLB-guided agent → Blender source → compiled GLB pipeline."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import shutil
+import struct
+import tempfile
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .backends import create_backend
+from .blender import BlenderError, BlenderRuntime, require_success
+from .glb_probe import probe_glb
+from .metrics import compare_workspace, mask_metrics
+from .progress import ProgressReporter, emit_progress, progress_step
+from .prompts import initial_prompt, repair_prompt
+from .source_guard import SourceGuardError, assert_safe_source
+from .workspace import Workspace, sha256, write_json
+
+
+class PipelineError(RuntimeError):
+    """A recoverable stage failure that prevents a valid deliverable."""
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    backend: str = "codex"
+    blender: Path | None = None
+    max_repairs: int = 2
+    min_score: float = 0.35
+    render_size: int = 256
+    llm_timeout_s: int = 1800
+    blender_timeout_s: int = 900
+
+
+CANONICAL_VIEWS = ("front", "back", "left", "right", "top", "iso")
+
+
+def _replace_directory(staged: Path, target: Path) -> None:
+    """Atomically promote a complete staged directory on the same filesystem."""
+
+    backup = target.parent / f".{target.name}.backup-{uuid.uuid4().hex}"
+    had_target = target.exists()
+    if had_target:
+        target.replace(backup)
+    try:
+        staged.replace(target)
+    except Exception:
+        if had_target and backup.exists():
+            backup.replace(target)
+        raise
+    if backup.exists():
+        # Promotion is already committed. A stale backup is preferable to
+        # reporting failure after the new target became live (notably when an
+        # antivirus/indexer briefly locks files on Windows).
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def _validate_positive_runtime(*, render_size: int, timeout_s: int) -> None:
+    if not 64 <= render_size <= 2048:
+        raise ValueError("render_size must be between 64 and 2048")
+    if timeout_s <= 0:
+        raise ValueError("timeout must be greater than zero")
+
+
+def _complete_evidence(root: Path, *, render_size: int) -> bool:
+    expected = [
+        root / "glb_probe.json",
+        root / "reference_scene.json",
+        root / "camera_contract.json",
+        root / "reference_views" / "masks.json",
+        *(root / "reference_views" / f"{name}.png" for name in CANONICAL_VIEWS),
+    ]
+    if not all(not path.is_symlink() and path.is_file() for path in expected):
+        return False
+    try:
+        glb_report = json.loads((root / "glb_probe.json").read_text(encoding="utf-8"))
+        scene = json.loads((root / "reference_scene.json").read_text(encoding="utf-8"))
+        camera = json.loads((root / "camera_contract.json").read_text(encoding="utf-8"))
+        masks = json.loads((root / "reference_views" / "masks.json").read_text(encoding="utf-8"))
+        if not all(isinstance(value, dict) for value in (glb_report, scene, camera, masks)):
+            return False
+        if not glb_report.get("self_contained") or glb_report.get("reference_readiness") != "pass":
+            return False
+        geometry_count = scene.get("geometry_object_count")
+        bounds = scene.get("bounds")
+        if type(geometry_count) is not int or geometry_count <= 0 or not isinstance(bounds, dict):
+            return False
+        for field in ("min", "max", "dimensions", "center"):
+            vector = bounds.get(field)
+            if not (
+                isinstance(vector, list)
+                and len(vector) == 3
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    for value in vector
+                )
+            ):
+                return False
+
+        camera_views = camera.get("views")
+        mask_views = masks.get("views")
+        if not isinstance(camera_views, list) or not isinstance(mask_views, dict):
+            return False
+        if masks.get("schema_version") != 2:
+            return False
+        if camera.get("resolution") != [render_size, render_size]:
+            return False
+        if [view.get("name") for view in camera_views if isinstance(view, dict)] != list(
+            CANONICAL_VIEWS
+        ):
+            return False
+        for view in camera_views:
+            if not isinstance(view, dict):
+                return False
+            scale = view.get("ortho_scale")
+            if (
+                not isinstance(scale, (int, float))
+                or isinstance(scale, bool)
+                or not math.isfinite(scale)
+                or scale <= 0.0
+            ):
+                return False
+            for field in ("location", "target"):
+                vector = view.get(field)
+                if not (
+                    isinstance(vector, list)
+                    and len(vector) == 3
+                    and all(
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(value)
+                        for value in vector
+                    )
+                ):
+                    return False
+        if set(mask_views) != set(CANONICAL_VIEWS):
+            return False
+        for name in CANONICAL_VIEWS:
+            record = mask_views[name]
+            if not isinstance(record, dict):
+                return False
+            if record.get("width") != render_size or record.get("height") != render_size:
+                return False
+            mask_metrics(record, record)
+            header = (root / "reference_views" / f"{name}.png").read_bytes()[:24]
+            if (
+                len(header) != 24
+                or header[:8] != b"\x89PNG\r\n\x1a\n"
+                or header[12:16] != b"IHDR"
+                or struct.unpack(">II", header[16:24]) != (render_size, render_size)
+            ):
+                return False
+        return True
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, struct.error):
+        return False
+
+
+def _verified_glb_snapshot(workspace: Workspace) -> tuple[bytes, str]:
+    path = workspace.glb_path
+    value = path.read_bytes()
+    digest = hashlib.sha256(value).hexdigest()
+    manifest = workspace.manifest()
+    expected = manifest["inputs"]["glb"]["sha256"]
+    if digest != expected:
+        raise PipelineError("reference GLB changed while it was being snapshotted")
+    return value, digest
+
+
+def prepare_reference(
+    workspace: Workspace,
+    runtime: BlenderRuntime,
+    *,
+    render_size: int = 256,
+    timeout_s: int = 900,
+    force: bool = False,
+    progress: ProgressReporter | None = None,
+) -> dict[str, Any]:
+    """Validate, measure, normalize, and render the evidence GLB."""
+
+    _validate_positive_runtime(render_size=render_size, timeout_s=timeout_s)
+    with progress_step(
+        progress,
+        "reference-input",
+        "Validating reference GLB provenance",
+    ) as stage:
+        manifest = workspace.manifest()
+        source_glb, glb_digest = _verified_glb_snapshot(workspace)
+        stage.complete(
+            f"Reference GLB verified — {len(source_glb) / (1024 * 1024):.1f} MiB",
+            glb_sha256=glb_digest,
+        )
+    cached = manifest.get("reference") if isinstance(manifest.get("reference"), dict) else {}
+    cache_matches = (
+        cached.get("glb_sha256") == glb_digest
+        and cached.get("render_size") == render_size
+    )
+    cache_complete = False
+    if not force and cache_matches:
+        with progress_step(
+            progress,
+            "reference-cache",
+            f"Validating cached {render_size}×{render_size} reference evidence",
+        ) as stage:
+            cache_complete = _complete_evidence(
+                workspace.evidence_dir,
+                render_size=render_size,
+            )
+            if cache_complete:
+                stage.complete(
+                    f"Cached {render_size}×{render_size} reference evidence is complete"
+                )
+            else:
+                stage.complete(
+                    "Cached reference evidence is incomplete; rebuilding it",
+                    kind="warning",
+                )
+    if cache_complete:
+        return json.loads((workspace.evidence_dir / "glb_probe.json").read_text(encoding="utf-8"))
+
+    with tempfile.TemporaryDirectory(prefix=".procagen3d-evidence-", dir=workspace.root) as directory:
+        stage_root = Path(directory)
+        staged_glb = stage_root / "reference.glb"
+        staged_glb.write_bytes(source_glb)
+        with progress_step(
+            progress,
+            "reference-probe",
+            "Inspecting GLB container, accessors, and semantic boundaries",
+        ) as stage:
+            report = probe_glb(staged_glb)
+            if report["reference_readiness"] != "pass":
+                raise PipelineError("the reference GLB is not a self-contained, drawable scene")
+            scene = report.get("scene", {})
+            stage.complete(
+                "Reference geometry inspected — "
+                f"{int(scene.get('vertex_count', 0)):,} vertices, "
+                f"{int(scene.get('triangle_count', 0)):,} triangles",
+                semantic_status=report.get("semantic_decomposition", {}).get("status"),
+            )
+        report["path"] = "inputs/reference.glb"
+        staged_evidence = stage_root / "evidence"
+        staged_evidence.mkdir()
+        write_json(staged_evidence / "glb_probe.json", report)
+        with progress_step(
+            progress,
+            "reference-render",
+            f"Normalizing the GLB and rendering six {render_size}×{render_size} reference views",
+        ) as stage:
+            result = runtime.run_stage(
+                "reference_probe",
+                [
+                    "--glb",
+                    staged_glb,
+                    "--evidence-dir",
+                    staged_evidence,
+                    "--size",
+                    str(render_size),
+                ],
+                cwd=stage_root,
+                timeout_s=timeout_s,
+            )
+            (staged_evidence / "reference_probe.stdout.log").write_text(
+                result.stdout, encoding="utf-8"
+            )
+            (staged_evidence / "reference_probe.stderr.log").write_text(
+                result.stderr, encoding="utf-8"
+            )
+            if not result.ok:
+                failure = workspace.root / "trajectories" / "reference_probe_failure"
+                failure.mkdir(parents=True, exist_ok=True)
+                (failure / "stdout.log").write_text(result.stdout, encoding="utf-8")
+                (failure / "stderr.log").write_text(result.stderr, encoding="utf-8")
+            require_success(result, stage="reference probe")
+            scene_path = staged_evidence / "reference_scene.json"
+            scene_report = json.loads(scene_path.read_text(encoding="utf-8"))
+            if not isinstance(scene_report, dict):
+                raise PipelineError("Blender reference_scene.json must contain an object")
+            scene_report["source"] = "inputs/reference.glb"
+            write_json(scene_path, scene_report)
+            if not _complete_evidence(staged_evidence, render_size=render_size):
+                raise PipelineError(
+                    "Blender reference probe produced an incomplete canonical evidence set"
+                )
+            stage.complete(
+                "Reference normalized and six canonical views rendered",
+                blender_duration_s=getattr(result, "duration_s", None),
+            )
+        current_glb, current_digest = _verified_glb_snapshot(workspace)
+        if current_digest != glb_digest or current_glb != source_glb:
+            raise PipelineError("reference GLB changed during evidence generation")
+        _replace_directory(staged_evidence, workspace.evidence_dir)
+    workspace.update_manifest(
+        status="prepared",
+        reference={
+            "glb_sha256": glb_digest,
+            "render_size": render_size,
+            "scene": "evidence/reference_scene.json",
+            "views": "evidence/reference_views",
+        },
+    )
+    return report
+
+
+def _validate_plan(path: Path) -> None:
+    if not path.is_file():
+        raise PipelineError("agent did not create src/plan.json")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PipelineError(f"src/plan.json is invalid JSON: {exc}") from exc
+    required = {
+        "subject",
+        "subject_kind",
+        "coordinate_frame",
+        "dimensions",
+        "parts",
+        "materials",
+        "construction_strategy",
+        "identity_features",
+        "limitations",
+    }
+    if not isinstance(value, dict):
+        raise PipelineError("src/plan.json must contain a JSON object")
+    missing = sorted(required - value.keys())
+    if missing:
+        raise PipelineError("src/plan.json is missing: " + ", ".join(missing))
+    if not isinstance(value["subject"], str) or not value["subject"].strip():
+        raise PipelineError("src/plan.json subject must be a non-empty string")
+    subject_kind = value["subject_kind"]
+    if not isinstance(subject_kind, str) or subject_kind not in {
+        "object",
+        "character",
+        "hybrid",
+        "scene",
+    }:
+        raise PipelineError(
+            "src/plan.json subject_kind must be object, character, hybrid, or scene"
+        )
+    character_analysis = value.get("character_analysis")
+    if subject_kind in {"character", "hybrid"}:
+        if not isinstance(character_analysis, dict):
+            raise PipelineError(
+                "character and hybrid plans must contain a character_analysis object"
+            )
+        character_keys = {
+            "pose",
+            "proportions",
+            "facial_landmarks",
+            "hair_or_headwear",
+            "clothing_layers",
+            "held_props",
+            "left_right_asymmetry",
+            "inferred_features",
+        }
+        character_missing = sorted(character_keys - character_analysis.keys())
+        if character_missing:
+            raise PipelineError(
+                "src/plan.json character_analysis is missing: "
+                + ", ".join(character_missing)
+            )
+        if not isinstance(character_analysis["pose"], str) or not character_analysis[
+            "pose"
+        ].strip():
+            raise PipelineError("src/plan.json character_analysis.pose must be a non-empty string")
+        if not isinstance(character_analysis["proportions"], dict):
+            raise PipelineError("src/plan.json character_analysis.proportions must be an object")
+        for key in character_keys - {"pose", "proportions"}:
+            if not isinstance(character_analysis[key], list):
+                raise PipelineError(f"src/plan.json character_analysis.{key} must be a list")
+    elif character_analysis is not None and not isinstance(character_analysis, dict):
+        raise PipelineError("src/plan.json character_analysis must be an object when provided")
+    for key in ("parts", "materials", "identity_features", "limitations"):
+        if not isinstance(value[key], list):
+            raise PipelineError(f"src/plan.json {key} must be a list")
+    if not isinstance(value["coordinate_frame"], dict):
+        raise PipelineError("src/plan.json coordinate_frame must be an object")
+    dimensions = value["dimensions"]
+    if not (
+        isinstance(dimensions, list)
+        and len(dimensions) == 3
+        and all(
+            isinstance(component, (int, float))
+            and not isinstance(component, bool)
+            and math.isfinite(component)
+            and component > 0.0
+            for component in dimensions
+        )
+    ):
+        raise PipelineError("src/plan.json dimensions must be three positive finite numbers")
+    if not value["parts"]:
+        raise PipelineError("src/plan.json parts must not be empty")
+    if not isinstance(value["construction_strategy"], str) or not value[
+        "construction_strategy"
+    ].strip():
+        raise PipelineError("src/plan.json construction_strategy must be a non-empty string")
+
+
+def _guard_program(path: Path) -> None:
+    if not path.is_file():
+        raise PipelineError("agent did not create src/program.py")
+    source = path.read_text(encoding="utf-8")
+    try:
+        assert_safe_source(source, filename="src/program.py")
+    except SourceGuardError as exc:
+        raise PipelineError(str(exc)) from exc
+
+
+def _source_snapshot(path: Path, *, label: str) -> bytes:
+    try:
+        canonical_parent = path.parent.resolve(strict=True)
+    except (OSError, RuntimeError):
+        canonical_parent = None
+    if (
+        canonical_parent != path.parent
+        or path.parent.is_symlink()
+        or path.is_symlink()
+        or not path.is_file()
+    ):
+        raise PipelineError(f"{label} must be a regular, non-symlink file")
+    value = path.read_bytes()
+    if len(value) > 2_000_000:
+        raise PipelineError(f"{label} is unexpectedly large")
+    return value
+
+
+def _agent_images(root: Path, *, image_relative: Path, include_candidate: bool) -> tuple[Path, ...]:
+    paths = [root / image_relative]
+    paths.extend(root / "evidence" / "reference_views" / f"{name}.png" for name in CANONICAL_VIEWS)
+    if include_candidate:
+        paths.extend(root / "artifacts" / "renders" / f"{name}.png" for name in CANONICAL_VIEWS)
+    return tuple(path for path in paths if path.is_file())
+
+
+def _copy_agent_transcript(result: Any, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for source in (
+        result.prompt_path,
+        result.transcript_path,
+        result.stderr_path,
+        result.result_path,
+        result.prompt_path.parent / "final_message.txt",
+    ):
+        if source.is_file():
+            shutil.copy2(source, destination / source.name)
+
+
+def _write_bytes_atomic(path: Path, value: bytes) -> None:
+    temporary = path.with_suffix(path.suffix + ".restore-tmp")
+    temporary.write_bytes(value)
+    temporary.replace(path)
+
+
+def _invoke_agent(
+    workspace: Workspace,
+    *,
+    backend_name: str,
+    prompt: str,
+    iteration: int,
+    timeout_s: int,
+    include_candidate: bool = False,
+    is_repair: bool = False,
+    progress: ProgressReporter | None = None,
+) -> dict[str, Any]:
+    backend = create_backend(backend_name)
+    if timeout_s <= 0:
+        raise ValueError("LLM timeout must be greater than zero")
+    action = "Repairing" if is_repair else "Authoring"
+    configured_model = getattr(backend, "model", None)
+    model_label = f" ({configured_model})" if configured_model else ""
+    with progress_step(
+        progress,
+        f"agent-{iteration:02d}",
+        f"{action} Blender source with {backend_name}{model_label}",
+    ) as stage:
+        trajectory = workspace.trajectory_dir(iteration)
+        image_relative = workspace.image_path.relative_to(workspace.root)
+        with tempfile.TemporaryDirectory(prefix="procagen3d-agent-") as directory:
+            # macOS exposes the same temporary directory through both /var and
+            # /private/var. Backends canonicalize their workspace before they
+            # report modified files, so keep this trust boundary canonical too.
+            agent_root = Path(directory).resolve(strict=True)
+            shutil.copytree(workspace.root / "inputs", agent_root / "inputs")
+            shutil.copytree(workspace.evidence_dir, agent_root / "evidence")
+            (agent_root / "src").mkdir()
+            for current in (workspace.plan_path, workspace.program_path):
+                if current.is_file():
+                    shutil.copy2(current, agent_root / "src" / current.name)
+            if include_candidate and workspace.artifacts_dir.is_dir():
+                render_source = workspace.artifacts_dir / "renders"
+                if render_source.is_dir():
+                    shutil.copytree(render_source, agent_root / "artifacts" / "renders")
+            agent_trajectory = agent_root / ".trajectory"
+            result = backend.run(
+                prompt=prompt,
+                workspace=agent_root,
+                trajectory_dir=agent_trajectory,
+                image_paths=_agent_images(
+                    agent_root,
+                    image_relative=image_relative,
+                    include_candidate=include_candidate,
+                ),
+                timeout_s=timeout_s,
+            )
+            _copy_agent_transcript(result, trajectory)
+            if not result.ok:
+                detail = (
+                    result.error
+                    or result.stderr[-2000:]
+                    or result.final_message
+                    or result.exit_reason
+                )
+                raise PipelineError(
+                    f"{backend_name} agent failed ({result.exit_reason}): {detail}"
+                )
+            staged_src = agent_root / "src"
+            try:
+                canonical_src = staged_src.resolve(strict=True)
+            except (OSError, RuntimeError):
+                canonical_src = None
+            if (
+                canonical_src != staged_src
+                or staged_src.is_symlink()
+                or not staged_src.is_dir()
+            ):
+                raise PipelineError(
+                    "agent src/ must remain a regular, non-symlink directory "
+                    "inside the disposable workspace"
+                )
+            changed_relative: list[str] = []
+            unauthorized: list[str] = []
+            for path in result.files_modified:
+                try:
+                    candidate = Path(path).expanduser()
+                    if not candidate.is_absolute():
+                        candidate = agent_root / candidate
+                    canonical_path = candidate.resolve(strict=False)
+                    relative = canonical_path.relative_to(agent_root)
+                except (OSError, RuntimeError, ValueError):
+                    unauthorized.append(str(path))
+                    continue
+                changed_relative.append(relative.as_posix())
+                if not relative.parts or relative.parts[0] != "src":
+                    unauthorized.append(relative.as_posix())
+            staged_program = staged_src / "program.py"
+            staged_plan = staged_src / "plan.json"
+            if unauthorized:
+                # Keep bounded, regular candidates for forensic review after an
+                # expensive rejected run, but never promote them into src/.
+                for source, label, destination in (
+                    (
+                        staged_program,
+                        "agent src/program.py",
+                        trajectory / "rejected_program.py",
+                    ),
+                    (
+                        staged_plan,
+                        "agent src/plan.json",
+                        trajectory / "rejected_plan.json",
+                    ),
+                ):
+                    try:
+                        candidate_value = _source_snapshot(source, label=label)
+                    except PipelineError:
+                        continue
+                    destination.write_bytes(candidate_value)
+                raise PipelineError(
+                    "agent changed files outside src/: " + ", ".join(unauthorized)
+                )
+            # Snapshot both required deliverables before any source promotion.
+            # The plan and AST contracts are checked in source-guard.
+            program_value = _source_snapshot(staged_program, label="agent src/program.py")
+            plan_value = _source_snapshot(staged_plan, label="agent src/plan.json")
+            # Preserve the exact reviewed candidates before committing them to src/.
+            # A trajectory-write failure must not leave source changed while the
+            # invocation reports an error.
+            (trajectory / "program.py").write_bytes(program_value)
+            (trajectory / "plan.json").write_bytes(plan_value)
+            with tempfile.TemporaryDirectory(
+                prefix=".procagen3d-src-", dir=workspace.root
+            ) as source_stage:
+                promoted_src = Path(source_stage) / "src"
+                promoted_src.mkdir()
+                (promoted_src / "program.py").write_bytes(program_value)
+                (promoted_src / "plan.json").write_bytes(plan_value)
+                _replace_directory(promoted_src, workspace.src_dir)
+            payload = {
+                "backend": result.backend,
+                "model": result.model,
+                "duration_s": result.duration_s,
+                "usage": result.usage,
+                "files_modified": changed_relative,
+            }
+            stage.complete(
+                f"{backend_name} produced plan.json and program.py",
+                model=result.model,
+                files_modified=changed_relative,
+                provider_duration_s=result.duration_s,
+            )
+    return payload
+
+
+def build_workspace(
+    workspace: Workspace,
+    runtime: BlenderRuntime,
+    *,
+    min_score: float = 0.35,
+    timeout_s: int = 900,
+    progress: ProgressReporter | None = None,
+) -> dict[str, Any]:
+    """Compile the current source in a clean directory and compare it."""
+
+    if not 0.0 <= min_score <= 1.0:
+        raise ValueError("min_score must be between 0 and 1")
+    if timeout_s <= 0:
+        raise ValueError("Blender timeout must be greater than zero")
+    with progress_step(
+        progress,
+        "source-validation",
+        "Snapshotting plan.json and program.py",
+    ) as stage:
+        program_snapshot = _source_snapshot(workspace.program_path, label="src/program.py")
+        plan_snapshot = _source_snapshot(workspace.plan_path, label="src/plan.json")
+        program_digest = hashlib.sha256(program_snapshot).hexdigest()
+        plan_digest = hashlib.sha256(plan_snapshot).hexdigest()
+        stage.complete(
+            f"Source snapshots captured — program {program_digest[:10]}",
+            program_sha256=program_digest,
+            plan_sha256=plan_digest,
+        )
+    with tempfile.TemporaryDirectory(prefix=".procagen3d-build-", dir=workspace.root) as directory:
+        clean_root = Path(directory)
+        staged_program = clean_root / "program.py"
+        staged_plan = clean_root / "plan.json"
+        staged_artifacts = clean_root / "artifacts"
+        staged_program.write_bytes(program_snapshot)
+        staged_plan.write_bytes(plan_snapshot)
+        with progress_step(
+            progress,
+            "source-guard",
+            "Applying the plan schema and Blender source guard",
+        ) as stage:
+            _validate_plan(staged_plan)
+            _guard_program(staged_program)
+            stage.complete("Plan schema and Blender source guard passed")
+        with progress_step(
+            progress,
+            "blender-build",
+            "Executing program.py in factory Blender and exporting model.glb",
+        ) as stage:
+            result = runtime.run_stage(
+                "build_asset",
+                [
+                    "--program",
+                    staged_program,
+                    "--artifacts-dir",
+                    staged_artifacts,
+                ],
+                cwd=clean_root,
+                timeout_s=timeout_s,
+            )
+            staged_artifacts.mkdir(parents=True, exist_ok=True)
+            (staged_artifacts / "build.stdout.log").write_text(
+                result.stdout, encoding="utf-8"
+            )
+            (staged_artifacts / "build.stderr.log").write_text(
+                result.stderr, encoding="utf-8"
+            )
+            if not result.ok:
+                failure = workspace.root / "trajectories" / "build_failure"
+                failure.mkdir(parents=True, exist_ok=True)
+                (failure / "stdout.log").write_text(result.stdout, encoding="utf-8")
+                (failure / "stderr.log").write_text(result.stderr, encoding="utf-8")
+            require_success(result, stage="source build")
+            stage.complete(
+                "Blender source executed; scene.blend and model.glb exported",
+                blender_duration_s=getattr(result, "duration_s", None),
+            )
+        model_path = staged_artifacts / "model.glb"
+        with progress_step(
+            progress,
+            "export-validation",
+            "Checking the exported GLB container and embedded resources",
+        ) as stage:
+            model_probe = probe_glb(model_path)
+            if (
+                not model_probe["self_contained"]
+                or model_probe["reference_readiness"] != "pass"
+            ):
+                raise PipelineError("compiled model.glb is not a self-contained drawable scene")
+            model_scene = model_probe.get("scene", {})
+            stage.complete(
+                "Exported GLB is self-contained — "
+                f"{int(model_scene.get('mesh_count', 0)):,} meshes, "
+                f"{int(model_scene.get('triangle_count', 0)):,} triangles",
+            )
+        with progress_step(
+            progress,
+            "compiled-probe",
+            "Re-importing model.glb in a second Blender process and rendering six views",
+        ) as stage:
+            compiled_result = runtime.run_stage(
+                "compiled_probe",
+                [
+                    "--glb",
+                    model_path,
+                    "--artifacts-dir",
+                    staged_artifacts,
+                    "--camera-contract",
+                    workspace.evidence_dir / "camera_contract.json",
+                ],
+                cwd=clean_root,
+                timeout_s=timeout_s,
+            )
+            (staged_artifacts / "compiled_probe.stdout.log").write_text(
+                compiled_result.stdout, encoding="utf-8"
+            )
+            (staged_artifacts / "compiled_probe.stderr.log").write_text(
+                compiled_result.stderr, encoding="utf-8"
+            )
+            if not compiled_result.ok:
+                failure = workspace.root / "trajectories" / "compiled_probe_failure"
+                failure.mkdir(parents=True, exist_ok=True)
+                (failure / "build.stdout.log").write_text(result.stdout, encoding="utf-8")
+                (failure / "build.stderr.log").write_text(result.stderr, encoding="utf-8")
+                (failure / "stdout.log").write_text(
+                    compiled_result.stdout, encoding="utf-8"
+                )
+                (failure / "stderr.log").write_text(
+                    compiled_result.stderr, encoding="utf-8"
+                )
+            require_success(compiled_result, stage="compiled GLB probe")
+            stage.complete(
+                "Compiled GLB re-imported and six canonical views rendered",
+                blender_duration_s=getattr(compiled_result, "duration_s", None),
+            )
+        with progress_step(
+            progress,
+            "artifact-provenance",
+            "Recording GLB, Blender scene, and report provenance",
+        ) as stage:
+            # Reports survive promotion out of the disposable build directory,
+            # so keep their provenance paths stable and workspace-relative.
+            model_probe["path"] = "artifacts/model.glb"
+            write_json(staged_artifacts / "model_probe.json", model_probe)
+            scene_report_path = staged_artifacts / "scene_report.json"
+            scene_report = json.loads(scene_report_path.read_text(encoding="utf-8"))
+            if not isinstance(scene_report, dict):
+                raise PipelineError("Blender scene_report.json must contain an object")
+            scene_report["program"] = "src/program.py"
+            write_json(scene_report_path, scene_report)
+            model_digest = sha256(model_path)
+            blend_digest = sha256(staged_artifacts / "scene.blend")
+            write_json(
+                staged_artifacts / "build_manifest.json",
+                {
+                    "schema_version": 1,
+                    "program_sha256": program_digest,
+                    "plan_sha256": plan_digest,
+                    "model_sha256": model_digest,
+                    "blend_sha256": blend_digest,
+                    "clean_room": True,
+                    "source_glb_imported_at_build_time": False,
+                    "compiled_glb_verified_in_separate_process": True,
+                },
+            )
+            stage.complete(
+                f"Artifact provenance recorded — GLB {model_digest[:10]}",
+                model_sha256=model_digest,
+                blend_sha256=blend_digest,
+            )
+        with progress_step(
+            progress,
+            "fidelity",
+            "Scoring silhouettes, spatial color, dimensions, and centering",
+        ) as stage:
+            comparison = compare_workspace(
+                reference_masks=workspace.evidence_dir / "reference_views" / "masks.json",
+                candidate_masks=staged_artifacts / "renders" / "masks.json",
+                reference_scene=workspace.evidence_dir / "reference_scene.json",
+                candidate_scene=staged_artifacts / "scene_report.json",
+                output=staged_artifacts / "comparison.json",
+                min_score=min_score,
+            )
+            if (
+                _source_snapshot(workspace.program_path, label="src/program.py")
+                != program_snapshot
+                or _source_snapshot(workspace.plan_path, label="src/plan.json")
+                != plan_snapshot
+            ):
+                raise PipelineError("src/program.py or src/plan.json changed during the build")
+            _replace_directory(staged_artifacts, workspace.artifacts_dir)
+            verdict = "passed" if comparison["passed"] else "needs review"
+            stage.complete(
+                f"Fidelity score {comparison['score']:.4f} — {verdict}",
+                score=comparison["score"],
+                passed=comparison["passed"],
+            )
+        return comparison
+
+
+def run_pipeline(
+    workspace: Workspace,
+    config: PipelineConfig,
+    *,
+    prepare_only: bool = False,
+    force_probe: bool = False,
+    progress: ProgressReporter | None = None,
+) -> dict[str, Any]:
+    if config.max_repairs < 0:
+        raise ValueError("max_repairs cannot be negative")
+    if not 0.0 <= config.min_score <= 1.0:
+        raise ValueError("min_score must be between 0 and 1")
+    _validate_positive_runtime(render_size=config.render_size, timeout_s=config.blender_timeout_s)
+    if config.llm_timeout_s <= 0:
+        raise ValueError("LLM timeout must be greater than zero")
+    try:
+        with progress_step(progress, "runtime", "Locating Blender") as stage:
+            runtime = BlenderRuntime.discover(config.blender)
+            executable = getattr(runtime, "executable", "configured executable")
+            stage.complete(f"Blender ready — {executable}")
+        probe = prepare_reference(
+            workspace,
+            runtime,
+            render_size=config.render_size,
+            timeout_s=config.blender_timeout_s,
+            force=force_probe,
+            progress=progress,
+        )
+    except (PipelineError, BlenderError, OSError, ValueError) as exc:
+        workspace.update_manifest(status="failed")
+        write_json(
+            workspace.root / "run_report.json",
+            {
+                "schema_version": 1,
+                "status": "failed",
+                "workspace": str(workspace.root),
+                "backend": config.backend,
+                "stage": "reference",
+                "agent_runs": [],
+                "build_attempts": [],
+                "error": str(exc),
+            },
+        )
+        raise
+    if prepare_only:
+        report = {
+            "schema_version": 1,
+            "status": "prepared",
+            "workspace": str(workspace.root),
+            "reference": {
+                "vertices": probe["scene"]["vertex_count"],
+                "triangles": probe["scene"]["triangle_count"],
+                "semantic_status": probe["semantic_decomposition"]["status"],
+            },
+        }
+        write_json(workspace.root / "run_report.json", report)
+        workspace.update_manifest(status="prepared")
+        emit_progress(
+            progress,
+            "info",
+            "pipeline",
+            "Reference evidence prepared; stopping before agent invocation",
+        )
+        return report
+
+    manifest = workspace.manifest()
+    user_prompt = str(manifest.get("prompt") or "")
+    agent_runs: list[dict[str, Any]] = []
+    build_attempts: list[dict[str, Any]] = []
+    next_iteration = workspace.next_trajectory_iteration()
+    if not workspace.program_path.is_file() or not workspace.plan_path.is_file():
+        try:
+            run = _invoke_agent(
+                workspace,
+                backend_name=config.backend,
+                prompt=initial_prompt(root=workspace.root, image=workspace.image_path, user_prompt=user_prompt),
+                iteration=next_iteration,
+                timeout_s=config.llm_timeout_s,
+                progress=progress,
+            )
+        except PipelineError as exc:
+            workspace.update_manifest(status="failed")
+            write_json(
+                workspace.root / "run_report.json",
+                {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "workspace": str(workspace.root),
+                    "backend": config.backend,
+                    "agent_runs": [],
+                    "build_attempts": [],
+                    "error": str(exc),
+                },
+            )
+            raise
+        agent_runs.append(run)
+        next_iteration += 1
+
+    last_failure: str | None = None
+    comparison: dict[str, Any] | None = None
+    valid_artifact = False
+    last_valid_program: bytes | None = None
+    last_valid_plan: bytes | None = None
+    last_valid_comparison: dict[str, Any] | None = None
+    for attempt in range(config.max_repairs + 1):
+        emit_progress(
+            progress,
+            "info",
+            "build-attempt",
+            f"Build attempt {attempt + 1} of {config.max_repairs + 1}",
+        )
+        try:
+            comparison = build_workspace(
+                workspace,
+                runtime,
+                min_score=config.min_score,
+                timeout_s=config.blender_timeout_s,
+                progress=progress,
+            )
+            valid_artifact = True
+            last_valid_program = workspace.program_path.read_bytes()
+            last_valid_plan = workspace.plan_path.read_bytes()
+            last_valid_comparison = comparison
+            build_attempts.append({"attempt": attempt, "built": True, "comparison": comparison})
+            if comparison["passed"]:
+                last_failure = None
+                break
+            last_failure = (
+                f"fidelity score {comparison['score']:.4f} is below "
+                f"the configured minimum {config.min_score:.4f}"
+            )
+            emit_progress(
+                progress,
+                "warning",
+                "build-attempt",
+                last_failure,
+            )
+        except (PipelineError, BlenderError, OSError, ValueError) as exc:
+            last_failure = str(exc)
+            build_attempts.append({"attempt": attempt, "built": False, "error": last_failure})
+            next_action = (
+                "preparing an LLM repair"
+                if attempt < config.max_repairs
+                else "no repair attempts remain"
+            )
+            emit_progress(
+                progress,
+                "warning",
+                "build-attempt",
+                f"Build attempt {attempt + 1} failed; {next_action}",
+                error=last_failure,
+            )
+        if attempt >= config.max_repairs:
+            break
+        try:
+            run = _invoke_agent(
+                workspace,
+                backend_name=config.backend,
+                prompt=repair_prompt(
+                    root=workspace.root,
+                    user_prompt=user_prompt,
+                    failure=last_failure,
+                    comparison=comparison,
+                    iteration=next_iteration,
+                ),
+                iteration=next_iteration,
+                timeout_s=config.llm_timeout_s,
+                include_candidate=valid_artifact,
+                is_repair=True,
+                progress=progress,
+            )
+        except PipelineError as exc:
+            last_failure = str(exc)
+            build_attempts.append(
+                {"attempt": attempt, "built": False, "stage": "agent-repair", "error": last_failure}
+            )
+            break
+        agent_runs.append(run)
+        next_iteration += 1
+
+    if not valid_artifact:
+        workspace.update_manifest(status="failed")
+        report = {
+            "schema_version": 1,
+            "status": "failed",
+            "workspace": str(workspace.root),
+            "backend": config.backend,
+            "agent_runs": agent_runs,
+            "build_attempts": build_attempts,
+            "error": last_failure,
+        }
+        write_json(workspace.root / "run_report.json", report)
+        emit_progress(
+            progress,
+            "failure",
+            "pipeline",
+            "Pipeline failed without a valid compiled GLB",
+            error=last_failure,
+        )
+        raise PipelineError(last_failure or "no valid artifact was produced")
+
+    artifact_manifest = json.loads(
+        (workspace.artifacts_dir / "build_manifest.json").read_text(encoding="utf-8")
+    )
+    source_matches_artifact = (
+        artifact_manifest.get("program_sha256") == sha256(workspace.program_path)
+        and artifact_manifest.get("plan_sha256") == sha256(workspace.plan_path)
+    )
+    if not source_matches_artifact and last_valid_program is not None and last_valid_plan is not None:
+        rejected = workspace.root / "trajectories" / f"iter_{max(0, next_iteration - 1):02d}"
+        rejected.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(workspace.program_path, rejected / "rejected_program.py")
+        shutil.copy2(workspace.plan_path, rejected / "rejected_plan.json")
+        _write_bytes_atomic(workspace.program_path, last_valid_program)
+        _write_bytes_atomic(workspace.plan_path, last_valid_plan)
+        comparison = last_valid_comparison
+        restoration = (
+            "The last failed repair was retained in its trajectory; source was restored "
+            "to the last compiled artifact."
+        )
+        last_failure = f"{last_failure}. {restoration}" if last_failure else restoration
+
+    status = "complete" if comparison and comparison["passed"] else "needs-review"
+    report = {
+        "schema_version": 1,
+        "status": status,
+        "workspace": str(workspace.root),
+        "backend": config.backend,
+        "agent_runs": agent_runs,
+        "build_attempts": build_attempts,
+        "score": comparison["score"] if comparison else None,
+        "passed": comparison["passed"] if comparison else False,
+        "warning": last_failure,
+        "deliverables": {
+            "program": "src/program.py",
+            "plan": "src/plan.json",
+            "glb": "artifacts/model.glb",
+            "blend": "artifacts/scene.blend",
+            "comparison": "artifacts/comparison.json",
+            "build_manifest": "artifacts/build_manifest.json",
+        },
+    }
+    write_json(workspace.root / "run_report.json", report)
+    workspace.update_manifest(status=status, score=report["score"], deliverables=report["deliverables"])
+    if status == "complete":
+        emit_progress(
+            progress,
+            "success",
+            "pipeline",
+            f"Pipeline complete — fidelity {float(report['score']):.4f}",
+        )
+    else:
+        emit_progress(
+            progress,
+            "warning",
+            "pipeline",
+            f"Pipeline produced a valid GLB that needs review — fidelity {float(report['score']):.4f}",
+        )
+    return report

@@ -1,273 +1,223 @@
 # ProcAgen3D
 
-**Version:** 0.3.0
+ProcAgen3D is a standalone Python application that turns an **image plus an
+offline-generated reference GLB** into two linked deliverables:
 
-Code-native generation of programmable 3D assets, implemented as an agent
-skill for Claude Code, Codex, and compatible runtimes.
+- editable, standalone Blender Python in `src/program.py`; and
+- `artifacts/model.glb`, compiled by running that program in headless Blender.
+
+The Blender program is the source of truth. The supplied GLB is used only as
+measurement and visual evidence; generated programs are statically rejected if
+they try to load it at runtime.
 
 ![ProcAgen3D teaser](assets/teaser.png)
 
-Instead of sculpting meshes or emitting vertex soup, the agent writes an
-executable **Blender Python program** — named parts, a real transform tree,
-articulated joints with limits, dimensions as named constants — and headless
-Blender compiles it to a GLB. The program is the asset; the GLB is a
-derivative artifact. Because the asset is source code, it stays editable:
-"make the handlebar wider" is a minimal, gated source edit, not a remodel.
+## Install with uv
 
-## Install
-
-Install the skill for Codex:
+Python 3.11+ and Blender 4.5/5.x are required. The coding-agent CLI you intend
+to use must already be authenticated.
 
 ```sh
-git clone https://github.com/larryshaw0079/procagen3d.git ~/.codex/skills/procagen3d
+uv sync --group dev
+uv run procagen3d doctor
 ```
 
-Install the skill for Claude Code:
+The repository includes `uv.lock` for reproducible environments. The runtime
+uses Rich for terminal progress; the dev group additionally installs pytest.
+
+## Generate an asset
+
+This source checkout includes eight image/GLB pairs under `assets/3d_glb`.
 
 ```sh
-git clone https://github.com/larryshaw0079/procagen3d.git ~/.claude/skills/procagen3d
+uv run procagen3d make \
+  assets/3d_glb/mystic_mouse_wanderer/reference_01.png \
+  assets/3d_glb/mystic_mouse_wanderer/object_0.glb \
+  --backend codex \
+  --prompt "Build the complete character with named, editable parts"
 ```
 
-## Showcase
+Use `--backend grok` or `--backend cursor` to switch coding agents. Workspaces
+are written to `outputs/<name>` by default. Use `--name` or `--output` to
+change that location.
 
-Representative reference-conditioned results. Each pair shows the closest available source-image
-angle on the left and a studio-lit Eevee render of the exported `model.glb` on
-the right. Every model starts as an executable Blender Python program and is
-compiled to a portable GLB by the ProcAgen3D pipeline.
+To build evidence without spending an agent invocation:
 
-<table>
-  <tr>
-    <td align="center" width="33%">
-      <a href="assets/showcase/audi-sport-quattro-s1-reference.png">
-        <img src="assets/showcase/audi-sport-quattro-s1-reference.png" width="135" alt="Reference image of an Audi Sport Quattro S1 rally car">
-      </a>
-      <a href="assets/showcase/audi-sport-quattro-s1.png">
-        <img src="assets/showcase/audi-sport-quattro-s1.png" width="135" alt="ProcAgen3D GLB render of an Audi Sport Quattro S1 rally car">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Audi Sport Quattro S1</strong>
-    </td>
-    <td align="center" width="33%">
-      <a href="assets/showcase/nissan-skyline-super-silhouette-reference.png">
-        <img src="assets/showcase/nissan-skyline-super-silhouette-reference.png" width="135" alt="Reference image of a Nissan Skyline Super Silhouette race car">
-      </a>
-      <a href="assets/showcase/nissan-skyline-super-silhouette.png">
-        <img src="assets/showcase/nissan-skyline-super-silhouette.png" width="135" alt="ProcAgen3D GLB render of a Nissan Skyline Super Silhouette race car">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Nissan Skyline Super Silhouette</strong>
-    </td>
-    <td align="center" width="33%">
-      <a href="assets/showcase/pagani-huayra-r-reference.png">
-        <img src="assets/showcase/pagani-huayra-r-reference.png" width="135" alt="Reference image of a Pagani Huayra R">
-      </a>
-      <a href="assets/showcase/pagani-huayra-r.png">
-        <img src="assets/showcase/pagani-huayra-r.png" width="135" alt="ProcAgen3D GLB render of a Pagani Huayra R">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Pagani Huayra R</strong>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="assets/showcase/toyota-sr5-reference.png">
-        <img src="assets/showcase/toyota-sr5-reference.png" width="135" alt="Reference image of a Toyota SR5 pickup with its hood open">
-      </a>
-      <a href="assets/showcase/toyota-sr5.png">
-        <img src="assets/showcase/toyota-sr5.png" width="135" alt="ProcAgen3D GLB render of a Toyota SR5 pickup with its hood open">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Toyota SR5</strong>
-    </td>
-    <td align="center" width="33%">
-      <a href="assets/showcase/city-bicycle-reference.png">
-        <img src="assets/showcase/city-bicycle-reference.png" width="135" alt="Reference image of a city bicycle with a wicker basket">
-      </a>
-      <a href="assets/showcase/city-bicycle.png">
-        <img src="assets/showcase/city-bicycle.png" width="135" alt="ProcAgen3D GLB render of a city bicycle with a wicker basket">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>City Bicycle</strong>
-    </td>
-    <td align="center" width="33%">
-      <a href="assets/showcase/quadcopter-drone-reference.png">
-        <img src="assets/showcase/quadcopter-drone-reference.png" width="135" alt="Reference image of a quadcopter drone">
-      </a>
-      <a href="assets/showcase/quadcopter-drone.png">
-        <img src="assets/showcase/quadcopter-drone.png" width="135" alt="ProcAgen3D GLB render of a quadcopter drone">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Quadcopter Drone</strong>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="assets/showcase/china-pavilion-reference.png">
-        <img src="assets/showcase/china-pavilion-reference.png" width="135" alt="Reference image of a traditional Chinese pavilion">
-      </a>
-      <a href="assets/showcase/china-pavilion.png">
-        <img src="assets/showcase/china-pavilion.png" width="135" alt="ProcAgen3D GLB render of a traditional Chinese pavilion">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Traditional Chinese Pavilion</strong>
-    </td>
-    <td align="center" width="33%">
-      <a href="assets/showcase/spanish-colonial-townhouse-reference.png">
-        <img src="assets/showcase/spanish-colonial-townhouse-reference.png" width="135" alt="Reference image of a Spanish colonial townhouse">
-      </a>
-      <a href="assets/showcase/spanish-colonial-townhouse.png">
-        <img src="assets/showcase/spanish-colonial-townhouse.png" width="135" alt="ProcAgen3D GLB render of a Spanish colonial townhouse">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Spanish Colonial Townhouse</strong>
-    </td>
-    <td align="center" width="33%">
-      <a href="assets/showcase/cozy-living-room-reference.png">
-        <img src="assets/showcase/cozy-living-room-reference.png" width="135" alt="Reference image of a cozy living room set">
-      </a>
-      <a href="assets/showcase/cozy-living-room.png">
-        <img src="assets/showcase/cozy-living-room.png" width="135" alt="ProcAgen3D GLB render of a cozy living room set">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Cozy Living Room</strong>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="assets/showcase/benben-robot-reference.png">
-        <img src="assets/showcase/benben-robot-reference.png" width="135" alt="Reference image of the Benben robot">
-      </a>
-      <a href="assets/showcase/benben-robot.png">
-        <img src="assets/showcase/benben-robot.png" width="135" alt="ProcAgen3D GLB render of the Benben robot">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Benben Robot</strong>
-    </td>
-    <td align="center" width="33%">
-      <a href="assets/showcase/compact-carbine-reference.png">
-        <img src="assets/showcase/compact-carbine-reference.png" width="135" alt="Reference image of a compact carbine">
-      </a>
-      <a href="assets/showcase/compact-carbine.png">
-        <img src="assets/showcase/compact-carbine.png" width="135" alt="ProcAgen3D GLB render of a compact carbine">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Compact Carbine</strong>
-    </td>
-    <td align="center" width="33%">
-      <a href="assets/showcase/fujifilm-x-t3-reference.png">
-        <img src="assets/showcase/fujifilm-x-t3-reference.png" width="135" alt="Reference image of a Fujifilm X-T3 camera">
-      </a>
-      <a href="assets/showcase/fujifilm-x-t3.png">
-        <img src="assets/showcase/fujifilm-x-t3.png" width="135" alt="ProcAgen3D GLB render of a Fujifilm X-T3 camera">
-      </a><br>
-      <sub>Reference → ProcAgen3D GLB</sub><br>
-      <strong>Fujifilm X-T3</strong>
-    </td>
-  </tr>
-</table>
-
-## How it works
-
-The agent supplies design judgment and visual review; a deterministic,
-stdlib-only harness enforces the paper's pipeline around it:
-
-```
-reconstruction plan → reconstruction probe → camera solve (image-conditioned)
-→ synthesize program → build + canonical renders (headless Blender)
-→ registered local-silhouette + pose fit (image-conditioned) → deterministic checks
-→ agent-vision inspection → guarded repair loop (complexity-scaled)
-→ articulation validation → constraint scoring → deliver
+```sh
+uv run procagen3d make IMAGE GLB --prepare-only --name my-asset
 ```
 
-Every stage is a CLI command with exit codes and grep-able
-`[PROCAGEN3D:OK|WARN|FAIL]` tags, so nothing depends on the agent's honesty:
-build errors, doctrine violations, broken joints, failed reference fits, and
-failed dimensional constraints are all caught mechanically. Semantic
-perception is agent vision by design — no learned depth/normal/edge models.
-Registered camera, mask, landmark, pose-chain, ratio, and layout gates verify
-visible projection; `CAMERA_SOLVE`, `SYMMETRY`, `DETACHED_PARTS`, `RIGID_AXIS`,
-and `SCENE_INTERPENETRATION` catch 3D faults a single view cannot see. Fit
-floors scale with the number of reference views, and a bounded single-view
-shortfall may ship as approximate with `limitations.md`.
+After adding `outputs/my-asset/src/plan.json` and `program.py`, compile the
+current source in a clean build without invoking an LLM:
 
-## Repository layout
-
-```
-procagen3d/
-├── procagen3d-skill/     # the skill — see its README for full docs
-│   ├── SKILL.md          # entry point: the staged loop and gates
-│   ├── scripts/          # driver + Blender-side stages
-│   ├── references/       # routed depth docs (doctrine, joints, edits, …)
-│   └── examples/         # bench-style items: L1_stool, L2_bicycle, L3_robot_arm
-└── assets/               # tracked teaser/showcase + gitignored test material
+```sh
+uv run procagen3d build outputs/my-asset
 ```
 
-## Requirements
+Resume an incomplete run or let the configured agent repair it:
 
-- **Blender 4.x or 5.x** (tested on 4.5 LTS and 5.2 LTS), found via
-  `--blender` flag → `$PROCAGEN3D_BLENDER` → PATH →
-  `~/.cache/procagen3d/*/blender`. On macOS, Blender 5.x headless needs
-  Metal GPU access; a sandboxed launch SIGSEGVs during GPU detection.
-- **Python 3.10+**. No pip packages — the harness is stdlib only, and
-  Blender stages run under Blender's bundled Python.
+```sh
+uv run procagen3d run outputs/my-asset --max-repairs 2
+```
 
-## Update log
+Long operations now report their intermediate stages: reference inspection,
+canonical rendering, each agent author/repair pass, the clean Blender build,
+GLB re-import, and fidelity scoring. Interactive terminals use a Rich spinner;
+redirected or CI logs receive explicit start and completion lines. Progress is
+written to stderr, while transcripts and Blender output remain in their normal
+workspace log files. Add `--no-progress` to `make`, `run`, or `build` for a
+quiet invocation.
 
-Entries are newest first.
+## Agent defaults
 
-### 0.3.0 — 2026-08-21
+| Backend | Executable | Default model/mode |
+| --- | --- | --- |
+| Codex | `codex` | `gpt-5.6-sol`, reasoning effort `max` |
+| Grok Build | `grok` | `grok-4.6`, reasoning effort `xhigh` |
+| Cursor | `cursor-agent` | `cursor-grok-4.6-xhigh-fast` |
 
-- Added `procagen3d solve-camera` to resect the registered viewpoint from
-  image-read landmarks, lock it into `camera_solve`/`fit_spec`, and fail
-  `CAMERA_SOLVE` when resection does not converge.
-- Added 3D structural gates a single registered view cannot see: `SYMMETRY`
-  for mirrored left/right pairs, `DETACHED_PARTS` for floating mesh islands,
-  `RIGID_AXIS` for collinear long assemblies, and `SCENE_INTERPENETRATION`
-  for declared multi-object instances.
-- Made fit floors evidence-adaptive: IoU thresholds drop 0.08 on a single
-  view, stay put at two, and rise 0.03 at three or more. Harness-owned
-  `threshold_policy` and `landmark_provenance` integrity checks stay in force.
-- Added bounded single-view approximate delivery via `limitations.md` (at
-  most 25% of gates, IoU miss ≤ 0.08, error ≤ 2× ceiling). Multi-view failures
-  still stop, and integrity faults never qualify.
-- Scaled probe and repair budgets by complexity class, and documented Blender
-  5.x / macOS Metal headless requirements.
-- Added city bicycle, compact carbine, Fujifilm X-T3, cozy living room,
-  quadcopter drone, and Spanish colonial townhouse showcase pairs; regrouped
-  the grid by category; and re-rendered the pavilion and townhouse in the
-  same studio-lit Eevee style as the other GLB stills.
+The installed Grok Build 1.0.5 CLI does not expose a separate Fast selector.
+ProcAgen3D therefore uses the closest truthful configuration—Grok 4.6 at
+Extra High—and `doctor` reports the limitation. Cursor exposes an exact Extra
+High Fast model ID.
 
-### 0.2.0 — 2026-08-17
+Each backend is a shell-free subprocess adapter. It records the prompt, JSONL
+transcript, stderr, terminal result, usage, model, and modified-file list in
+`trajectories/iter_XX`. Agents may change only `src/`.
 
-- Replaced mixed-form continuous-volume quotas with evidence-backed per-part
-  shape families, preventing legitimate camera/rifle boxes and prisms from
-  being rounded into lofts or ellipsoids.
-- Added `reconstruction_plan.json` with candidate-tested shape priors,
-  program-family tags, semantic feature coverage, and perceptual complexity.
-- Added fit schema v2 with contour-informative local silhouette regions,
-  directed frame-axis gates, and articulated pose-chain gates for segment
-  direction, bend, and normalized link length.
-- Added complexity-adaptive detail floors and hard showcase coverage checks so
-  simple repeated objects do not set the budget for cars and mecha; complex
-  plans must also distribute required features across occupied object regions.
-- Generalized the shape-only stage into an image reconstruction probe that must
-  pass family, camera, pose, and local-silhouette evidence before detail.
+## Pipeline
 
-### 0.1.0 — 2026-08-11
+```text
+image + offline GLB
+        │
+        ├─ copy + SHA-256 provenance
+        ├─ pure-Python GLB container/accessor probe
+        └─ isolated Blender reference probe
+             ├─ canonical normalization (Z-up, grounded, longest side = 2)
+             ├─ evaluated bounds and recomputed mesh geometry
+             ├─ welded-component hypotheses and Z cross-sections
+             └─ canonical renders + packed silhouette/RGB evidence
+                         │
+                         ▼
+               Codex / Grok / Cursor CLI
+                         │
+                 plan.json + program.py
+                         │
+             AST source contract and clean build
+                         │
+        Blender calls build() → editable .blend → exported GLB
+                         │
+             re-import exact GLB + same-camera renders
+                         │
+        silhouette/RGB/bounds scoring → bounded source repair loop
+```
 
-- Added the versioned `fit_spec.json` contract for registered cameras, masks,
-  landmarks, ratios, scene instances, and spatial relations.
-- Added `procagen3d fit`, exact reference-resolution rendering, overlays,
-  scored masks, and a machine-readable `fit_report.json`.
-- Added deterministic fit gates and hash-based freshness checks. Image-based
-  outputs now fail `check` when fit evidence is missing, failed, or stale;
-  text-only outputs remain unaffected.
-- Added explicit README release tracking and documented the registered-fit
-  workflow throughout the skill.
-- Reformatted the showcase as three columns per row with smaller image pairs.
+The sample GLBs are deliberately handled as semantically weak evidence: most
+contain one anonymous merged mesh, one material, no normals, no rig, and no
+animation. Node names are not trusted as part labels. Blender computes the
+evaluated geometry, while the coding agent infers meaningful construction from
+the original image, canonical views, bounds, connected components, and sparse
+cross-sections.
 
-### 0.0.1 — 2026-08-08
+For character and hybrid subjects, the validated plan adds an anatomy-aware track:
+posture, head-to-body and limb proportions, facial landmarks, hair/headwear,
+clothing layers, attachments, held props, and character-relative left/right.
+This release verifies the evaluated rest-pose GLB. A generated program may build
+an armature, but the pipeline does not yet certify skin weights, animation clips,
+IK, or walk cycles; those remain explicit limitations rather than implied output.
 
-- Published the initial code-native Blender generation workflow with build,
-  render, checks, articulation validation, constraint scoring, guarded repair,
-  and local-edit gates.
+The generated `program.py` must define a synchronous, zero-argument `build()`.
+It may use `bpy`, `bmesh`, `mathutils`, `math`, and `random`, but it may not read
+files, import/reference the source GLB, use the network, spawn processes, load
+Blender libraries, render, save, or export. The application performs those
+side effects after running the source in a clean temporary directory.
+
+### Trust boundary
+
+The AST guard, disposable agent workspace, clean build directory, and stripped
+Blender environment prevent common accidental violations; they are not a
+security sandbox for deliberately hostile Python. A generated Blender program
+has the authority of the local Blender process. Use authenticated coding-agent
+CLIs that you trust. For untrusted generation, run `make --prepare-only`, review
+`src/program.py`, and execute Blender inside your own container/OS sandbox.
+
+## Workspace
+
+```text
+outputs/<name>/
+├── manifest.json
+├── inputs/
+│   ├── reference.<image-extension>
+│   └── reference.glb
+├── evidence/
+│   ├── glb_probe.json
+│   ├── reference_scene.json
+│   ├── camera_contract.json
+│   └── reference_views/{front,back,left,right,top,iso}.png
+├── src/
+│   ├── plan.json
+│   └── program.py
+├── artifacts/
+│   ├── scene.blend
+│   ├── model.glb
+│   ├── scene_report.json
+│   ├── model_probe.json
+│   ├── build_manifest.json
+│   ├── comparison.json
+│   └── renders/
+├── trajectories/iter_XX/
+└── run_report.json
+```
+
+`complete` means the compiled artifact reached `--min-score` (default 0.35).
+`needs-review` still contains a valid program, BLEND, and GLB, but exhausted the
+bounded repair budget below that fidelity floor. Build/static failures never
+ship as valid artifacts. Commands return exit code 2 for `needs-review`, so CI
+can distinguish it from a passing result while retaining the last matching
+source/artifact pair.
+
+Reference evidence and build artifacts are assembled in same-filesystem staging
+directories and promoted as complete directory transactions. A failed probe or
+repair therefore leaves the previous valid evidence/artifact set intact. The
+candidate report and renders are produced from a fresh re-import of the exported
+GLB, so unsupported pre-export Blender state cannot improve its fidelity score.
+
+## Commands
+
+```text
+procagen3d make IMAGE GLB     create, author, compile, and verify a workspace
+procagen3d run WORKSPACE      resume generation or bounded repair
+procagen3d build WORKSPACE    compile existing source without invoking an LLM
+procagen3d inspect WORKSPACE  print manifest, artifacts, and comparison report
+procagen3d probe MODEL.glb    inspect GLB structure with the Python stdlib
+procagen3d examples           list image/GLB pairs under a local sample root
+procagen3d doctor             check uv, Blender, CLIs, and model defaults
+```
+
+Run `uv run procagen3d COMMAND --help` for all options.
+`examples` defaults to `assets/3d_glb` relative to the current directory; when
+running an installed wheel elsewhere, pass `--root /path/to/your/examples`.
+
+## Development
+
+```sh
+uv sync --group dev
+uv run pytest -q
+PROCAGEN3D_RUN_BLENDER_TESTS=1 uv run pytest -q tests/test_blender_integration.py
+```
+
+Tests cover GLB parsing/accessor transforms, semantic-boundary detection,
+generated-source policy, backend commands/parsers, workspace provenance, mask
+and RGB metrics, finite scene validation, atomic host-pipeline behavior, and
+portable build provenance. The opt-in Blender integration test saves the
+editable scene, exports a self-contained GLB, starts a second factory process,
+re-imports it, and renders all six canonical views. It also verifies that a
+generated render handler cannot cross that process boundary and inflate score.
+
+## Design lineage
+
+The application adopts the code-as-truth workspace and stateless Blender ideas
+from [OpenTopos](https://github.com/gaoypeng/opentopos), and the principle of
+using a GLB as measured multi-view evidence from
+[img2threejs](https://github.com/img2threejs/img2threejs). Neither project nor the
+retired ProcAgen3D skill is a runtime dependency.

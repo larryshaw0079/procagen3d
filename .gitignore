@@ -27,4 +27,3 @@ outputs/
 output_test/
 third-party/
 output_fix_prior/
-uv.lock
