@@ -10,7 +10,7 @@ The reconstruction mode makes the source-of-truth claim explicit:
 
 - `procedural` (default): `program.py` is standalone replay source; the GLB is
   measurement/visual evidence only.
-- `reference-derived`: the provenance-locked GLB is normalized and host-loaded
+- `glb-ref`: the provenance-locked GLB is normalized and host-loaded
   into `PROCAGEN3D_REFERENCE`. The program creates new derived objects, and the
   originals are removed before save/export. Replay truth is the program plus
   the recorded GLB and preload contract—not the Python file alone.
@@ -45,13 +45,14 @@ uv run procagen3d make \
 ```
 
 Use `--backend grok` or `--backend cursor` to switch coding agents. Workspaces
-are written to `outputs/<name>` by default. Use `--name` or `--output` to
-change that location.
+are written to `outputs/<name>-<mode>` by default. Use `--name` or `--output` to
+change that location; `--name` still receives the `-<mode>` suffix unless it
+already ends with the selected mode.
 
-For an explicitly reference-derived reconstruction:
+For an explicitly glb-ref reconstruction:
 
 ```sh
-uv run procagen3d make IMAGE GLB --mode reference-derived
+uv run procagen3d make IMAGE GLB --mode glb-ref
 ```
 
 To build evidence without spending an agent invocation:
@@ -60,17 +61,17 @@ To build evidence without spending an agent invocation:
 uv run procagen3d make IMAGE GLB --prepare-only --name my-asset
 ```
 
-After adding `outputs/my-asset/src/plan.json` and `program.py`, compile the
+After adding `outputs/my-asset-procedural/src/plan.json` and `program.py`, compile the
 current source in a clean build without invoking an LLM:
 
 ```sh
-uv run procagen3d build outputs/my-asset
+uv run procagen3d build outputs/my-asset-procedural
 ```
 
 Resume an incomplete run or let the configured agent repair it:
 
 ```sh
-uv run procagen3d run outputs/my-asset \
+uv run procagen3d run outputs/my-asset-procedural \
   --max-repairs 2 \
   --max-fidelity-repairs 1
 ```
@@ -156,7 +157,7 @@ IK, or walk cycles; those remain explicit limitations rather than implied output
 The generated `program.py` must define a synchronous, zero-argument `build()`.
 It may use `bpy`, `bmesh`, `mathutils`, `math`, and `random`, but it may not read
 files, import the source GLB itself, use the network, spawn processes, load
-Blender libraries, render, save, or export. In `reference-derived` mode only,
+Blender libraries, render, save, or export. In `glb-ref` mode only,
 it may inspect and derive new Blender objects from the host-owned normalized
 collection. The application performs all external side effects in a clean
 temporary build and records the actual mode in both workspace and artifact
@@ -179,7 +180,7 @@ CLIs that you trust. For untrusted generation, run `make --prepare-only`, review
 ## Workspace
 
 ```text
-outputs/<name>/
+outputs/<name>-<mode>/
 ├── manifest.json
 ├── inputs/
 │   ├── reference.<image-extension>
@@ -250,7 +251,7 @@ budgets, workspace provenance, hard fidelity gates, finite scene validation,
 atomic host-pipeline behavior, and portable build provenance. The opt-in Blender
 integration tests save and export in one process, re-import in a second factory
 process, verify custom-mesh transforms through translated parent empties, and
-verify that reference-derived export contains only newly created candidates.
+verify that glb-ref export contains only newly created candidates.
 
 ## Design lineage
 

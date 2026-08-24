@@ -33,7 +33,7 @@ from .reconstruction import (
     validate_reconstruction_mode,
 )
 from .rich_ui import RichProgressReporter, print_comparison, print_workspace_summary
-from .workspace import Workspace, slugify, write_json
+from .workspace import Workspace, slugify, workspace_slug, write_json
 
 
 def _positive_int(value: str) -> int:
@@ -148,7 +148,10 @@ def _progress_context(args: argparse.Namespace):
 
 
 def _command_make(args: argparse.Namespace) -> int:
-    slug = args.name or slugify(args.glb.expanduser().resolve().parent.name)
+    slug = workspace_slug(
+        args.name or slugify(args.glb.expanduser().resolve().parent.name),
+        reconstruction_mode=args.reconstruction_mode,
+    )
     with _progress_context(args) as progress:
         with progress_step(
             progress,
@@ -402,7 +405,10 @@ def build_parser() -> argparse.ArgumentParser:
     make.add_argument("image", type=Path)
     make.add_argument("glb", type=Path)
     make.add_argument("--prompt", "-p", default="")
-    make.add_argument("--name", help="workspace slug; defaults to the GLB parent directory")
+    make.add_argument(
+        "--name",
+        help="workspace slug; defaults to the GLB parent directory with -<mode> appended",
+    )
     make.add_argument("--output", "-o", type=Path, default=Path("outputs"))
     make.add_argument("--prepare-only", action="store_true", help="build evidence without invoking an LLM")
     make.add_argument("--force-probe", action="store_true")

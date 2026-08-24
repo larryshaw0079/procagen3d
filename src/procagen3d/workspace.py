@@ -27,6 +27,20 @@ def slugify(value: str) -> str:
     return value
 
 
+def workspace_slug(name: str, *, reconstruction_mode: str) -> str:
+    """Append the reconstruction mode to a workspace directory name."""
+
+    reconstruction_mode = validate_reconstruction_mode(reconstruction_mode)
+    suffix = f"-{reconstruction_mode}"
+    if name.endswith(suffix):
+        return name
+    budget = 64 - len(suffix)
+    base = name[:budget].rstrip("-_")
+    if not base:
+        raise ValueError("cannot derive a non-empty workspace slug")
+    return f"{base}{suffix}"
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:

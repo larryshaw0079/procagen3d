@@ -289,14 +289,14 @@ def build():
             "--artifacts-dir",
             derived_artifacts,
             "--mode",
-            "reference-derived",
+            "glb-ref",
             "--reference-glb",
             reference_artifacts / "model.glb",
         ],
         cwd=tmp_path,
         timeout_s=180,
     )
-    require_success(derived_build, stage="integration reference-derived build")
+    require_success(derived_build, stage="integration glb-ref build")
 
     contract = tmp_path / "derived_camera_contract.json"
     write_json(
@@ -335,7 +335,7 @@ def build():
         cwd=tmp_path,
         timeout_s=180,
     )
-    require_success(compiled, stage="integration reference-derived GLB probe")
+    require_success(compiled, stage="integration glb-ref GLB probe")
 
     report = json.loads((derived_artifacts / "scene_report.json").read_text(encoding="utf-8"))
     assert report["geometry_object_count"] == 1

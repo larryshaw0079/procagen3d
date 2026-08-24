@@ -22,9 +22,9 @@ def _mode_contract(reconstruction_mode: str) -> str:
 - Do not copy, embed, trace, or import the reference mesh, and do not emit large vertex/index dumps.
 - The reference GLB and its reports are measurement evidence only.
 - `src/program.py` is the standalone replay source of truth in this mode."""
-    return """Reconstruction mode: `reference-derived`.
+    return """Reconstruction mode: `glb-ref`.
 - At build time the verified GLB is host-imported, frame-0/rest-posed, and normalized into the Blender collection `PROCAGEN3D_REFERENCE`; its longest dimension is 2 units and its ground is Z=0.
-- `build()` may inspect those Blender objects and may duplicate mesh data, segment, remesh, retopologize, simplify, transform, or procedurally augment them. This is an intentionally reference-derived reconstruction, not an independently procedural claim.
+- `build()` may inspect those Blender objects and may duplicate mesh data, segment, remesh, retopologize, simplify, transform, or procedurally augment them. This is an intentionally glb-ref reconstruction, not an independently procedural claim.
 - Do not reset the scene or delete, rename, mutate, hide, move, or relink host-owned reference objects or `PROCAGEN3D_REFERENCE`; cleanup may remove only objects created by your own `build()`.
 - `build()` must create candidate geometry as new Blender objects. Put it outside `PROCAGEN3D_REFERENCE`, detach it from reference parents, and do not leave modifiers that depend on reference objects. The host deletes every original reference object before saving and exporting.
 - Do not read or import the GLB yourself, embed large geometry dumps in Python, or export the original host-owned objects directly.
@@ -76,7 +76,7 @@ Program contract:
 - Make recognizable silhouette, proportions, major color blocks, and identity features the priority. Organize parts under named objects/collections.
 - Make transforms deterministic. Prefer assigning explicit world matrices built with `mathutils.Matrix.LocRotScale`. If you set location/rotation/scale properties or create/reparent a hierarchy, call `bpy.context.view_layer.update()` before reading or preserving any `matrix_world`; newly authored nested parent chains also require this evaluation before a keep-world reparent.
 - For characters, preserve the reference posture and character-relative left/right; solve the head, face, hands/feet, costume silhouette, attachments, and held props as explicit semantic parts. A merged source mesh is not permission to invent hidden anatomy. Do not claim a usable rig unless you actually construct and bind one.
-- The host build runs under `blender --background --factory-startup`. In procedural mode the program needs no application-owned inputs; in reference-derived mode it intentionally requires the documented, normalized host collection.
+- The host build runs under `blender --background --factory-startup`. In procedural mode the program needs no application-owned inputs; in glb-ref mode it intentionally requires the documented, normalized host collection.
 - Do not read files, import/link external assets, access the network, start processes, render, save a .blend, or export a GLB. The application owns those operations.
 - Do not invoke Blender during this agent turn. Limit local validation to JSON parsing and Python syntax/static checks; the host pipeline runs Blender after source promotion.
 - Do not merely explain or paste code into chat. Inspect the evidence and write both files directly. Finish only after `python -m py_compile src/program.py` would succeed.

@@ -23,7 +23,7 @@ def arguments():
     parser.add_argument("--artifacts-dir", type=Path, required=True)
     parser.add_argument(
         "--mode",
-        choices=("procedural", "reference-derived"),
+        choices=("procedural", "glb-ref"),
         default="procedural",
     )
     parser.add_argument("--reference-glb", type=Path)
@@ -49,7 +49,7 @@ def import_reference(path):
     """Import normalized evidence and return the exact objects owned by the host."""
 
     if path is None or not path.is_file():
-        raise RuntimeError("reference-derived mode requires a verified --reference-glb")
+        raise RuntimeError("glb-ref mode requires a verified --reference-glb")
     before = set(bpy.context.scene.objects)
     if "FINISHED" not in bpy.ops.import_scene.gltf(filepath=str(path)):
         raise RuntimeError("reference GLB import did not finish")
@@ -72,7 +72,7 @@ def import_reference(path):
         for owner in tuple(obj.users_collection):
             owner.objects.unlink(obj)
         collection.objects.link(obj)
-    bpy.context.scene["procagen3d_reconstruction_mode"] = "reference-derived"
+    bpy.context.scene["procagen3d_reconstruction_mode"] = "glb-ref"
     bpy.context.scene["procagen3d_reference_collection"] = REFERENCE_COLLECTION
     return reference_objects
 
@@ -121,7 +121,7 @@ def main():
     args.artifacts_dir.mkdir(parents=True, exist_ok=True)
     reset_scene()
     reference_objects = set()
-    if args.mode == "reference-derived":
+    if args.mode == "glb-ref":
         reference_objects = import_reference(args.reference_glb)
     elif args.reference_glb is not None:
         raise RuntimeError("procedural mode must not receive --reference-glb")
@@ -133,9 +133,9 @@ def main():
     build()
     bpy.context.view_layer.update()
     objects = [obj for obj in geometry_objects() if obj not in reference_objects]
-    if args.mode == "reference-derived" and not objects:
+    if args.mode == "glb-ref" and not objects:
         raise RuntimeError(
-            "reference-derived build() must create candidate geometry; "
+            "glb-ref build() must create candidate geometry; "
             "the host reference collection is evidence, not the output"
         )
     if reference_objects:

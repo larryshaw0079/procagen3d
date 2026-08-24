@@ -61,7 +61,7 @@ PLAN_SCHEMA: dict[str, Any] = {
             "enum": list(RECONSTRUCTION_MODES),
             "default": DEFAULT_RECONSTRUCTION_MODE,
             "description": (
-                "procedural synthesizes compact editable geometry; reference-derived "
+                "procedural synthesizes compact editable geometry; glb-ref "
                 "may derive geometry from the supplied reference under the host contract."
             ),
         },

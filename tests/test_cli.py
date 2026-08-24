@@ -28,11 +28,11 @@ def test_run_uses_manifest_backend_when_override_is_absent() -> None:
     assert args.reconstruction_mode is None
 
 
-def test_make_accepts_reference_derived_mode() -> None:
+def test_make_accepts_glb_ref_mode() -> None:
     args = build_parser().parse_args(
-        ["make", "image.png", "model.glb", "--mode", "reference-derived"]
+        ["make", "image.png", "model.glb", "--mode", "glb-ref"]
     )
-    assert args.reconstruction_mode == "reference-derived"
+    assert args.reconstruction_mode == "glb-ref"
 
 
 def test_long_running_commands_accept_no_progress() -> None:

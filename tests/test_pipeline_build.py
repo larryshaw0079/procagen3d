@@ -165,7 +165,7 @@ def test_build_rejects_plan_mode_that_differs_from_host_mode(tmp_path: Path) -> 
         pipeline.build_workspace(
             workspace,
             UnusedRuntime(),
-            reconstruction_mode="reference-derived",
+            reconstruction_mode="glb-ref",
             timeout_s=10,
         )
 
@@ -251,7 +251,7 @@ def test_build_reports_keep_workspace_relative_provenance(
 ) -> None:
     workspace = _workspace(tmp_path)
     plan = json.loads(workspace.plan_path.read_text(encoding="utf-8"))
-    plan["reconstruction_mode"] = "reference-derived"
+    plan["reconstruction_mode"] = "glb-ref"
     write_json(workspace.plan_path, plan)
     workspace.evidence_dir.mkdir(exist_ok=True)
     (workspace.evidence_dir / "camera_contract.json").write_text("{}", encoding="utf-8")
@@ -312,7 +312,7 @@ def test_build_reports_keep_workspace_relative_provenance(
         workspace,
         runtime,
         min_score=0.0,
-        reconstruction_mode="reference-derived",
+        reconstruction_mode="glb-ref",
         timeout_s=10,
         trajectory_dir=trajectory,
         progress=events.append,
@@ -321,7 +321,7 @@ def test_build_reports_keep_workspace_relative_provenance(
     assert result["passed"] is True
     assert runtime.stages == ["build_asset", "compiled_probe"]
     build_arguments = runtime.arguments["build_asset"]
-    assert build_arguments[build_arguments.index("--mode") + 1] == "reference-derived"
+    assert build_arguments[build_arguments.index("--mode") + 1] == "glb-ref"
     staged_reference = build_arguments[build_arguments.index("--reference-glb") + 1]
     assert staged_reference.name == "reference.glb"
     assert staged_reference.parent != workspace.glb_path.parent
@@ -352,7 +352,7 @@ def test_build_reports_keep_workspace_relative_provenance(
     assert model_probe["path"] == "artifacts/model.glb"
     assert scene_report["program"] == "src/program.py"
     assert build_manifest["compiled_glb_verified_in_separate_process"] is True
-    assert build_manifest["reconstruction_mode"] == "reference-derived"
+    assert build_manifest["reconstruction_mode"] == "glb-ref"
     assert build_manifest["source_glb_imported_at_build_time"] is True
     assert build_manifest["reference_glb_sha256"] == workspace.manifest()["inputs"]["glb"]["sha256"]
     assert "originals removed before export" in build_manifest["reference_contract"]

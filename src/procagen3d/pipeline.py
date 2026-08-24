@@ -674,7 +674,7 @@ def build_workspace(
         raise ValueError("Blender timeout must be greater than zero")
     reference_snapshot: bytes | None = None
     reference_digest: str | None = None
-    if reconstruction_mode == "reference-derived":
+    if reconstruction_mode == "glb-ref":
         reference_snapshot, reference_digest = _verified_glb_snapshot(workspace)
     source_trajectory: Path | None = None
     with progress_step(
@@ -735,7 +735,7 @@ def build_workspace(
                 "--mode",
                 reconstruction_mode,
             ]
-            if reconstruction_mode == "reference-derived":
+            if reconstruction_mode == "glb-ref":
                 build_arguments.extend(["--reference-glb", staged_reference])
             result = runtime.run_stage(
                 "build_asset",
@@ -850,16 +850,16 @@ def build_workspace(
                     ),
                     "replay_source_of_truth": (
                         ["src/program.py", "inputs/reference.glb", "host-reference-preload-v1"]
-                        if reconstruction_mode == "reference-derived"
+                        if reconstruction_mode == "glb-ref"
                         else ["src/program.py"]
                     ),
                     "source_glb_imported_at_build_time": (
-                        reconstruction_mode == "reference-derived"
+                        reconstruction_mode == "glb-ref"
                     ),
                     "reference_glb_sha256": reference_digest,
                     "reference_contract": (
                         "host-imported-normalized-source; originals removed before export"
-                        if reconstruction_mode == "reference-derived"
+                        if reconstruction_mode == "glb-ref"
                         else "measurement-evidence-only"
                     ),
                     "compiled_glb_verified_in_separate_process": True,

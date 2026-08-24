@@ -30,7 +30,7 @@ def _valid_plan() -> dict[str, object]:
 
 def test_schema_declares_modes_and_old_plans_default_to_procedural() -> None:
     mode = PLAN_SCHEMA["properties"]["reconstruction_mode"]
-    assert mode["enum"] == ["procedural", "reference-derived"]
+    assert mode["enum"] == ["procedural", "glb-ref"]
     assert mode["default"] == "procedural"
 
     original = _valid_plan()
@@ -38,8 +38,8 @@ def test_schema_declares_modes_and_old_plans_default_to_procedural() -> None:
     assert "reconstruction_mode" not in original
     assert normalized["reconstruction_mode"] == "procedural"
 
-    original["reconstruction_mode"] = "reference-derived"
-    assert validate_plan_document(original)["reconstruction_mode"] == "reference-derived"
+    original["reconstruction_mode"] = "glb-ref"
+    assert validate_plan_document(original)["reconstruction_mode"] == "glb-ref"
 
 
 def test_prompt_ready_schema_text_is_the_exact_authoritative_document() -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-RECONSTRUCTION_MODES = ("procedural", "reference-derived")
+RECONSTRUCTION_MODES = ("procedural", "glb-ref")
 DEFAULT_RECONSTRUCTION_MODE = "procedural"
 
 

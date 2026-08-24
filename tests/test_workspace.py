@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from procagen3d.workspace import Workspace, slugify, write_json
+from procagen3d.workspace import Workspace, slugify, workspace_slug, write_json
 
 
 def _workspace(tmp_path: Path, *, slug: str = "fixture") -> Workspace:
@@ -31,6 +31,22 @@ def test_slugify_is_stable_and_bounded() -> None:
     assert len(slugify("a" * 100)) == 64
     with pytest.raises(ValueError):
         slugify("---")
+
+
+def test_workspace_slug_appends_mode_without_duplicating_it() -> None:
+    assert workspace_slug("mystic-mouse", reconstruction_mode="procedural") == (
+        "mystic-mouse-procedural"
+    )
+    assert workspace_slug("mystic-mouse", reconstruction_mode="glb-ref") == (
+        "mystic-mouse-glb-ref"
+    )
+    assert workspace_slug("custom-procedural", reconstruction_mode="procedural") == (
+        "custom-procedural"
+    )
+    long_name = "a" * 64
+    suffixed = workspace_slug(long_name, reconstruction_mode="procedural")
+    assert suffixed.endswith("-procedural")
+    assert len(suffixed) == 64
 
 
 def test_workspace_copies_inputs_and_records_provenance(tmp_path: Path) -> None:
@@ -68,7 +84,7 @@ def test_workspace_copies_inputs_and_records_provenance(tmp_path: Path) -> None:
         )
 
 
-def test_workspace_records_reference_derived_mode(tmp_path: Path) -> None:
+def test_workspace_records_glb_ref_mode(tmp_path: Path) -> None:
     image = tmp_path / "image.png"
     glb = tmp_path / "model.glb"
     image.write_bytes(b"image")
@@ -81,10 +97,10 @@ def test_workspace_records_reference_derived_mode(tmp_path: Path) -> None:
         glb=glb,
         prompt="",
         backend="codex",
-        reconstruction_mode="reference-derived",
+        reconstruction_mode="glb-ref",
     )
 
-    assert workspace.manifest()["reconstruction_mode"] == "reference-derived"
+    assert workspace.manifest()["reconstruction_mode"] == "glb-ref"
 
 
 def test_workspace_locate_by_slug_and_update_manifest(tmp_path: Path) -> None:
