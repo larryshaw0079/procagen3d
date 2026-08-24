@@ -8,19 +8,23 @@ wheels/
 
 # Virtual environments
 .venv
+.venv/
 
-uv.lock
-
-# ProcAgen3D skill outputs
-.procagen3d
-procagen3d_out/
+# ProcAgen3D application outputs
+.procagen3d/
 assets/*
 !assets/teaser.png
 !assets/showcase/
 !assets/showcase/*.png
+!assets/3d_glb/
+!assets/3d_glb/**/
+!assets/3d_glb/**/*.png
+!assets/3d_glb/**/*.glb
+.DS_Store
 
 benchmark/
 outputs/
 output_test/
 third-party/
 output_fix_prior/
+uv.lock

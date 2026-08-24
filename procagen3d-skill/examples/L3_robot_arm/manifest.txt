@@ -1,6 +1,0 @@
-An industrial 6-axis-style robot arm bolted to a base flange of 17 cm
-radius with 8 bolts on a bolt circle. The shoulder pivot sits at 40.5 cm
-height and the elbow pivot at 86.5 cm (measured along the arm at rest,
-pointing up). Base yaw, shoulder and elbow are revolute joints with
-physically sensible limits; include a simple two-finger gripper at the
-wrist. Painted steel body, dark rubber cable sleeves.
