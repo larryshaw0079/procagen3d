@@ -1,14 +1,21 @@
 # ProcAgen3D
 
-ProcAgen3D is a standalone Python application that turns an **image plus an
-offline-generated reference GLB** into two linked deliverables:
+ProcAgen3D turns an **image plus an offline-generated reference GLB** into two
+linked deliverables:
 
-- editable, standalone Blender Python in `src/program.py`; and
+- editable Blender Python in `src/program.py`; and
 - `artifacts/model.glb`, compiled by running that program in headless Blender.
 
-The Blender program is the source of truth. The supplied GLB is used only as
-measurement and visual evidence; generated programs are statically rejected if
-they try to load it at runtime.
+The reconstruction mode makes the source-of-truth claim explicit:
+
+- `procedural` (default): `program.py` is standalone replay source; the GLB is
+  measurement/visual evidence only.
+- `reference-derived`: the provenance-locked GLB is normalized and host-loaded
+  into `PROCAGEN3D_REFERENCE`. The program creates new derived objects, and the
+  originals are removed before save/export. Replay truth is the program plus
+  the recorded GLB and preload contract—not the Python file alone.
+
+Generated programs cannot read/import files themselves in either mode.
 
 ![ProcAgen3D teaser](assets/teaser.png)
 
@@ -41,6 +48,12 @@ Use `--backend grok` or `--backend cursor` to switch coding agents. Workspaces
 are written to `outputs/<name>` by default. Use `--name` or `--output` to
 change that location.
 
+For an explicitly reference-derived reconstruction:
+
+```sh
+uv run procagen3d make IMAGE GLB --mode reference-derived
+```
+
 To build evidence without spending an agent invocation:
 
 ```sh
@@ -57,17 +70,26 @@ uv run procagen3d build outputs/my-asset
 Resume an incomplete run or let the configured agent repair it:
 
 ```sh
-uv run procagen3d run outputs/my-asset --max-repairs 2
+uv run procagen3d run outputs/my-asset \
+  --max-repairs 2 \
+  --max-fidelity-repairs 1
 ```
+
+These are independent budgets: schema/source-guard/Blender failures use
+`--max-repairs`; only successful rendered candidates use
+`--max-fidelity-repairs`. At least one post-render repair is mandatory, so an
+aggregate score cannot end the full agent pipeline before visual feedback.
 
 Long operations now report their intermediate stages: reference inspection,
 canonical rendering, each agent author/repair pass, the clean Blender build,
 GLB re-import, and fidelity scoring. Interactive terminals use a Rich spinner;
 redirected or CI logs receive explicit start and completion lines. Progress is
-written to stderr. During an agent pass, sanitized provider milestones and a
-30-second heartbeat show elapsed time, structured-event count, last CLI-output
-age, and the current sizes of `plan.json` and `program.py`. Raw reasoning,
-commands, command output, and provider JSON remain only in the workspace logs.
+written to stderr. During a Codex pass, interactive activity updates the current
+spinner in place. Redirected logs show only turn start, completed `src/` writes,
+failures, and terminal usage; agent heartbeats are disabled. Successful
+workspace checks, reasoning steps, and assistant/tool chatter are suppressed
+from live output. Raw reasoning, commands, command output, and provider JSON
+remain complete in the workspace logs.
 Add `--no-progress` to `make`, `run`, or `build` for a quiet invocation.
 
 ## Agent defaults
@@ -114,7 +136,7 @@ image + offline GLB
                          │
              re-import exact GLB + same-camera renders
                          │
-        silhouette/RGB/bounds scoring → bounded source repair loop
+        aggregate diagnostics + non-compensating gates → split repair loops
 ```
 
 The sample GLBs are deliberately handled as semantically weak evidence: most
@@ -133,9 +155,17 @@ IK, or walk cycles; those remain explicit limitations rather than implied output
 
 The generated `program.py` must define a synchronous, zero-argument `build()`.
 It may use `bpy`, `bmesh`, `mathutils`, `math`, and `random`, but it may not read
-files, import/reference the source GLB, use the network, spawn processes, load
-Blender libraries, render, save, or export. The application performs those
-side effects after running the source in a clean temporary directory.
+files, import the source GLB itself, use the network, spawn processes, load
+Blender libraries, render, save, or export. In `reference-derived` mode only,
+it may inspect and derive new Blender objects from the host-owned normalized
+collection. The application performs all external side effects in a clean
+temporary build and records the actual mode in both workspace and artifact
+provenance.
+
+Generated parent/transform helpers must use explicit world transforms such as
+`Matrix.LocRotScale`, or refresh the Blender view layer before reading
+`matrix_world`. The source guard rejects the stale snapshot → reparent → restore
+pattern that otherwise collapses newly linked custom meshes to the origin.
 
 ### Trust boundary
 
@@ -174,11 +204,14 @@ outputs/<name>/
 └── run_report.json
 ```
 
-`complete` means the compiled artifact reached `--min-score` (default 0.35).
-`needs-review` still contains a valid program, BLEND, and GLB, but exhausted the
-bounded repair budget below that fidelity floor. Build/static failures never
-ship as valid artifacts. Commands return exit code 2 for `needs-review`, so CI
-can distinguish it from a passing result while retaining the last matching
+`complete` requires both `--min-score` (default 0.35) and every hard gate:
+mean silhouette IoU, worst-view silhouette IoU, worst-view foreground-area
+similarity, center distance, and ground-plane offset. These gates are
+non-compensating, so correct overall dimensions can no longer hide collapsed or
+misplaced geometry. `needs-review` still contains a valid program, BLEND, and
+GLB, but exhausted the post-render budget without passing. Build/static failures
+never ship as valid artifacts. Commands return exit code 2 for `needs-review`,
+so CI can distinguish it from a passing result while retaining the last matching
 source/artifact pair.
 
 Reference evidence and build artifacts are assembled in same-filesystem staging
@@ -212,12 +245,12 @@ PROCAGEN3D_RUN_BLENDER_TESTS=1 uv run pytest -q tests/test_blender_integration.p
 ```
 
 Tests cover GLB parsing/accessor transforms, semantic-boundary detection,
-generated-source policy, backend commands/parsers, workspace provenance, mask
-and RGB metrics, finite scene validation, atomic host-pipeline behavior, and
-portable build provenance. The opt-in Blender integration test saves the
-editable scene, exports a self-contained GLB, starts a second factory process,
-re-imports it, and renders all six canonical views. It also verifies that a
-generated render handler cannot cross that process boundary and inflate score.
+generated-source policy, exact/exhaustive plan-schema validation, split repair
+budgets, workspace provenance, hard fidelity gates, finite scene validation,
+atomic host-pipeline behavior, and portable build provenance. The opt-in Blender
+integration tests save and export in one process, re-import in a second factory
+process, verify custom-mesh transforms through translated parent empties, and
+verify that reference-derived export contains only newly created candidates.
 
 ## Design lineage
 

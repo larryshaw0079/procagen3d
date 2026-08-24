@@ -70,11 +70,11 @@ def geometry_objects():
     return [obj for obj in bpy.context.scene.objects if obj.type in supported and is_renderable(obj)]
 
 
-def validate_drawable_scene():
+def validate_drawable_scene(objects=None):
     """Return renderable geometry after finite/evaluated triangle validation."""
 
     bpy.context.view_layer.update()
-    objects = geometry_objects()
+    objects = list(objects) if objects is not None else geometry_objects()
     if not objects:
         raise RuntimeError("scene contains no renderable geometry objects")
     depsgraph = bpy.context.evaluated_depsgraph_get()

@@ -14,6 +14,8 @@ def test_make_defaults_to_requested_codex_configuration() -> None:
     args = build_parser().parse_args(["make", "image.png", "model.glb"])
     assert args.backend == "codex"
     assert args.max_repairs == 2
+    assert args.max_fidelity_repairs == 1
+    assert args.reconstruction_mode == "procedural"
     backend = create_backend(args.backend)
     assert backend.model == "gpt-5.6-sol"
     assert backend.reasoning_effort == "max"
@@ -23,6 +25,14 @@ def test_run_uses_manifest_backend_when_override_is_absent() -> None:
     args = build_parser().parse_args(["run", "workspace"])
     assert args.workspace == Path("workspace")
     assert args.backend is None
+    assert args.reconstruction_mode is None
+
+
+def test_make_accepts_reference_derived_mode() -> None:
+    args = build_parser().parse_args(
+        ["make", "image.png", "model.glb", "--mode", "reference-derived"]
+    )
+    assert args.reconstruction_mode == "reference-derived"
 
 
 def test_long_running_commands_accept_no_progress() -> None:

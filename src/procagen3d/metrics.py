@@ -6,6 +6,7 @@ import base64
 import binascii
 import json
 import math
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,55 @@ _SCORE_WEIGHTS = {
     "dimension_similarity": 0.15,
     "center_similarity": 0.10,
 }
+
+
+@dataclass(frozen=True)
+class FidelityGateThresholds:
+    """Non-compensating fidelity requirements applied after aggregate scoring.
+
+    The pipeline normalizes the reference's longest dimension to two units, so
+    the distance thresholds are expressed in those normalized scene units.
+    Callers may pass a different instance to :func:`compare_workspace` when a
+    reconstruction profile needs stricter or more permissive gates.
+    """
+
+    min_mean_silhouette_iou: float = 0.40
+    min_view_silhouette_iou: float = 0.30
+    min_view_area_similarity: float = 0.40
+    max_center_distance: float = 0.35
+    max_ground_offset: float = 0.10
+
+    def __post_init__(self) -> None:
+        probability_fields = (
+            "min_mean_silhouette_iou",
+            "min_view_silhouette_iou",
+            "min_view_area_similarity",
+        )
+        distance_fields = ("max_center_distance", "max_ground_offset")
+        for name in probability_fields:
+            _validate_gate_threshold(name, getattr(self, name), maximum=1.0)
+        for name in distance_fields:
+            _validate_gate_threshold(name, getattr(self, name))
+
+
+def _validate_gate_threshold(
+    name: str,
+    value: Any,
+    *,
+    maximum: float | None = None,
+) -> float:
+    qualifier = " between 0 and 1" if maximum == 1.0 else " and non-negative"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be finite{qualifier}")
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} must be finite{qualifier}") from exc
+    if not math.isfinite(result) or result < 0.0 or (
+        maximum is not None and result > maximum
+    ):
+        raise ValueError(f"{name} must be finite{qualifier}")
+    return result
 
 
 def _get_bit(data: bytes, index: int) -> bool:
@@ -254,6 +304,123 @@ def _vector_similarity(reference: list[float], candidate: list[float]) -> float:
     return _bounded_score("dimension similarity", sum(values) / len(values))
 
 
+def _hard_gate_result(
+    *,
+    value: float,
+    threshold: float,
+    operator: str,
+    passed: bool,
+    message: str,
+    view: str | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "value": value,
+        "operator": operator,
+        "threshold": threshold,
+        "passed": passed,
+        "message": message,
+    }
+    if view is not None:
+        result["view"] = view
+    return result
+
+
+def _evaluate_hard_gates(
+    *,
+    views: dict[str, dict[str, Any]],
+    mean_iou: float,
+    center_distance: float,
+    reference_geometry: dict[str, list[float]],
+    candidate_geometry: dict[str, list[float]],
+    thresholds: FidelityGateThresholds,
+) -> dict[str, Any]:
+    worst_iou_view, worst_iou_metrics = min(
+        views.items(), key=lambda item: item[1]["iou"]
+    )
+    worst_area_view, worst_area_metrics = min(
+        views.items(), key=lambda item: item[1]["area_similarity"]
+    )
+    ground_offset = abs(
+        candidate_geometry["min"][2] - reference_geometry["min"][2]
+    )
+    if not math.isfinite(ground_offset):
+        raise ValueError("reference and candidate ground offset is not finite")
+
+    mean_iou_passed = mean_iou >= thresholds.min_mean_silhouette_iou
+    worst_iou = float(worst_iou_metrics["iou"])
+    worst_iou_passed = worst_iou >= thresholds.min_view_silhouette_iou
+    worst_area = float(worst_area_metrics["area_similarity"])
+    worst_area_passed = worst_area >= thresholds.min_view_area_similarity
+    center_passed = center_distance <= thresholds.max_center_distance
+    ground_passed = ground_offset <= thresholds.max_ground_offset
+
+    results = {
+        "mean_silhouette_iou": _hard_gate_result(
+            value=mean_iou,
+            threshold=thresholds.min_mean_silhouette_iou,
+            operator=">=",
+            passed=mean_iou_passed,
+            message=(
+                f"mean silhouette IoU {mean_iou:.4f} must be at least "
+                f"{thresholds.min_mean_silhouette_iou:.4f}"
+            ),
+        ),
+        "minimum_view_silhouette_iou": _hard_gate_result(
+            value=worst_iou,
+            threshold=thresholds.min_view_silhouette_iou,
+            operator=">=",
+            passed=worst_iou_passed,
+            view=worst_iou_view,
+            message=(
+                f"{worst_iou_view} silhouette IoU {worst_iou:.4f} must be at least "
+                f"{thresholds.min_view_silhouette_iou:.4f}"
+            ),
+        ),
+        "minimum_view_area_similarity": _hard_gate_result(
+            value=worst_area,
+            threshold=thresholds.min_view_area_similarity,
+            operator=">=",
+            passed=worst_area_passed,
+            view=worst_area_view,
+            message=(
+                f"{worst_area_view} foreground-area similarity {worst_area:.4f} "
+                f"must be at least {thresholds.min_view_area_similarity:.4f}"
+            ),
+        ),
+        "center_distance": _hard_gate_result(
+            value=center_distance,
+            threshold=thresholds.max_center_distance,
+            operator="<=",
+            passed=center_passed,
+            message=(
+                f"center distance {center_distance:.4f} must be at most "
+                f"{thresholds.max_center_distance:.4f}"
+            ),
+        ),
+        "ground_offset": _hard_gate_result(
+            value=ground_offset,
+            threshold=thresholds.max_ground_offset,
+            operator="<=",
+            passed=ground_passed,
+            message=(
+                f"ground-plane offset {ground_offset:.4f} must be at most "
+                f"{thresholds.max_ground_offset:.4f}"
+            ),
+        ),
+    }
+    failures = [
+        {"gate": name, **result}
+        for name, result in results.items()
+        if not result["passed"]
+    ]
+    return {
+        "passed": not failures,
+        "thresholds": asdict(thresholds),
+        "results": results,
+        "failures": failures,
+    }
+
+
 def compare_workspace(
     *,
     reference_masks: Path,
@@ -262,8 +429,13 @@ def compare_workspace(
     candidate_scene: Path,
     output: Path,
     min_score: float,
+    gate_thresholds: FidelityGateThresholds | None = None,
 ) -> dict[str, Any]:
     min_score = _score_threshold(min_score)
+    if gate_thresholds is None:
+        gate_thresholds = FidelityGateThresholds()
+    elif not isinstance(gate_thresholds, FidelityGateThresholds):
+        raise TypeError("gate_thresholds must be a FidelityGateThresholds instance")
     reference_mask_data = _canonical_views(reference_masks, label="reference")
     candidate_mask_data = _canonical_views(candidate_masks, label="candidate")
     views = {
@@ -297,12 +469,23 @@ def compare_workspace(
         + _SCORE_WEIGHTS["dimension_similarity"] * dimension_similarity
         + _SCORE_WEIGHTS["center_similarity"] * center_similarity,
     )
+    hard_gates = _evaluate_hard_gates(
+        views=views,
+        mean_iou=mean_iou,
+        center_distance=center_distance,
+        reference_geometry=reference_geometry,
+        candidate_geometry=candidate_geometry,
+        thresholds=gate_thresholds,
+    )
+    score_passed = score >= min_score
     report = {
         "schema_version": 2,
         "score": score,
         "score_weights": dict(_SCORE_WEIGHTS),
         "min_score": min_score,
-        "passed": score >= min_score,
+        "score_passed": score_passed,
+        "passed": score_passed and hard_gates["passed"],
+        "hard_gates": hard_gates,
         "summary": {
             "mean_silhouette_iou": mean_iou,
             "mean_area_similarity": mean_area,

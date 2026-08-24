@@ -232,6 +232,45 @@ values[0] = 2
 '''
         self.assertIn("module-side-effect", codes(subscript))
 
+    def test_rejects_stale_world_matrix_parenting_pattern(self) -> None:
+        unsafe = '''
+import bpy
+def parent_keep_world(obj, parent):
+    world = obj.matrix_world.copy()
+    obj.parent = parent
+    obj.matrix_world = world
+def build():
+    pass
+'''
+        self.assertIn("stale-world-transform", codes(unsafe))
+
+    def test_accepts_refreshed_or_explicit_world_matrix_parenting(self) -> None:
+        refreshed = '''
+import bpy
+def parent_keep_world(obj, parent):
+    bpy.context.view_layer.update()
+    world = obj.matrix_world.copy()
+    obj.parent = parent
+    obj.matrix_world = world
+def build():
+    pass
+'''
+        explicit = '''
+import bpy
+from mathutils import Matrix
+def parent_keep_world(obj, parent):
+    world = Matrix.LocRotScale(
+        obj.location.copy(), obj.rotation_euler.to_quaternion(), obj.scale.copy()
+    )
+    obj.parent = parent
+    bpy.context.view_layer.update()
+    obj.matrix_world = world
+def build():
+    pass
+'''
+        self.assertEqual(validate_source(refreshed), ())
+        self.assertEqual(validate_source(explicit), ())
+
     def test_definitions_cannot_execute_blender_code_before_build(self) -> None:
         default_call = '''
 import bpy

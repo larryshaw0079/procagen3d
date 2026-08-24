@@ -18,8 +18,10 @@ from .backends import CLIBackend, create_backend
 from .blender import BlenderError, BlenderRuntime, require_success
 from .glb_probe import probe_glb
 from .metrics import compare_workspace, mask_metrics
+from .plan_schema import PlanSchemaError, validate_plan_document
 from .progress import ProgressReporter, emit_progress, progress_step
 from .prompts import initial_prompt, repair_prompt
+from .reconstruction import DEFAULT_RECONSTRUCTION_MODE, validate_reconstruction_mode
 from .source_guard import SourceGuardError, assert_safe_source
 from .workspace import Workspace, sha256, write_json
 
@@ -33,7 +35,9 @@ class PipelineConfig:
     backend: str = "codex"
     blender: Path | None = None
     max_repairs: int = 2
+    max_fidelity_repairs: int = 1
     min_score: float = 0.35
+    reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE
     render_size: int = 256
     llm_timeout_s: int = 1800
     blender_timeout_s: int = 900
@@ -309,98 +313,22 @@ def prepare_reference(
     return report
 
 
-def _validate_plan(path: Path) -> None:
+def _validate_plan(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise PipelineError("agent did not create src/plan.json")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-standard numeric constant {token!r}")
+            ),
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
         raise PipelineError(f"src/plan.json is invalid JSON: {exc}") from exc
-    required = {
-        "subject",
-        "subject_kind",
-        "coordinate_frame",
-        "dimensions",
-        "parts",
-        "materials",
-        "construction_strategy",
-        "identity_features",
-        "limitations",
-    }
-    if not isinstance(value, dict):
-        raise PipelineError("src/plan.json must contain a JSON object")
-    missing = sorted(required - value.keys())
-    if missing:
-        raise PipelineError("src/plan.json is missing: " + ", ".join(missing))
-    if not isinstance(value["subject"], str) or not value["subject"].strip():
-        raise PipelineError("src/plan.json subject must be a non-empty string")
-    subject_kind = value["subject_kind"]
-    if not isinstance(subject_kind, str) or subject_kind not in {
-        "object",
-        "character",
-        "hybrid",
-        "scene",
-    }:
-        raise PipelineError(
-            "src/plan.json subject_kind must be object, character, hybrid, or scene"
-        )
-    character_analysis = value.get("character_analysis")
-    if subject_kind in {"character", "hybrid"}:
-        if not isinstance(character_analysis, dict):
-            raise PipelineError(
-                "character and hybrid plans must contain a character_analysis object"
-            )
-        character_keys = {
-            "pose",
-            "proportions",
-            "facial_landmarks",
-            "hair_or_headwear",
-            "clothing_layers",
-            "held_props",
-            "left_right_asymmetry",
-            "inferred_features",
-        }
-        character_missing = sorted(character_keys - character_analysis.keys())
-        if character_missing:
-            raise PipelineError(
-                "src/plan.json character_analysis is missing: "
-                + ", ".join(character_missing)
-            )
-        if not isinstance(character_analysis["pose"], str) or not character_analysis[
-            "pose"
-        ].strip():
-            raise PipelineError("src/plan.json character_analysis.pose must be a non-empty string")
-        if not isinstance(character_analysis["proportions"], dict):
-            raise PipelineError("src/plan.json character_analysis.proportions must be an object")
-        for key in character_keys - {"pose", "proportions"}:
-            if not isinstance(character_analysis[key], list):
-                raise PipelineError(f"src/plan.json character_analysis.{key} must be a list")
-    elif character_analysis is not None and not isinstance(character_analysis, dict):
-        raise PipelineError("src/plan.json character_analysis must be an object when provided")
-    for key in ("parts", "materials", "identity_features", "limitations"):
-        if not isinstance(value[key], list):
-            raise PipelineError(f"src/plan.json {key} must be a list")
-    if not isinstance(value["coordinate_frame"], dict):
-        raise PipelineError("src/plan.json coordinate_frame must be an object")
-    dimensions = value["dimensions"]
-    if not (
-        isinstance(dimensions, list)
-        and len(dimensions) == 3
-        and all(
-            isinstance(component, (int, float))
-            and not isinstance(component, bool)
-            and math.isfinite(component)
-            and component > 0.0
-            for component in dimensions
-        )
-    ):
-        raise PipelineError("src/plan.json dimensions must be three positive finite numbers")
-    if not value["parts"]:
-        raise PipelineError("src/plan.json parts must not be empty")
-    if not isinstance(value["construction_strategy"], str) or not value[
-        "construction_strategy"
-    ].strip():
-        raise PipelineError("src/plan.json construction_strategy must be a non-empty string")
+    try:
+        return validate_plan_document(value)
+    except PlanSchemaError as exc:
+        raise PipelineError(f"src/plan.json {exc}") from exc
 
 
 def _guard_program(path: Path) -> None:
@@ -732,6 +660,7 @@ def build_workspace(
     runtime: BlenderRuntime,
     *,
     min_score: float = 0.35,
+    reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE,
     timeout_s: int = 900,
     trajectory_dir: Path | None = None,
     progress: ProgressReporter | None = None,
@@ -740,8 +669,13 @@ def build_workspace(
 
     if not 0.0 <= min_score <= 1.0:
         raise ValueError("min_score must be between 0 and 1")
+    reconstruction_mode = validate_reconstruction_mode(reconstruction_mode)
     if timeout_s <= 0:
         raise ValueError("Blender timeout must be greater than zero")
+    reference_snapshot: bytes | None = None
+    reference_digest: str | None = None
+    if reconstruction_mode == "reference-derived":
+        reference_snapshot, reference_digest = _verified_glb_snapshot(workspace)
     source_trajectory: Path | None = None
     with progress_step(
         progress,
@@ -768,15 +702,24 @@ def build_workspace(
         clean_root = Path(directory)
         staged_program = clean_root / "program.py"
         staged_plan = clean_root / "plan.json"
+        staged_reference = clean_root / "reference.glb"
         staged_artifacts = clean_root / "artifacts"
         staged_program.write_bytes(program_snapshot)
         staged_plan.write_bytes(plan_snapshot)
+        if reference_snapshot is not None:
+            staged_reference.write_bytes(reference_snapshot)
         with progress_step(
             progress,
             "source-guard",
             "Applying the plan schema and Blender source guard",
         ) as stage:
-            _validate_plan(staged_plan)
+            validated_plan = _validate_plan(staged_plan)
+            if validated_plan.get("reconstruction_mode") != reconstruction_mode:
+                raise PipelineError(
+                    "src/plan.json reconstruction_mode must match the build mode: "
+                    f"expected {reconstruction_mode!r}, found "
+                    f"{validated_plan.get('reconstruction_mode')!r}"
+                )
             _guard_program(staged_program)
             stage.complete("Plan schema and Blender source guard passed")
         with progress_step(
@@ -784,14 +727,19 @@ def build_workspace(
             "blender-build",
             "Executing program.py in factory Blender and exporting model.glb",
         ) as stage:
+            build_arguments = [
+                "--program",
+                staged_program,
+                "--artifacts-dir",
+                staged_artifacts,
+                "--mode",
+                reconstruction_mode,
+            ]
+            if reconstruction_mode == "reference-derived":
+                build_arguments.extend(["--reference-glb", staged_reference])
             result = runtime.run_stage(
                 "build_asset",
-                [
-                    "--program",
-                    staged_program,
-                    "--artifacts-dir",
-                    staged_artifacts,
-                ],
+                build_arguments,
                 cwd=clean_root,
                 timeout_s=timeout_s,
             )
@@ -896,7 +844,24 @@ def build_workspace(
                     "model_sha256": model_digest,
                     "blend_sha256": blend_digest,
                     "clean_room": True,
-                    "source_glb_imported_at_build_time": False,
+                    "reconstruction_mode": reconstruction_mode,
+                    "program_is_standalone_replay_source": (
+                        reconstruction_mode == "procedural"
+                    ),
+                    "replay_source_of_truth": (
+                        ["src/program.py", "inputs/reference.glb", "host-reference-preload-v1"]
+                        if reconstruction_mode == "reference-derived"
+                        else ["src/program.py"]
+                    ),
+                    "source_glb_imported_at_build_time": (
+                        reconstruction_mode == "reference-derived"
+                    ),
+                    "reference_glb_sha256": reference_digest,
+                    "reference_contract": (
+                        "host-imported-normalized-source; originals removed before export"
+                        if reconstruction_mode == "reference-derived"
+                        else "measurement-evidence-only"
+                    ),
                     "compiled_glb_verified_in_separate_process": True,
                 },
             )
@@ -955,10 +920,16 @@ def build_workspace(
             ):
                 raise PipelineError("src/program.py or src/plan.json changed during the build")
             verdict = "passed" if comparison["passed"] else "needs review"
+            gate_verdict = (
+                "hard gates passed"
+                if comparison.get("hard_gates", {}).get("passed")
+                else "hard gates failed"
+            )
             stage.complete(
-                f"Fidelity score {comparison['score']:.4f} — {verdict}",
+                f"Fidelity score {comparison['score']:.4f}; {gate_verdict} — {verdict}",
                 score=comparison["score"],
                 passed=comparison["passed"],
+                hard_gates_passed=comparison.get("hard_gates", {}).get("passed"),
             )
         _replace_directory(staged_artifacts, workspace.artifacts_dir)
         return comparison
@@ -974,6 +945,10 @@ def run_pipeline(
 ) -> dict[str, Any]:
     if config.max_repairs < 0:
         raise ValueError("max_repairs cannot be negative")
+    if config.max_fidelity_repairs < 1:
+        raise ValueError("max_fidelity_repairs must be at least one")
+    reconstruction_mode = validate_reconstruction_mode(config.reconstruction_mode)
+    workspace.update_manifest(reconstruction_mode=reconstruction_mode)
     if not 0.0 <= config.min_score <= 1.0:
         raise ValueError("min_score must be between 0 and 1")
     _validate_positive_runtime(render_size=config.render_size, timeout_s=config.blender_timeout_s)
@@ -1001,6 +976,7 @@ def run_pipeline(
                 "status": "failed",
                 "workspace": str(workspace.root),
                 "backend": config.backend,
+                "reconstruction_mode": reconstruction_mode,
                 "stage": "reference",
                 "agent_runs": [],
                 "build_attempts": [],
@@ -1013,6 +989,7 @@ def run_pipeline(
             "schema_version": 1,
             "status": "prepared",
             "workspace": str(workspace.root),
+            "reconstruction_mode": reconstruction_mode,
             "reference": {
                 "vertices": probe["scene"]["vertex_count"],
                 "triangles": probe["scene"]["triangle_count"],
@@ -1020,7 +997,10 @@ def run_pipeline(
             },
         }
         write_json(workspace.root / "run_report.json", report)
-        workspace.update_manifest(status="prepared")
+        workspace.update_manifest(
+            status="prepared",
+            reconstruction_mode=reconstruction_mode,
+        )
         emit_progress(
             progress,
             "info",
@@ -1040,7 +1020,12 @@ def run_pipeline(
             run = _invoke_agent(
                 workspace,
                 backend_name=config.backend,
-                prompt=initial_prompt(root=workspace.root, image=workspace.image_path, user_prompt=user_prompt),
+                prompt=initial_prompt(
+                    root=workspace.root,
+                    image=workspace.image_path,
+                    user_prompt=user_prompt,
+                    reconstruction_mode=reconstruction_mode,
+                ),
                 iteration=next_iteration,
                 timeout_s=config.llm_timeout_s,
                 progress=progress,
@@ -1054,6 +1039,7 @@ def run_pipeline(
                     "status": "failed",
                     "workspace": str(workspace.root),
                     "backend": config.backend,
+                    "reconstruction_mode": reconstruction_mode,
                     "agent_runs": [],
                     "build_attempts": [],
                     "error": str(exc),
@@ -1070,18 +1056,27 @@ def run_pipeline(
     last_valid_program: bytes | None = None
     last_valid_plan: bytes | None = None
     last_valid_comparison: dict[str, Any] | None = None
-    for attempt in range(config.max_repairs + 1):
+    build_repairs_used = 0
+    fidelity_repairs_used = 0
+    build_attempt = 0
+    build_phase = "initial"
+    maximum_builds = 1 + config.max_repairs + config.max_fidelity_repairs
+    while True:
         emit_progress(
             progress,
             "info",
             "build-attempt",
-            f"Build attempt {attempt + 1} of {config.max_repairs + 1}",
+            f"Build attempt {build_attempt + 1} of at most {maximum_builds}",
+            phase=build_phase,
+            build_repairs_used=build_repairs_used,
+            fidelity_repairs_used=fidelity_repairs_used,
         )
         try:
             comparison = build_workspace(
                 workspace,
                 runtime,
                 min_score=config.min_score,
+                reconstruction_mode=reconstruction_mode,
                 timeout_s=config.blender_timeout_s,
                 trajectory_dir=(
                     workspace.root / "trajectories" / f"iter_{active_iteration:02d}"
@@ -1095,7 +1090,8 @@ def run_pipeline(
             last_valid_plan = workspace.plan_path.read_bytes()
             last_valid_comparison = comparison
             built_attempt: dict[str, Any] = {
-                "attempt": attempt,
+                "attempt": build_attempt,
+                "phase": build_phase,
                 "built": True,
                 "comparison": comparison,
             }
@@ -1113,33 +1109,94 @@ def run_pipeline(
             build_attempts.append(built_attempt)
             if comparison["passed"]:
                 last_failure = None
-                break
-            last_failure = (
-                f"fidelity score {comparison['score']:.4f} is below "
-                f"the configured minimum {config.min_score:.4f}"
-            )
-            emit_progress(
-                progress,
-                "warning",
-                "build-attempt",
-                last_failure,
-            )
+            else:
+                hard_gate_failures = comparison.get("hard_gates", {}).get("failures", [])
+                failed_names = [
+                    str(item.get("gate"))
+                    for item in hard_gate_failures
+                    if isinstance(item, dict) and item.get("gate")
+                ]
+                score_failure = not bool(comparison.get("score_passed", comparison["passed"]))
+                failure_parts = []
+                if score_failure:
+                    failure_parts.append(
+                        f"aggregate score {comparison['score']:.4f} below {config.min_score:.4f}"
+                    )
+                if failed_names:
+                    failure_parts.append("hard gates failed: " + ", ".join(failed_names))
+                last_failure = "; ".join(failure_parts) or "fidelity acceptance failed"
+                emit_progress(
+                    progress,
+                    "warning",
+                    "build-attempt",
+                    last_failure,
+                )
         except (PipelineError, BlenderError, OSError, ValueError) as exc:
             last_failure = str(exc)
-            build_attempts.append({"attempt": attempt, "built": False, "error": last_failure})
+            build_attempts.append(
+                {
+                    "attempt": build_attempt,
+                    "phase": build_phase,
+                    "built": False,
+                    "error": last_failure,
+                }
+            )
             next_action = (
-                "preparing an LLM repair"
-                if attempt < config.max_repairs
-                else "no repair attempts remain"
+                "preparing a schema/build repair"
+                if build_repairs_used < config.max_repairs
+                else "no schema/build repairs remain"
             )
             emit_progress(
                 progress,
                 "warning",
                 "build-attempt",
-                f"Build attempt {attempt + 1} failed; {next_action}",
+                f"Build attempt {build_attempt + 1} failed; {next_action}",
                 error=last_failure,
             )
-        if attempt >= config.max_repairs:
+            if build_repairs_used >= config.max_repairs:
+                break
+            try:
+                run = _invoke_agent(
+                    workspace,
+                    backend_name=config.backend,
+                    prompt=repair_prompt(
+                        root=workspace.root,
+                        user_prompt=user_prompt,
+                        failure=last_failure,
+                        comparison=comparison,
+                        iteration=next_iteration,
+                        reconstruction_mode=reconstruction_mode,
+                    ),
+                    iteration=next_iteration,
+                    timeout_s=config.llm_timeout_s,
+                    include_candidate=valid_artifact,
+                    is_repair=True,
+                    progress=progress,
+                )
+            except PipelineError as repair_exc:
+                last_failure = str(repair_exc)
+                build_attempts.append(
+                    {
+                        "attempt": build_attempt,
+                        "phase": "agent-build-repair",
+                        "built": False,
+                        "stage": "agent-repair",
+                        "error": last_failure,
+                    }
+                )
+                break
+            agent_runs.append(run)
+            build_repairs_used += 1
+            build_attempt += 1
+            build_phase = "schema-build-repair"
+            next_iteration += 1
+            active_iteration = _matching_source_iteration(workspace)
+            continue
+
+        # A successful render is the boundary between the independent retry
+        # budgets. The first visual repair is mandatory, even for a passing
+        # first render, so aggregate metrics cannot short-circuit visual review.
+        if fidelity_repairs_used >= config.max_fidelity_repairs:
             break
         try:
             run = _invoke_agent(
@@ -1151,20 +1208,30 @@ def run_pipeline(
                     failure=last_failure,
                     comparison=comparison,
                     iteration=next_iteration,
+                    reconstruction_mode=reconstruction_mode,
                 ),
                 iteration=next_iteration,
                 timeout_s=config.llm_timeout_s,
-                include_candidate=valid_artifact,
+                include_candidate=True,
                 is_repair=True,
                 progress=progress,
             )
         except PipelineError as exc:
             last_failure = str(exc)
             build_attempts.append(
-                {"attempt": attempt, "built": False, "stage": "agent-repair", "error": last_failure}
+                {
+                    "attempt": build_attempt,
+                    "phase": "agent-fidelity-repair",
+                    "built": False,
+                    "stage": "agent-repair",
+                    "error": last_failure,
+                }
             )
             break
         agent_runs.append(run)
+        fidelity_repairs_used += 1
+        build_attempt += 1
+        build_phase = "post-render-repair"
         next_iteration += 1
         active_iteration = _matching_source_iteration(workspace)
 
@@ -1175,8 +1242,16 @@ def run_pipeline(
             "status": "failed",
             "workspace": str(workspace.root),
             "backend": config.backend,
+            "reconstruction_mode": reconstruction_mode,
             "agent_runs": agent_runs,
             "build_attempts": build_attempts,
+            "retry_budget": {
+                "schema_build": {"used": build_repairs_used, "maximum": config.max_repairs},
+                "post_render": {
+                    "used": fidelity_repairs_used,
+                    "maximum": config.max_fidelity_repairs,
+                },
+            },
             "error": last_failure,
         }
         write_json(workspace.root / "run_report.json", report)
@@ -1216,8 +1291,16 @@ def run_pipeline(
         "status": status,
         "workspace": str(workspace.root),
         "backend": config.backend,
+        "reconstruction_mode": reconstruction_mode,
         "agent_runs": agent_runs,
         "build_attempts": build_attempts,
+        "retry_budget": {
+            "schema_build": {"used": build_repairs_used, "maximum": config.max_repairs},
+            "post_render": {
+                "used": fidelity_repairs_used,
+                "maximum": config.max_fidelity_repairs,
+            },
+        },
         "score": comparison["score"] if comparison else None,
         "passed": comparison["passed"] if comparison else False,
         "warning": last_failure,
@@ -1231,7 +1314,12 @@ def run_pipeline(
         },
     }
     write_json(workspace.root / "run_report.json", report)
-    workspace.update_manifest(status=status, score=report["score"], deliverables=report["deliverables"])
+    workspace.update_manifest(
+        status=status,
+        score=report["score"],
+        reconstruction_mode=reconstruction_mode,
+        deliverables=report["deliverables"],
+    )
     if status == "complete":
         emit_progress(
             progress,

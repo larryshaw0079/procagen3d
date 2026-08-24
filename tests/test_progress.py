@@ -151,6 +151,38 @@ def test_agent_activity_line_keeps_the_blocking_stage_active() -> None:
     assert reporter._active_stage is None
 
 
+def test_interactive_agent_activity_updates_spinner_without_printing_a_line() -> None:
+    class CapturingStatus:
+        def __init__(self) -> None:
+            self.updates = []
+
+        def update(self, value) -> None:
+            self.updates.append(value)
+
+        def stop(self) -> None:
+            pass
+
+    stream = StringIO()
+    reporter = RichProgressReporter(
+        Console(file=stream, force_terminal=True, color_system=None, width=160)
+    )
+    status = CapturingStatus()
+    reporter._status = status  # type: ignore[assignment]
+    reporter._active_stage = "agent-00"
+
+    reporter(
+        ProgressEvent(
+            "info",
+            "agent-00",
+            "Codex still working — 2m elapsed; program.py 12.0 KiB",
+        )
+    )
+
+    assert len(status.updates) == 1
+    assert "Codex still working" in str(status.updates[0])
+    assert stream.getvalue() == ""
+
+
 def test_rich_cleanup_cannot_mask_pipeline_exception() -> None:
     class BrokenStatus:
         def stop(self) -> None:

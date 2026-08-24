@@ -10,6 +10,8 @@ from .base import (
     CLIBackend,
     CLIInvocation,
     ParsedOutput,
+    _format_duration,
+    _source_file_state,
     json_objects,
     source_change_paths,
     usage_activity,
@@ -121,10 +123,8 @@ class CodexBackend(CLIBackend):
         workspace: Path,
     ) -> str | None:
         event_type = event.get("type")
-        if event_type == "thread.started":
-            return "Codex session started"
         if event_type == "turn.started":
-            return "Codex began analyzing the reference and planning the asset"
+            return "Codex model turn started"
         if event_type == "turn.completed":
             usage = event.get("usage")
             return usage_activity("Codex", usage if isinstance(usage, Mapping) else {})
@@ -140,23 +140,21 @@ class CodexBackend(CLIBackend):
         completed = event_type == "item.completed"
 
         if item_type == "command_execution":
-            action = _classify_command(str(item.get("command") or ""))
             if completed:
                 exit_code = item.get("exit_code")
                 if isinstance(exit_code, int) and exit_code != 0:
                     return f"Codex workspace check failed — exit code {exit_code}"
-                return f"Codex finished {action}"
-            return f"Codex is {action}"
+            return None
 
         if item_type == "file_change":
+            if not completed:
+                return None
             paths = source_change_paths(event, workspace=workspace)
             if not paths:
-                return "Codex is updating generated source"
+                return None
             shown = ", ".join(paths[:2])
             if len(paths) > 2:
                 shown += f" (+{len(paths) - 2} more)"
-            if not completed:
-                return f"Codex is writing {shown}"
             changes = item.get("changes")
             kinds = (
                 {
@@ -170,52 +168,29 @@ class CodexBackend(CLIBackend):
             verb = "created" if kinds == {"add"} else "updated"
             return f"Codex {verb} {shown}"
 
-        if item_type == "agent_message" and completed:
-            return "Codex posted a progress update"
-        if item_type == "reasoning" and completed:
-            return "Codex completed a reasoning step"
-        if item_type == "web_search":
-            return "Codex is inspecting supporting information"
-        if item_type == "mcp_tool_call":
-            return "Codex is running a connected workspace tool"
-        if item_type == "todo_list" and completed:
-            return "Codex updated its implementation checklist"
         if item_type == "error":
+            return "Codex reported an item-level failure"
+        status = str(item.get("status") or "").lower()
+        if completed and (status in {"error", "failed"} or item.get("error")):
             return "Codex reported an item-level failure"
         return None
 
+    def heartbeat_message(
+        self,
+        *,
+        elapsed_s: float,
+        provider_event_count: int,
+        last_output_age_s: float | None,
+        workspace: Path,
+    ) -> str:
+        """Keep long Codex turns visible without printing stream internals."""
 
-def _classify_command(command: str) -> str:
-    lowered = command.lower()
-    if any(
-        marker in lowered
-        for marker in (
-            "evidence/",
-            "/evidence",
-            "reference_scene",
-            "reference_views",
-            "camera_contract",
-            "glb_probe",
-            "inputs/reference",
+        del provider_event_count, last_output_age_s
+        source_state = "; ".join(
+            _source_file_state(workspace / "src" / name)
+            for name in ("plan.json", "program.py")
         )
-    ):
-        return "inspecting reference evidence"
-    if any(
-        marker in lowered
-        for marker in (
-            "py_compile",
-            "compileall",
-            "ast.parse",
-            "json.load",
-            "jq -e",
-            "src/program.py",
-            "src/plan.json",
-        )
-    ):
-        return "validating generated source"
-    if "git status" in lowered or "git diff" in lowered:
-        return "checking workspace changes"
-    return "running a workspace check"
+        return f"Codex still authoring — {_format_duration(elapsed_s)}; {source_state}"
 
 
 # Descriptive alias for callers following OpenTopos's backend naming scheme.

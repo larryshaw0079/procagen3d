@@ -54,6 +54,7 @@ def test_workspace_copies_inputs_and_records_provenance(tmp_path: Path) -> None:
     manifest = json.loads(workspace.manifest_path.read_text(encoding="utf-8"))
     assert manifest["inputs"]["image"]["source"] == str(image.resolve())
     assert manifest["inputs"]["glb"]["sha256"] == hashlib.sha256(b"glb-data").hexdigest()
+    assert manifest["reconstruction_mode"] == "procedural"
     assert workspace.trajectory_dir(3).name == "iter_03"
 
     with pytest.raises(FileExistsError):
@@ -65,6 +66,25 @@ def test_workspace_copies_inputs_and_records_provenance(tmp_path: Path) -> None:
             prompt="",
             backend="codex",
         )
+
+
+def test_workspace_records_reference_derived_mode(tmp_path: Path) -> None:
+    image = tmp_path / "image.png"
+    glb = tmp_path / "model.glb"
+    image.write_bytes(b"image")
+    glb.write_bytes(b"glb")
+
+    workspace = Workspace.create(
+        base=tmp_path / "outputs",
+        slug="derived",
+        image=image,
+        glb=glb,
+        prompt="",
+        backend="codex",
+        reconstruction_mode="reference-derived",
+    )
+
+    assert workspace.manifest()["reconstruction_mode"] == "reference-derived"
 
 
 def test_workspace_locate_by_slug_and_update_manifest(tmp_path: Path) -> None:

@@ -27,6 +27,11 @@ from .pipeline import (
 )
 from .process import run_process
 from .progress import progress_step
+from .reconstruction import (
+    DEFAULT_RECONSTRUCTION_MODE,
+    RECONSTRUCTION_MODES,
+    validate_reconstruction_mode,
+)
 from .rich_ui import RichProgressReporter, print_comparison, print_workspace_summary
 from .workspace import Workspace, slugify, write_json
 
@@ -52,10 +57,35 @@ def _score(value: str) -> float:
     return converted
 
 
-def _add_runtime_options(parser: argparse.ArgumentParser, *, backend_default: str | None) -> None:
+def _add_runtime_options(
+    parser: argparse.ArgumentParser,
+    *,
+    backend_default: str | None,
+    mode_default: str | None,
+) -> None:
     parser.add_argument("--backend", choices=BACKEND_NAMES, default=backend_default)
     parser.add_argument("--blender", type=Path, help="path to the Blender executable")
-    parser.add_argument("--max-repairs", type=int, choices=range(0, 11), default=2)
+    parser.add_argument(
+        "--mode",
+        dest="reconstruction_mode",
+        choices=RECONSTRUCTION_MODES,
+        default=mode_default,
+        help="geometry contract; existing workspaces retain their recorded mode by default",
+    )
+    parser.add_argument(
+        "--max-repairs",
+        type=int,
+        choices=range(0, 11),
+        default=2,
+        help="LLM repairs reserved for schema, source-guard, or Blender build failures",
+    )
+    parser.add_argument(
+        "--max-fidelity-repairs",
+        type=int,
+        choices=range(1, 11),
+        default=1,
+        help="post-render LLM repairs; at least one visual repair is always attempted",
+    )
     parser.add_argument("--min-score", type=_score, default=0.35)
     parser.add_argument("--render-size", type=_render_size, default=256)
     parser.add_argument("--llm-timeout", type=_positive_int, default=1800, metavar="SECONDS")
@@ -72,7 +102,9 @@ def _config(args: argparse.Namespace, *, backend: str) -> PipelineConfig:
         backend=backend,
         blender=args.blender,
         max_repairs=args.max_repairs,
+        max_fidelity_repairs=args.max_fidelity_repairs,
         min_score=args.min_score,
+        reconstruction_mode=validate_reconstruction_mode(args.reconstruction_mode),
         render_size=args.render_size,
         llm_timeout_s=args.llm_timeout,
         blender_timeout_s=args.blender_timeout,
@@ -130,6 +162,7 @@ def _command_make(args: argparse.Namespace) -> int:
                 glb=args.glb,
                 prompt=args.prompt,
                 backend=args.backend,
+                reconstruction_mode=args.reconstruction_mode,
             )
             stage.complete(f"Workspace created — {workspace.root}")
         report = run_pipeline(
@@ -151,7 +184,12 @@ def _command_run(args: argparse.Namespace) -> int:
             "Loading workspace and verifying input provenance",
         ) as stage:
             workspace = Workspace.locate(args.workspace, base=args.output)
-            backend = args.backend or str(workspace.manifest().get("backend") or "codex")
+            manifest = workspace.manifest()
+            backend = args.backend or str(manifest.get("backend") or "codex")
+            args.reconstruction_mode = (
+                args.reconstruction_mode
+                or str(manifest.get("reconstruction_mode") or DEFAULT_RECONSTRUCTION_MODE)
+            )
             stage.complete(f"Workspace ready — {workspace.root}")
         report = run_pipeline(
             workspace,
@@ -174,6 +212,11 @@ def _command_build(args: argparse.Namespace) -> int:
                 "Loading workspace and verifying input provenance",
             ) as stage:
                 workspace = Workspace.locate(args.workspace, base=args.output)
+                manifest = workspace.manifest()
+                reconstruction_mode = validate_reconstruction_mode(
+                    args.reconstruction_mode
+                    or str(manifest.get("reconstruction_mode") or DEFAULT_RECONSTRUCTION_MODE)
+                )
                 stage.complete(f"Workspace ready — {workspace.root}")
             with progress_step(progress, "runtime", "Locating Blender") as stage:
                 runtime = BlenderRuntime.discover(args.blender)
@@ -190,6 +233,7 @@ def _command_build(args: argparse.Namespace) -> int:
                 workspace,
                 runtime,
                 min_score=args.min_score,
+                reconstruction_mode=reconstruction_mode,
                 timeout_s=args.blender_timeout,
                 trajectory_dir=matching_source_trajectory(workspace),
                 progress=progress,
@@ -219,7 +263,12 @@ def _command_build(args: argparse.Namespace) -> int:
         "comparison": "artifacts/comparison.json",
         "build_manifest": "artifacts/build_manifest.json",
     }
-    workspace.update_manifest(status=status, score=report["score"], deliverables=deliverables)
+    workspace.update_manifest(
+        status=status,
+        score=report["score"],
+        reconstruction_mode=reconstruction_mode,
+        deliverables=deliverables,
+    )
     write_json(
         workspace.root / "run_report.json",
         {
@@ -227,6 +276,7 @@ def _command_build(args: argparse.Namespace) -> int:
             "status": status,
             "workspace": str(workspace.root),
             "backend": None,
+            "reconstruction_mode": reconstruction_mode,
             "score": report["score"],
             "passed": report["passed"],
             "deliverables": deliverables,
@@ -356,7 +406,11 @@ def build_parser() -> argparse.ArgumentParser:
     make.add_argument("--output", "-o", type=Path, default=Path("outputs"))
     make.add_argument("--prepare-only", action="store_true", help="build evidence without invoking an LLM")
     make.add_argument("--force-probe", action="store_true")
-    _add_runtime_options(make, backend_default="codex")
+    _add_runtime_options(
+        make,
+        backend_default="codex",
+        mode_default=DEFAULT_RECONSTRUCTION_MODE,
+    )
     make.set_defaults(handler=_command_make)
 
     run = commands.add_parser("run", help="resume or repair an existing workspace")
@@ -364,13 +418,20 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output", "-o", type=Path, default=Path("outputs"))
     run.add_argument("--prepare-only", action="store_true")
     run.add_argument("--force-probe", action="store_true")
-    _add_runtime_options(run, backend_default=None)
+    _add_runtime_options(run, backend_default=None, mode_default=None)
     run.set_defaults(handler=_command_run)
 
     build = commands.add_parser("build", help="compile and verify the current src/program.py without an LLM")
     build.add_argument("workspace", type=Path)
     build.add_argument("--output", "-o", type=Path, default=Path("outputs"))
     build.add_argument("--blender", type=Path)
+    build.add_argument(
+        "--mode",
+        dest="reconstruction_mode",
+        choices=RECONSTRUCTION_MODES,
+        default=None,
+        help="override the workspace's recorded reconstruction mode for this build",
+    )
     build.add_argument("--min-score", type=_score, default=0.35)
     build.add_argument("--render-size", type=_render_size, default=256)
     build.add_argument("--blender-timeout", type=_positive_int, default=900)

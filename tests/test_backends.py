@@ -340,6 +340,18 @@ class BackendParserTests(unittest.TestCase):
                 },
                 workspace=workspace,
             )
+            failed_command_message = codex.activity_message(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": f"rg {secret} {workspace / 'evidence'}",
+                        "aggregated_output": secret * 100,
+                        "exit_code": 2,
+                    },
+                },
+                workspace=workspace,
+            )
             file_message = codex.activity_message(
                 {
                     "type": "item.completed",
@@ -350,6 +362,13 @@ class BackendParserTests(unittest.TestCase):
                 },
                 workspace=workspace,
             )
+            chatter_messages = [
+                codex.activity_message(
+                    {"type": "item.completed", "item": {"type": item_type, "text": secret}},
+                    workspace=workspace,
+                )
+                for item_type in ("agent_message", "reasoning", "todo_list")
+            ]
             grok_message = GrokBackend().activity_message(
                 {"type": "text", "data": secret},
                 workspace=workspace,
@@ -362,13 +381,47 @@ class BackendParserTests(unittest.TestCase):
                 workspace=workspace,
             )
 
-            self.assertIn("inspecting reference evidence", command_message or "")
+            self.assertIsNone(command_message)
+            self.assertEqual(
+                failed_command_message,
+                "Codex workspace check failed — exit code 2",
+            )
             self.assertEqual(file_message, "Codex created src/program.py")
+            self.assertEqual(chatter_messages, [None, None, None])
             self.assertIn("drafting", grok_message or "")
             self.assertIn("drafting", cursor_message or "")
-            for message in (command_message, file_message, grok_message, cursor_message):
+            for message in (
+                command_message,
+                failed_command_message,
+                file_message,
+                *chatter_messages,
+                grok_message,
+                cursor_message,
+            ):
                 self.assertNotIn(secret, message or "")
                 self.assertNotIn(str(workspace), message or "")
+
+    def test_codex_heartbeat_is_compact_and_source_focused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            source = workspace / "src" / "program.py"
+            source.parent.mkdir()
+            source.write_text("pass\n", encoding="utf-8")
+
+            message = CodexBackend().heartbeat_message(
+                elapsed_s=245.9,
+                provider_event_count=987,
+                last_output_age_s=0.1,
+                workspace=workspace,
+            )
+
+            self.assertEqual(
+                message,
+                "Codex still authoring — 4m 05s; "
+                "plan.json not created; program.py 5 B",
+            )
+            self.assertNotIn("provider", message)
+            self.assertNotIn("last CLI output", message)
 
     def test_terminal_activity_reports_only_numeric_usage(self) -> None:
         workspace = Path(tempfile.gettempdir()).resolve()
@@ -458,6 +511,23 @@ class BackendFactoryAndRunTests(unittest.TestCase):
             self.assertTrue(any("process still running" in message for message in activity))
             self.assertTrue(any("plan.json 4 B" in message for message in activity))
             self.assertTrue(any("program.py not created" in message for message in activity))
+
+    def test_streamed_activity_has_no_heartbeat_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            activity: list[str] = []
+
+            result = StreamingFixtureBackend().run(
+                prompt="write source",
+                workspace=workspace,
+                timeout_s=3,
+                on_activity=activity.append,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertIn("Fixture provider started", activity)
+            self.assertIn("Fixture provider completed", activity)
+            self.assertFalse(any("still running" in message for message in activity))
 
 
 if __name__ == "__main__":

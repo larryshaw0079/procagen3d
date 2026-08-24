@@ -85,7 +85,7 @@ def test_plan_only_failed_repair_restores_source_matching_last_artifact(
 
     report = pipeline.run_pipeline(
         workspace,
-        PipelineConfig(max_repairs=1, min_score=0.9),
+        PipelineConfig(max_repairs=0, max_fidelity_repairs=1, min_score=0.9),
     )
 
     assert report["status"] == "needs-review"
@@ -194,9 +194,65 @@ def test_run_pipeline_forwards_progress_through_a_repair(
     ]
     assert [
         event.message for event in events if event.stage == "build-attempt" and event.kind == "info"
-    ] == ["Build attempt 1 of 2", "Build attempt 2 of 2"]
+    ] == ["Build attempt 1 of at most 3", "Build attempt 2 of at most 3"]
     assert events[-1].kind == "success"
     assert events[-1].stage == "pipeline"
+
+
+def test_schema_build_and_post_render_repairs_have_independent_budgets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    monkeypatch.setattr(pipeline.BlenderRuntime, "discover", lambda explicit=None: object())
+    monkeypatch.setattr(pipeline, "prepare_reference", lambda *args, **kwargs: _prepared_probe())
+    build_calls = 0
+    repair_prompts: list[dict] = []
+
+    def fake_build(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        if build_calls == 1:
+            raise PipelineError("schema failed")
+        write_json(
+            workspace.artifacts_dir / "build_manifest.json",
+            {
+                "program_sha256": sha256(workspace.program_path),
+                "plan_sha256": sha256(workspace.plan_path),
+            },
+        )
+        return {
+            "score": 0.2 if build_calls == 2 else 1.0,
+            "score_passed": build_calls == 3,
+            "passed": build_calls == 3,
+            "hard_gates": {"failures": []},
+        }
+
+    def fake_agent(*args, **kwargs):
+        repair_prompts.append(kwargs)
+        return {"backend": "fake", "model": "fake", "files_modified": []}
+
+    monkeypatch.setattr(pipeline, "build_workspace", fake_build)
+    monkeypatch.setattr(pipeline, "_invoke_agent", fake_agent)
+
+    report = pipeline.run_pipeline(
+        workspace,
+        PipelineConfig(max_repairs=1, max_fidelity_repairs=1, min_score=0.9),
+    )
+
+    assert report["status"] == "complete"
+    assert build_calls == 3
+    assert len(repair_prompts) == 2
+    assert repair_prompts[0]["include_candidate"] is False
+    assert repair_prompts[1]["include_candidate"] is True
+    assert [attempt["phase"] for attempt in report["build_attempts"]] == [
+        "initial",
+        "schema-build-repair",
+        "post-render-repair",
+    ]
+    assert report["retry_budget"] == {
+        "schema_build": {"used": 1, "maximum": 1},
+        "post_render": {"used": 1, "maximum": 1},
+    }
 
 
 def test_resume_routes_glb_to_the_trajectory_matching_restored_source(

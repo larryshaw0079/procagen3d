@@ -143,6 +143,32 @@ class CLIBackend(ABC):
         del event, workspace
         return None
 
+    def heartbeat_message(
+        self,
+        *,
+        elapsed_s: float,
+        provider_event_count: int,
+        last_output_age_s: float | None,
+        workspace: Path,
+    ) -> str:
+        """Describe a quiet-period heartbeat without exposing provider payloads."""
+
+        if last_output_age_s is None:
+            output_state = "no CLI output yet"
+        else:
+            output_state = f"last CLI output {_format_duration(last_output_age_s)} ago"
+        event_word = "event" if provider_event_count == 1 else "events"
+        source_state = "; ".join(
+            _source_file_state(workspace / "src" / name)
+            for name in ("plan.json", "program.py")
+        )
+        return (
+            f"{self.name.title()} process still running — "
+            f"{_format_duration(elapsed_s)} elapsed; "
+            f"{provider_event_count:,} provider {event_word}; "
+            f"{output_state}; {source_state}"
+        )
+
     def run(
         self,
         *,
@@ -153,7 +179,7 @@ class CLIBackend(ABC):
         timeout_s: int | None = None,
         env: Mapping[str, str] | None = None,
         on_activity: ActivityCallback | None = None,
-        heartbeat_interval_s: float = 30.0,
+        heartbeat_interval_s: float | None = None,
     ) -> AgentRunResult:
         workspace = workspace.expanduser().resolve()
         if not workspace.is_dir():
@@ -183,8 +209,9 @@ class CLIBackend(ABC):
         effective_timeout = timeout_s if timeout_s is not None else self.default_timeout_s
         if effective_timeout <= 0:
             raise ValueError("timeout_s must be greater than zero")
-        if on_activity is not None and heartbeat_interval_s <= 0:
+        if on_activity is not None and heartbeat_interval_s is not None and heartbeat_interval_s <= 0:
             raise ValueError("heartbeat_interval_s must be greater than zero")
+        heartbeat_enabled = on_activity is not None and heartbeat_interval_s is not None
 
         started = time.monotonic()
         provider_event_count = 0
@@ -225,22 +252,15 @@ class CLIBackend(ABC):
             last_output_at = time.monotonic()
 
         def observe_heartbeat(elapsed_s: float) -> None:
-            if last_output_at is None:
-                output_state = "no CLI output yet"
-            else:
-                output_state = (
-                    f"last CLI output {_format_duration(time.monotonic() - last_output_at)} ago"
-                )
-            event_word = "event" if provider_event_count == 1 else "events"
-            source_state = "; ".join(
-                _source_file_state(workspace / "src" / name)
-                for name in ("plan.json", "program.py")
-            )
             emit_activity(
-                f"{self.name.title()} process still running — "
-                f"{_format_duration(elapsed_s)} elapsed; "
-                f"{provider_event_count:,} provider {event_word}; "
-                f"{output_state}; {source_state}"
+                self.heartbeat_message(
+                    elapsed_s=elapsed_s,
+                    provider_event_count=provider_event_count,
+                    last_output_age_s=(
+                        None if last_output_at is None else time.monotonic() - last_output_at
+                    ),
+                    workspace=workspace,
+                )
             )
 
         try:
@@ -252,8 +272,8 @@ class CLIBackend(ABC):
                 env=env,
                 on_stdout_line=observe_stdout if on_activity is not None else None,
                 on_stderr_line=observe_stderr if on_activity is not None else None,
-                on_heartbeat=observe_heartbeat if on_activity is not None else None,
-                heartbeat_interval_s=heartbeat_interval_s,
+                on_heartbeat=observe_heartbeat if heartbeat_enabled else None,
+                heartbeat_interval_s=heartbeat_interval_s or 30.0,
             )
         except OSError as exc:
             process = ProcessResult(

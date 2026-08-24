@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .reconstruction import DEFAULT_RECONSTRUCTION_MODE, validate_reconstruction_mode
+
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -54,7 +56,9 @@ class Workspace:
         glb: Path,
         prompt: str,
         backend: str,
+        reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE,
     ) -> "Workspace":
+        reconstruction_mode = validate_reconstruction_mode(reconstruction_mode)
         if not _SLUG_RE.fullmatch(slug):
             raise ValueError(f"invalid slug {slug!r}; use lowercase letters, digits, '-' or '_'")
         image = image.expanduser().resolve()
@@ -85,6 +89,7 @@ class Workspace:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "prompt": prompt,
             "backend": backend,
+            "reconstruction_mode": reconstruction_mode,
             "inputs": {
                 "image": {
                     "path": str(image_target.relative_to(root)),

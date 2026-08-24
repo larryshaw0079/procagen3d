@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from procagen3d.plan_schema import plan_schema_text
 from procagen3d.prompts import initial_prompt, repair_prompt
 
 
@@ -18,6 +19,8 @@ def test_initial_prompt_routes_characters_through_anatomy_analysis(tmp_path: Pat
     assert "character-relative left/right" in prompt
     assert "Do not claim a usable rig" in prompt
     assert "Do not invoke Blender during this agent turn" in prompt
+    assert plan_schema_text() in prompt
+    assert "Set `reconstruction_mode` to `procedural`" in prompt
 
 
 def test_repair_prompt_rechecks_character_identity_structure(tmp_path: Path) -> None:
@@ -34,3 +37,5 @@ def test_repair_prompt_rechecks_character_identity_structure(tmp_path: Path) -> 
     assert "left/right asymmetry" in prompt
     assert "held props" in prompt
     assert "Do not invoke Blender during this agent turn" in prompt
+    assert plan_schema_text() in prompt
+    assert "set `reconstruction_mode` to `procedural`" in prompt

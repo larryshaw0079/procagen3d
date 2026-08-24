@@ -118,6 +118,8 @@ class SymlinkSourceBackend(FakeBackend):
 
 
 class ActivityBackend(FakeBackend):
+    name = "codex"
+
     def run(
         self,
         *,
@@ -127,7 +129,9 @@ class ActivityBackend(FakeBackend):
         image_paths,
         timeout_s,
         on_activity=None,
+        heartbeat_interval_s=None,
     ):
+        self.heartbeat_interval_s = heartbeat_interval_s
         if on_activity is not None:
             on_activity("Provider is inspecting reference evidence")
         return super().run(
@@ -191,6 +195,7 @@ def test_cli_backend_activity_is_forwarded_without_closing_the_agent_stage(
     assert len(activity) == 1
     assert activity[0].stage == "agent-00"
     assert activity[0].elapsed_s is None
+    assert fake.heartbeat_interval_s is None
     assert events[0].kind == "start"
     assert events[-1].kind == "success"
 

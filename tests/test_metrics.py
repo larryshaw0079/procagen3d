@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from procagen3d.metrics import CANONICAL_VIEW_NAMES, compare_workspace, mask_metrics
+from procagen3d.metrics import (
+    CANONICAL_VIEW_NAMES,
+    FidelityGateThresholds,
+    compare_workspace,
+    mask_metrics,
+)
 
 
 def packed(
@@ -68,6 +73,7 @@ def compare_scenes(
     reference: object,
     candidate: object,
     min_score: object = 0.5,
+    gate_thresholds: FidelityGateThresholds | None = None,
 ) -> dict:
     record = packed(["11", "11"])
     masks = write_json(tmp_path / "valid-masks.json", mask_document(record))
@@ -80,6 +86,7 @@ def compare_scenes(
         candidate_scene=candidate_path,
         output=tmp_path / "comparison.json",
         min_score=min_score,
+        gate_thresholds=gate_thresholds,
     )
 
 
@@ -205,6 +212,103 @@ def test_compare_workspace_identical_inputs_score_one(tmp_path: Path) -> None:
     )
 
     assert report["score"] == pytest.approx(1.0)
+    assert report["score_passed"] is True
+    assert report["hard_gates"]["passed"] is True
+    assert report["hard_gates"]["failures"] == []
+    assert report["passed"] is True
+
+
+def test_low_single_view_fails_hard_gate_despite_passing_score(tmp_path: Path) -> None:
+    reference_record = packed(["1100", "1100"])
+    candidate_document = mask_document(reference_record)
+    candidate_document["views"]["left"] = packed(["0011", "0011"])
+    reference_masks = write_json(
+        tmp_path / "reference-masks.json", mask_document(reference_record)
+    )
+    candidate_masks = write_json(tmp_path / "candidate-masks.json", candidate_document)
+    scene = write_json(tmp_path / "scene.json", geometry_document())
+    output = tmp_path / "comparison.json"
+
+    report = compare_workspace(
+        reference_masks=reference_masks,
+        candidate_masks=candidate_masks,
+        reference_scene=scene,
+        candidate_scene=scene,
+        output=output,
+        min_score=0.50,
+    )
+
+    assert report["score_passed"] is True
+    assert report["passed"] is False
+    gate = report["hard_gates"]["results"]["minimum_view_silhouette_iou"]
+    assert gate == {
+        "value": 0.0,
+        "operator": ">=",
+        "threshold": 0.30,
+        "passed": False,
+        "message": "left silhouette IoU 0.0000 must be at least 0.3000",
+        "view": "left",
+    }
+    assert [failure["gate"] for failure in report["hard_gates"]["failures"]] == [
+        "minimum_view_silhouette_iou"
+    ]
+    assert json.loads(output.read_text(encoding="utf-8")) == report
+
+
+@pytest.mark.parametrize(
+    ("translation", "failed_gate", "value"),
+    [
+        ((0.0, 0.0, -0.20), "ground_offset", 0.20),
+        ((0.40, 0.0, 0.0), "center_distance", 0.40),
+    ],
+)
+def test_spatial_hard_gates_reject_displaced_geometry(
+    tmp_path: Path,
+    translation: tuple[float, float, float],
+    failed_gate: str,
+    value: float,
+) -> None:
+    candidate = geometry_document()
+    for field in ("min", "max", "center"):
+        candidate["bounds"][field] = [
+            coordinate + offset
+            for coordinate, offset in zip(
+                candidate["bounds"][field], translation, strict=True
+            )
+        ]
+
+    report = compare_scenes(
+        tmp_path,
+        reference=geometry_document(),
+        candidate=candidate,
+        min_score=0.50,
+    )
+
+    assert report["score_passed"] is True
+    assert report["passed"] is False
+    assert report["hard_gates"]["results"][failed_gate]["value"] == pytest.approx(value)
+    assert [failure["gate"] for failure in report["hard_gates"]["failures"]] == [
+        failed_gate
+    ]
+
+
+def test_custom_hard_gate_thresholds_can_relax_a_profile(tmp_path: Path) -> None:
+    candidate = geometry_document()
+    candidate["bounds"]["min"][0] += 0.40
+    candidate["bounds"]["max"][0] += 0.40
+    candidate["bounds"]["center"][0] += 0.40
+    thresholds = FidelityGateThresholds(max_center_distance=0.50)
+
+    report = compare_scenes(
+        tmp_path,
+        reference=geometry_document(),
+        candidate=candidate,
+        min_score=0.50,
+        gate_thresholds=thresholds,
+    )
+
+    assert report["hard_gates"]["thresholds"]["max_center_distance"] == 0.50
+    assert report["hard_gates"]["passed"] is True
     assert report["passed"] is True
 
 

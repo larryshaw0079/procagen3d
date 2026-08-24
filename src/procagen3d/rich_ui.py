@@ -67,6 +67,23 @@ class RichProgressReporter:
             self._status.start()
             return
 
+        # Provider activity is transient status, not a new pipeline stage. In
+        # an interactive terminal, update the one spinner in place so a long
+        # Codex turn does not leave dozens of permanent activity lines behind.
+        if (
+            event.kind == "info"
+            and event.elapsed_s is None
+            and event.stage == self._active_stage
+            and self._status is not None
+        ):
+            label = Text(event.message, style="cyan")
+            label.append(f"  [{event.stage}]", style="dim")
+            try:
+                self._status.update(label)
+            except (Exception, SystemExit):
+                pass
+            return
+
         completes_active_step = (
             event.elapsed_s is not None and event.stage == self._active_stage
         )
@@ -132,6 +149,11 @@ def print_workspace_summary(
 
 def print_comparison(console: Console, report: dict[str, Any]) -> None:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    hard_gates = report.get("hard_gates") if isinstance(report.get("hard_gates"), dict) else {}
+    gate_results = hard_gates.get("results") if isinstance(hard_gates.get("results"), dict) else {}
+    gate_pass_count = sum(
+        bool(value.get("passed")) for value in gate_results.values() if isinstance(value, dict)
+    )
     table = Table(title="Compiled GLB fidelity", show_header=True, header_style="bold cyan")
     table.add_column("Metric")
     table.add_column("Score", justify="right")
@@ -145,7 +167,19 @@ def print_comparison(console: Console, report: dict[str, Any]) -> None:
     )
     for name, value in rows:
         table.add_row(name, f"{float(value):.4f}" if isinstance(value, (int, float)) else "—")
+    if gate_results:
+        table.add_row("Hard gates", f"{gate_pass_count}/{len(gate_results)}")
     passed = bool(report.get("passed"))
-    table.caption = "PASS" if passed else "NEEDS REVIEW"
+    failures = hard_gates.get("failures") if isinstance(hard_gates.get("failures"), list) else []
+    failed_names = [
+        str(item.get("gate"))
+        for item in failures
+        if isinstance(item, dict) and item.get("gate")
+    ]
+    table.caption = (
+        "PASS"
+        if passed
+        else "NEEDS REVIEW" + (f" — failed: {', '.join(failed_names)}" if failed_names else "")
+    )
     table.caption_style = "bold green" if passed else "bold yellow"
     console.print(table)

@@ -450,6 +450,132 @@ def _validate_module_execution(tree: ast.Module) -> list[SourceViolation]:
     return violations
 
 
+def _attribute_path(node: ast.AST) -> tuple[str, ...] | None:
+    """Return a simple dotted attribute path, independent of import aliases."""
+
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    return (current.id, *reversed(parts))
+
+
+def _is_view_layer_update(statement: ast.stmt) -> bool:
+    """Recognize an immediately preceding ``...view_layer.update()`` call."""
+
+    if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+        return False
+    call = statement.value
+    if call.args or call.keywords:
+        return False
+    path = _attribute_path(call.func)
+    return path is not None and path[-2:] == ("view_layer", "update")
+
+
+def _matrix_world_snapshot(statement: ast.stmt) -> tuple[str, str] | None:
+    """Return ``(saved_name, object_expression)`` for ``x = obj.matrix_world.copy()``."""
+
+    if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+        return None
+    target = statement.targets[0]
+    value = statement.value
+    if not isinstance(target, ast.Name) or not isinstance(value, ast.Call):
+        return None
+    if value.args or value.keywords or not isinstance(value.func, ast.Attribute):
+        return None
+    if value.func.attr != "copy" or not isinstance(value.func.value, ast.Attribute):
+        return None
+    matrix = value.func.value
+    if matrix.attr != "matrix_world":
+        return None
+    return target.id, ast.dump(matrix.value, include_attributes=False)
+
+
+def _object_attribute_assignment(
+    statement: ast.stmt, attribute: str
+) -> tuple[str, ast.AST] | None:
+    if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+        return None
+    if isinstance(statement, ast.Assign):
+        if len(statement.targets) != 1:
+            return None
+        target = statement.targets[0]
+        value = statement.value
+    else:
+        target = statement.target
+        value = statement.value
+    if value is None or not isinstance(target, ast.Attribute) or target.attr != attribute:
+        return None
+    return ast.dump(target.value, include_attributes=False), value
+
+
+def _validate_parent_world_snapshots(tree: ast.Module) -> list[SourceViolation]:
+    """Reject the Blender stale-world parenting pattern that collapses geometry.
+
+    A newly linked object's transform channels can be authored while its
+    dependency-graph ``matrix_world`` is still identity.  Saving that stale
+    matrix, assigning a parent, and restoring it silently moves the object to
+    the origin.  Generated sources must either refresh the view layer directly
+    before the snapshot or build the intended world matrix explicitly (for
+    example with ``Matrix.LocRotScale``) and evaluate a newly authored parent
+    hierarchy before applying it.
+    """
+
+    violations: list[SourceViolation] = []
+
+    def inspect_block(statements: list[ast.stmt]) -> None:
+        snapshots: dict[str, tuple[str, ast.Assign, bool]] = {}
+        parented: set[str] = set()
+        for index, statement in enumerate(statements):
+            snapshot = _matrix_world_snapshot(statement)
+            if snapshot is not None:
+                saved_name, object_expression = snapshot
+                refreshed = index > 0 and _is_view_layer_update(statements[index - 1])
+                snapshots[saved_name] = (object_expression, statement, refreshed)
+
+            parent_assignment = _object_attribute_assignment(statement, "parent")
+            if parent_assignment is not None:
+                parented.add(parent_assignment[0])
+
+            restoration = _object_attribute_assignment(statement, "matrix_world")
+            if restoration is not None and isinstance(restoration[1], ast.Name):
+                object_expression, value = restoration
+                saved = snapshots.get(value.id)
+                if (
+                    saved is not None
+                    and saved[0] == object_expression
+                    and object_expression in parented
+                    and not saved[2]
+                ):
+                    violations.append(
+                        _violation(
+                            "stale-world-transform",
+                            "refresh bpy.context.view_layer immediately before copying "
+                            "matrix_world, or construct the intended world matrix with "
+                            "Matrix.LocRotScale and evaluate the parent hierarchy before "
+                            "applying it",
+                            saved[1],
+                        )
+                    )
+
+            for child_name in ("body", "orelse", "finalbody"):
+                child = getattr(statement, child_name, None)
+                if isinstance(child, list):
+                    inspect_block(child)
+            if isinstance(statement, (ast.Try, ast.TryStar)):
+                for handler in statement.handlers:
+                    inspect_block(handler.body)
+            if isinstance(statement, ast.Match):
+                for case in statement.cases:
+                    inspect_block(case.body)
+
+    inspect_block(tree.body)
+    return violations
+
+
 class _SafetyVisitor(ast.NodeVisitor):
     def __init__(self, *, docstrings: set[int]):
         self.violations: list[SourceViolation] = []
@@ -693,6 +819,7 @@ def validate_source(
 
     violations = _validate_build_entrypoint(tree)
     violations.extend(_validate_module_execution(tree))
+    violations.extend(_validate_parent_world_snapshots(tree))
     visitor = _SafetyVisitor(docstrings=_docstring_constants(tree))
     visitor.visit(tree)
     violations.extend(visitor.violations)
