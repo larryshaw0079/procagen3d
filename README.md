@@ -131,7 +131,7 @@ Add `--no-progress` to `make`, `run`, or `build` for a quiet invocation.
 
 | Backend | Executable | Default model/mode |
 | --- | --- | --- |
-| Codex | `codex` | `gpt-5.6-sol`, reasoning effort `max` |
+| Codex | `codex` | `gpt-5.6-sol`, reasoning effort `xhigh` |
 | Grok Build | `grok` | `grok-4.6`, reasoning effort `xhigh` |
 | Cursor | `cursor-agent` | `cursor-grok-4.6-xhigh-fast` |
 

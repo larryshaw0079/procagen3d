@@ -402,7 +402,7 @@ def _command_doctor(args: argparse.Namespace) -> int:
         name: {"model": create_backend(name).model}
         for name in BACKEND_NAMES
     }
-    checks["defaults"]["codex"]["reasoning_effort"] = "max"
+    checks["defaults"]["codex"]["reasoning_effort"] = "xhigh"
     checks["defaults"]["grok"].update(
         reasoning_effort="xhigh",
         fast_mode="not exposed by Grok Build CLI 1.0.5",

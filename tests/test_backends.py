@@ -81,7 +81,7 @@ class BackendCommandTests(unittest.TestCase):
         self.prompt_file = self.workspace / "trajectories" / "iter_00" / "prompt.txt"
         self.image = self.workspace / "inputs" / "reference.png"
 
-    def test_codex_command_pins_sol_max_and_safe_headless_flags(self) -> None:
+    def test_codex_command_pins_sol_xhigh_and_safe_headless_flags(self) -> None:
         backend = CodexBackend()
         command = backend.build_command(
             "write the program",
@@ -107,7 +107,7 @@ class BackendCommandTests(unittest.TestCase):
                 "-m",
                 "gpt-5.6-sol",
                 "-c",
-                "model_reasoning_effort=max",
+                "model_reasoning_effort=xhigh",
                 "-s",
                 "workspace-write",
                 "--color",

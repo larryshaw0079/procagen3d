@@ -19,7 +19,7 @@ def test_make_defaults_to_requested_codex_configuration() -> None:
     assert args.granularity == "medium"
     backend = create_backend(args.backend)
     assert backend.model == "gpt-5.6-sol"
-    assert backend.reasoning_effort == "max"
+    assert backend.reasoning_effort == "xhigh"
 
 
 def test_run_uses_manifest_backend_when_override_is_absent() -> None:

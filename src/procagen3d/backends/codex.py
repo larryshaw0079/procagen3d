@@ -20,12 +20,12 @@ from .base import (
 
 @dataclass(frozen=True)
 class CodexBackend(CLIBackend):
-    """Invoke Codex non-interactively with GPT-5.6 Sol at max effort."""
+    """Invoke Codex non-interactively with GPT-5.6 Sol at extra-high effort."""
 
     name: ClassVar[str] = "codex"
     cli: str = "codex"
     model: str = "gpt-5.6-sol"
-    reasoning_effort: str = "max"
+    reasoning_effort: str = "xhigh"
     sandbox: str = "workspace-write"
     approval_policy: str = "never"
     ephemeral: bool = True
