@@ -17,6 +17,11 @@ from . import __version__
 from .backends import BACKEND_NAMES, create_backend
 from .blender import BlenderError, BlenderRuntime
 from .glb_probe import GLBProbeError, probe_glb
+from .granularity import (
+    DEFAULT_GRANULARITY,
+    GRANULARITY_LEVELS,
+    validate_granularity,
+)
 from .pipeline import (
     PipelineConfig,
     PipelineError,
@@ -62,6 +67,7 @@ def _add_runtime_options(
     *,
     backend_default: str | None,
     mode_default: str | None,
+    granularity_default: str | None,
 ) -> None:
     parser.add_argument("--backend", choices=BACKEND_NAMES, default=backend_default)
     parser.add_argument("--blender", type=Path, help="path to the Blender executable")
@@ -71,6 +77,16 @@ def _add_runtime_options(
         choices=RECONSTRUCTION_MODES,
         default=mode_default,
         help="geometry contract; existing workspaces retain their recorded mode by default",
+    )
+    parser.add_argument(
+        "--granularity",
+        "--detail-level",
+        choices=GRANULARITY_LEVELS,
+        default=granularity_default,
+        help=(
+            "geometry detail profile; fine and surface enable bidirectional 3D "
+            "surface-distance validation"
+        ),
     )
     parser.add_argument(
         "--max-repairs",
@@ -84,7 +100,7 @@ def _add_runtime_options(
         type=int,
         choices=range(1, 11),
         default=1,
-        help="post-render LLM repairs; at least one visual repair is always attempted",
+        help="post-render/surface LLM repairs; at least one fidelity repair is always attempted",
     )
     parser.add_argument("--min-score", type=_score, default=0.35)
     parser.add_argument("--render-size", type=_render_size, default=256)
@@ -105,6 +121,7 @@ def _config(args: argparse.Namespace, *, backend: str) -> PipelineConfig:
         max_fidelity_repairs=args.max_fidelity_repairs,
         min_score=args.min_score,
         reconstruction_mode=validate_reconstruction_mode(args.reconstruction_mode),
+        granularity=validate_granularity(args.granularity),
         render_size=args.render_size,
         llm_timeout_s=args.llm_timeout,
         blender_timeout_s=args.blender_timeout,
@@ -131,6 +148,7 @@ def _build_summary(
             report={
                 "status": status,
                 "score": report["score"],
+                "granularity": report.get("granularity"),
                 "deliverables": deliverables,
             },
         )
@@ -166,6 +184,7 @@ def _command_make(args: argparse.Namespace) -> int:
                 prompt=args.prompt,
                 backend=args.backend,
                 reconstruction_mode=args.reconstruction_mode,
+                granularity=args.granularity,
             )
             stage.complete(f"Workspace created — {workspace.root}")
         report = run_pipeline(
@@ -193,6 +212,10 @@ def _command_run(args: argparse.Namespace) -> int:
                 args.reconstruction_mode
                 or str(manifest.get("reconstruction_mode") or DEFAULT_RECONSTRUCTION_MODE)
             )
+            args.granularity = (
+                args.granularity
+                or str(manifest.get("granularity") or DEFAULT_GRANULARITY)
+            )
             stage.complete(f"Workspace ready — {workspace.root}")
         report = run_pipeline(
             workspace,
@@ -207,6 +230,8 @@ def _command_run(args: argparse.Namespace) -> int:
 
 def _command_build(args: argparse.Namespace) -> int:
     workspace: Workspace | None = None
+    reconstruction_mode: str | None = None
+    granularity: str | None = None
     try:
         with _progress_context(args) as progress:
             with progress_step(
@@ -219,6 +244,10 @@ def _command_build(args: argparse.Namespace) -> int:
                 reconstruction_mode = validate_reconstruction_mode(
                     args.reconstruction_mode
                     or str(manifest.get("reconstruction_mode") or DEFAULT_RECONSTRUCTION_MODE)
+                )
+                granularity = validate_granularity(
+                    args.granularity
+                    or str(manifest.get("granularity") or DEFAULT_GRANULARITY)
                 )
                 stage.complete(f"Workspace ready — {workspace.root}")
             with progress_step(progress, "runtime", "Locating Blender") as stage:
@@ -237,6 +266,7 @@ def _command_build(args: argparse.Namespace) -> int:
                 runtime,
                 min_score=args.min_score,
                 reconstruction_mode=reconstruction_mode,
+                granularity=granularity,
                 timeout_s=args.blender_timeout,
                 trajectory_dir=matching_source_trajectory(workspace),
                 progress=progress,
@@ -251,6 +281,8 @@ def _command_build(args: argparse.Namespace) -> int:
                     "status": "failed",
                     "workspace": str(workspace.root),
                     "backend": None,
+                    "reconstruction_mode": reconstruction_mode,
+                    "granularity": granularity,
                     "stage": "build",
                     "error": str(exc),
                 },
@@ -266,10 +298,13 @@ def _command_build(args: argparse.Namespace) -> int:
         "comparison": "artifacts/comparison.json",
         "build_manifest": "artifacts/build_manifest.json",
     }
+    if (workspace.artifacts_dir / "surface_comparison.json").is_file():
+        deliverables["surface_comparison"] = "artifacts/surface_comparison.json"
     workspace.update_manifest(
         status=status,
         score=report["score"],
         reconstruction_mode=reconstruction_mode,
+        granularity=granularity,
         deliverables=deliverables,
     )
     write_json(
@@ -280,6 +315,7 @@ def _command_build(args: argparse.Namespace) -> int:
             "workspace": str(workspace.root),
             "backend": None,
             "reconstruction_mode": reconstruction_mode,
+            "granularity": granularity,
             "score": report["score"],
             "passed": report["passed"],
             "deliverables": deliverables,
@@ -315,6 +351,9 @@ def _command_inspect(args: argparse.Namespace) -> int:
             "program": workspace.program_path.is_file(),
             "blend": (workspace.artifacts_dir / "scene.blend").is_file(),
             "glb": (workspace.artifacts_dir / "model.glb").is_file(),
+            "surface_comparison": (
+                workspace.artifacts_dir / "surface_comparison.json"
+            ).is_file(),
         },
         "run_report": json.loads(run_report_path.read_text(encoding="utf-8"))
         if run_report_path.is_file()
@@ -416,6 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
         make,
         backend_default="codex",
         mode_default=DEFAULT_RECONSTRUCTION_MODE,
+        granularity_default=DEFAULT_GRANULARITY,
     )
     make.set_defaults(handler=_command_make)
 
@@ -424,7 +464,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output", "-o", type=Path, default=Path("outputs"))
     run.add_argument("--prepare-only", action="store_true")
     run.add_argument("--force-probe", action="store_true")
-    _add_runtime_options(run, backend_default=None, mode_default=None)
+    _add_runtime_options(
+        run,
+        backend_default=None,
+        mode_default=None,
+        granularity_default=None,
+    )
     run.set_defaults(handler=_command_run)
 
     build = commands.add_parser("build", help="compile and verify the current src/program.py without an LLM")
@@ -437,6 +482,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=RECONSTRUCTION_MODES,
         default=None,
         help="override the workspace's recorded reconstruction mode for this build",
+    )
+    build.add_argument(
+        "--granularity",
+        "--detail-level",
+        choices=GRANULARITY_LEVELS,
+        default=None,
+        help="override the workspace's recorded granularity for this build",
     )
     build.add_argument("--min-score", type=_score, default=0.35)
     build.add_argument("--render-size", type=_render_size, default=256)

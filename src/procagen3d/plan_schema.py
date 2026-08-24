@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Sequence
 
+from .granularity import DEFAULT_GRANULARITY, GRANULARITY_LEVELS
 from .reconstruction import DEFAULT_RECONSTRUCTION_MODE, RECONSTRUCTION_MODES
 
 
@@ -63,6 +64,16 @@ PLAN_SCHEMA: dict[str, Any] = {
             "description": (
                 "procedural synthesizes compact editable geometry; glb-ref "
                 "may derive geometry from the supplied reference under the host contract."
+            ),
+        },
+        "granularity": {
+            "type": "string",
+            "enum": list(GRANULARITY_LEVELS),
+            "default": DEFAULT_GRANULARITY,
+            "description": (
+                "Geometric authoring and validation detail. Fine and surface levels "
+                "replace primitive-only fitting with surface-conforming procedural meshes "
+                "and enable bidirectional 3D surface-distance gates."
             ),
         },
         "coordinate_frame": {
@@ -342,9 +353,9 @@ def plan_schema_violations(value: Any) -> tuple[PlanSchemaViolation, ...]:
 def validate_plan_document(value: Any) -> dict[str, Any]:
     """Validate and return a shallow normalized plan.
 
-    ``reconstruction_mode`` was added after the original plan contract. Old plans
-    remain valid and normalize to ``procedural``; newly authored plans should
-    include the field explicitly.
+    ``reconstruction_mode`` and ``granularity`` were added after the original
+    plan contract. Old plans remain valid and receive compatibility defaults;
+    newly authored plans should include both fields explicitly.
     """
 
     violations = plan_schema_violations(value)
@@ -352,4 +363,5 @@ def validate_plan_document(value: Any) -> dict[str, Any]:
         raise PlanSchemaError(violations)
     normalized = dict(value)
     normalized.setdefault("reconstruction_mode", DEFAULT_RECONSTRUCTION_MODE)
+    normalized.setdefault("granularity", DEFAULT_GRANULARITY)
     return normalized

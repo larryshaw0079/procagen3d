@@ -170,6 +170,24 @@ def test_build_rejects_plan_mode_that_differs_from_host_mode(tmp_path: Path) -> 
         )
 
 
+def test_build_rejects_plan_granularity_that_differs_from_host_profile(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+
+    class UnusedRuntime:
+        def run_stage(self, *args, **kwargs):  # pragma: no cover - guard runs first
+            raise AssertionError("Blender must not run for a granularity mismatch")
+
+    with pytest.raises(pipeline.PipelineError, match="granularity must match"):
+        pipeline.build_workspace(
+            workspace,
+            UnusedRuntime(),
+            granularity="fine",
+            timeout_s=10,
+        )
+
+
 def test_complete_evidence_requires_canonical_camera_order(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence"
     _write_evidence(evidence)
@@ -356,6 +374,109 @@ def test_build_reports_keep_workspace_relative_provenance(
     assert build_manifest["source_glb_imported_at_build_time"] is True
     assert build_manifest["reference_glb_sha256"] == workspace.manifest()["inputs"]["glb"]["sha256"]
     assert "originals removed before export" in build_manifest["reference_contract"]
+
+
+def test_fine_build_runs_surface_stage_without_exposing_reference_to_program(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    plan = json.loads(workspace.plan_path.read_text(encoding="utf-8"))
+    plan["granularity"] = "fine"
+    write_json(workspace.plan_path, plan)
+    workspace.evidence_dir.mkdir(exist_ok=True)
+    (workspace.evidence_dir / "camera_contract.json").write_text("{}", encoding="utf-8")
+
+    class FakeRuntime:
+        def __init__(self):
+            self.stages: list[str] = []
+            self.arguments: dict[str, list] = {}
+
+        def run_stage(self, stage, arguments, *, cwd, timeout_s):
+            self.stages.append(stage)
+            self.arguments[stage] = list(arguments)
+            if stage == "build_asset":
+                artifacts = Path(arguments[arguments.index("--artifacts-dir") + 1])
+                artifacts.mkdir(parents=True, exist_ok=True)
+                (artifacts / "model.glb").write_bytes(b"compiled glb")
+                (artifacts / "scene.blend").write_bytes(b"blend")
+            elif stage == "compiled_probe":
+                artifacts = Path(arguments[arguments.index("--artifacts-dir") + 1])
+                write_json(
+                    artifacts / "scene_report.json",
+                    {
+                        "bounds": {
+                            "min": [0.0, 0.0, 0.0],
+                            "max": [1.0, 1.0, 1.0],
+                            "dimensions": [1.0, 1.0, 1.0],
+                            "center": [0.5, 0.5, 0.5],
+                        }
+                    },
+                )
+            elif stage == "surface_compare":
+                output = Path(arguments[arguments.index("--output") + 1])
+                write_json(
+                    output,
+                    {
+                        "schema_version": 1,
+                        "symmetric": {"mean": 0.02, "p95": 0.05},
+                    },
+                )
+            else:  # pragma: no cover - makes unexpected stages explicit
+                raise AssertionError(stage)
+            return SimpleNamespace(ok=True, stdout="ok", stderr="")
+
+    monkeypatch.setattr(
+        pipeline,
+        "probe_glb",
+        lambda path: {
+            "path": str(path),
+            "self_contained": True,
+            "reference_readiness": "pass",
+            "scene": {"mesh_count": 1, "triangle_count": 12},
+        },
+    )
+    seen_comparison: dict = {}
+
+    def fake_compare(**kwargs):
+        seen_comparison.update(kwargs)
+        assert kwargs["surface_comparison"].is_file()
+        report = {"score": 1.0, "passed": True, "hard_gates": {"passed": True}}
+        write_json(kwargs["output"], report)
+        return report
+
+    monkeypatch.setattr(pipeline, "compare_workspace", fake_compare)
+    runtime = FakeRuntime()
+
+    result = pipeline.build_workspace(
+        workspace,
+        runtime,
+        min_score=0.0,
+        granularity="fine",
+        timeout_s=10,
+    )
+
+    assert result["passed"] is True
+    assert runtime.stages == ["build_asset", "compiled_probe", "surface_compare"]
+    build_arguments = runtime.arguments["build_asset"]
+    assert build_arguments[build_arguments.index("--granularity") + 1] == "fine"
+    assert "--reference-glb" not in build_arguments
+    surface_arguments = runtime.arguments["surface_compare"]
+    assert surface_arguments[surface_arguments.index("--samples") + 1] == "20000"
+    assert seen_comparison["surface_gate_thresholds"].max_mean_surface_distance == 0.035
+    assert seen_comparison["surface_gate_thresholds"].max_p95_surface_distance == 0.080
+
+    surface_report = json.loads(
+        (workspace.artifacts_dir / "surface_comparison.json").read_text(encoding="utf-8")
+    )
+    assert surface_report["granularity"] == "fine"
+    assert surface_report["reference"] == "inputs/reference.glb"
+    build_manifest = json.loads(
+        (workspace.artifacts_dir / "build_manifest.json").read_text(encoding="utf-8")
+    )
+    assert build_manifest["granularity"] == "fine"
+    assert build_manifest["source_glb_imported_at_build_time"] is False
+    assert build_manifest["reference_glb_used_for_surface_evaluation"] is True
+    assert "surface-evaluation" in build_manifest["reference_contract"]
 
 
 def test_build_rejects_a_trajectory_that_does_not_own_the_active_source(

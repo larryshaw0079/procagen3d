@@ -55,6 +55,40 @@ For an explicitly glb-ref reconstruction:
 uv run procagen3d make IMAGE GLB --mode glb-ref
 ```
 
+Geometry granularity is independent of reconstruction provenance:
+
+```sh
+uv run procagen3d make IMAGE GLB --granularity fine
+uv run procagen3d make IMAGE GLB --mode glb-ref --granularity surface
+```
+
+| Granularity | Authoring target | 3D surface acceptance |
+| --- | --- | --- |
+| `coarse` | Fast semantic blockout and major silhouette | Disabled |
+| `medium` | Compact editable geometry and secondary forms (compatibility default) | Disabled |
+| `fine` | Surface-conforming contour cages, lofts, panels, recesses, and anatomy | 20k deterministic samples per direction; mean/p95 gates |
+| `surface` | Strictest attainable surface fit and explicit plane/concavity transitions | 80k samples per direction; tighter mean/p95 gates |
+
+Fine levels do not equate detail with subdivision count. They tell the authoring
+agent to replace primitive-only fitting with custom procedural surfaces, then
+run a host-owned bidirectional BVH comparison after export. Candidate-to-reference
+distance detects excess/inflated geometry; reference-to-candidate distance detects
+missing form. The report includes worst 3D residual coordinates for the repair
+loop. In `procedural` mode this is necessarily a best-effort authored
+approximation from images and measurements; use `glb-ref` when reference-derived
+geometry is acceptable. Increase `--max-fidelity-repairs` for difficult fine or
+surface assets.
+
+To upgrade an existing medium workspace such as a local mecha run, resume it
+with an explicit profile; the plan/profile mismatch intentionally triggers an
+authoring repair before the fine candidate is accepted:
+
+```sh
+uv run procagen3d run outputs/strike-style-mecha \
+  --granularity fine \
+  --max-fidelity-repairs 3
+```
+
 To build evidence without spending an agent invocation:
 
 ```sh
@@ -137,7 +171,9 @@ image + offline GLB
                          │
              re-import exact GLB + same-camera renders
                          │
-        aggregate diagnostics + non-compensating gates → split repair loops
+        render diagnostics + optional bidirectional surface distance
+                         │
+                  non-compensating gates → split repair loops
 ```
 
 The sample GLBs are deliberately handled as semantically weak evidence: most
@@ -200,6 +236,7 @@ outputs/<name>-<mode>/
 │   ├── model_probe.json
 │   ├── build_manifest.json
 │   ├── comparison.json
+│   ├── surface_comparison.json  # fine/surface only
 │   └── renders/
 ├── trajectories/iter_XX/
 └── run_report.json
@@ -209,8 +246,9 @@ outputs/<name>-<mode>/
 mean silhouette IoU, worst-view silhouette IoU, worst-view foreground-area
 similarity, center distance, and ground-plane offset. These gates are
 non-compensating, so correct overall dimensions can no longer hide collapsed or
-misplaced geometry. `needs-review` still contains a valid program, BLEND, and
-GLB, but exhausted the post-render budget without passing. Build/static failures
+misplaced geometry. `fine` and `surface` add non-compensating bidirectional mean
+and p95 surface-distance gates. `needs-review` still contains a valid program,
+BLEND, and GLB, but exhausted the fidelity-repair budget without passing. Build/static failures
 never ship as valid artifacts. Commands return exit code 2 for `needs-review`,
 so CI can distinguish it from a passing result while retaining the last matching
 source/artifact pair.
@@ -248,10 +286,12 @@ PROCAGEN3D_RUN_BLENDER_TESTS=1 uv run pytest -q tests/test_blender_integration.p
 Tests cover GLB parsing/accessor transforms, semantic-boundary detection,
 generated-source policy, exact/exhaustive plan-schema validation, split repair
 budgets, workspace provenance, hard fidelity gates, finite scene validation,
-atomic host-pipeline behavior, and portable build provenance. The opt-in Blender
+atomic host-pipeline behavior, granularity compatibility, surface-report schema,
+and portable build provenance. The opt-in Blender
 integration tests save and export in one process, re-import in a second factory
 process, verify custom-mesh transforms through translated parent empties, and
-verify that glb-ref export contains only newly created candidates.
+verify deterministic bidirectional surface distance and that glb-ref export
+contains only newly created candidates.
 
 ## Design lineage
 

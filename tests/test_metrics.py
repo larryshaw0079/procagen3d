@@ -9,6 +9,7 @@ import pytest
 from procagen3d.metrics import (
     CANONICAL_VIEW_NAMES,
     FidelityGateThresholds,
+    SurfaceGateThresholds,
     compare_workspace,
     mask_metrics,
 )
@@ -62,6 +63,73 @@ def geometry_document() -> dict:
     }
 
 
+def surface_document(
+    *,
+    symmetric_mean: float = 0.020,
+    symmetric_p95: float = 0.050,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "units": "normalized-scene-units",
+        "pose_policy": "frame-0, armatures-in-rest-position",
+        "sampling": {
+            "strategy": "deterministic fixture",
+            "requested_samples_per_direction": 4,
+            "percentile_method": "linear fixture",
+            "worst_sample_limit_per_direction": 2,
+        },
+        "reference_normalization": {
+            "source_min": [-0.5, -0.5, 0.0],
+            "source_max": [0.5, 0.5, 1.0],
+            "scale": 2.0,
+            "translation": [0.0, 0.0, 0.0],
+            "longest_dimension": 2.0,
+        },
+        "surfaces": {
+            "reference": {"vertices": 8, "triangles": 12, "area": 6.0},
+            "candidate": {"vertices": 12, "triangles": 20, "area": 7.0},
+        },
+        "candidate_to_reference": {
+            "samples": 4,
+            "source_surface_area": 7.0,
+            "mean": 0.018,
+            "rms": 0.025,
+            "p95": 0.045,
+            "max": 0.060,
+            "worst_samples": [
+                {
+                    "sample_index": 1,
+                    "distance": 0.060,
+                    "source": [0.0, 0.0, 1.0],
+                    "nearest": [0.0, 0.0, 0.94],
+                }
+            ],
+        },
+        "reference_to_candidate": {
+            "samples": 4,
+            "source_surface_area": 6.0,
+            "mean": 0.022,
+            "rms": 0.030,
+            "p95": 0.055,
+            "max": 0.070,
+            "worst_samples": [
+                {
+                    "sample_index": 2,
+                    "distance": 0.070,
+                    "source": [0.0, 0.0, 0.0],
+                    "nearest": [0.0, 0.0, 0.07],
+                }
+            ],
+        },
+        "symmetric": {
+            "mean": symmetric_mean,
+            "rms": max(symmetric_mean, 0.028),
+            "p95": symmetric_p95,
+            "max": max(symmetric_p95, 0.070),
+        },
+    }
+
+
 def write_json(path: Path, value: dict) -> Path:
     path.write_text(json.dumps(value), encoding="utf-8")
     return path
@@ -74,6 +142,8 @@ def compare_scenes(
     candidate: object,
     min_score: object = 0.5,
     gate_thresholds: FidelityGateThresholds | None = None,
+    surface_comparison: Path | None = None,
+    surface_gate_thresholds: SurfaceGateThresholds | None = None,
 ) -> dict:
     record = packed(["11", "11"])
     masks = write_json(tmp_path / "valid-masks.json", mask_document(record))
@@ -87,6 +157,8 @@ def compare_scenes(
         output=tmp_path / "comparison.json",
         min_score=min_score,
         gate_thresholds=gate_thresholds,
+        surface_comparison=surface_comparison,
+        surface_gate_thresholds=surface_gate_thresholds,
     )
 
 
@@ -216,6 +288,175 @@ def test_compare_workspace_identical_inputs_score_one(tmp_path: Path) -> None:
     assert report["hard_gates"]["passed"] is True
     assert report["hard_gates"]["failures"] == []
     assert report["passed"] is True
+
+
+def test_omitting_surface_data_preserves_the_exact_legacy_report(tmp_path: Path) -> None:
+    record = packed(["10", "01"])
+    masks = write_json(tmp_path / "masks.json", mask_document(record))
+    scene = write_json(tmp_path / "scene.json", geometry_document())
+
+    legacy = compare_workspace(
+        reference_masks=masks,
+        candidate_masks=masks,
+        reference_scene=scene,
+        candidate_scene=scene,
+        output=tmp_path / "legacy.json",
+        min_score=0.5,
+    )
+    explicit_none = compare_workspace(
+        reference_masks=masks,
+        candidate_masks=masks,
+        reference_scene=scene,
+        candidate_scene=scene,
+        output=tmp_path / "explicit-none.json",
+        min_score=0.5,
+        surface_comparison=None,
+        surface_gate_thresholds=None,
+    )
+
+    assert explicit_none == legacy
+    assert "surface_comparison" not in legacy
+    assert "mean_surface_distance" not in legacy["summary"]
+    assert "max_mean_surface_distance" not in legacy["hard_gates"]["thresholds"]
+
+
+def test_surface_distances_add_diagnostics_and_noncompensating_gates(
+    tmp_path: Path,
+) -> None:
+    surface_path = write_json(tmp_path / "surface.json", surface_document())
+
+    accepted = compare_scenes(
+        tmp_path,
+        reference=geometry_document(),
+        candidate=geometry_document(),
+        min_score=1.0,
+        surface_comparison=surface_path,
+    )
+
+    assert accepted["score"] == 1.0
+    assert accepted["score_weights"] == {
+        "silhouette_iou": 0.50,
+        "area_similarity": 0.10,
+        "spatial_rgb_similarity": 0.15,
+        "dimension_similarity": 0.15,
+        "center_similarity": 0.10,
+    }
+    assert accepted["summary"]["mean_surface_distance"] == 0.020
+    assert accepted["summary"]["p95_surface_distance"] == 0.050
+    assert accepted["surface_comparison"]["sampling"][
+        "requested_samples_per_direction"
+    ] == 4
+    assert accepted["hard_gates"]["results"]["mean_surface_distance"]["passed"]
+    assert accepted["hard_gates"]["results"]["p95_surface_distance"]["passed"]
+    assert accepted["passed"] is True
+
+    rejected = compare_scenes(
+        tmp_path,
+        reference=geometry_document(),
+        candidate=geometry_document(),
+        min_score=1.0,
+        surface_comparison=surface_path,
+        surface_gate_thresholds=SurfaceGateThresholds(
+            max_mean_surface_distance=0.015,
+            max_p95_surface_distance=0.040,
+        ),
+    )
+
+    assert rejected["score"] == accepted["score"]
+    assert rejected["score_passed"] is True
+    assert rejected["passed"] is False
+    assert rejected["hard_gates"]["thresholds"]["max_mean_surface_distance"] == 0.015
+    assert rejected["hard_gates"]["thresholds"]["max_p95_surface_distance"] == 0.040
+    assert [failure["gate"] for failure in rejected["hard_gates"]["failures"]] == [
+        "mean_surface_distance",
+        "p95_surface_distance",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda value: value.update(schema_version=2),
+            "must use schema_version 1",
+        ),
+        (
+            lambda value: value["sampling"].update(
+                requested_samples_per_direction=True
+            ),
+            "requested_samples_per_direction must be a positive integer",
+        ),
+        (
+            lambda value: value["candidate_to_reference"].update(samples=3),
+            "samples must equal",
+        ),
+        (
+            lambda value: value["reference_to_candidate"].update(
+                source_surface_area=5.0
+            ),
+            "source_surface_area does not match",
+        ),
+        (
+            lambda value: value["candidate_to_reference"].update(mean=-0.1),
+            "mean must be a finite non-negative number",
+        ),
+        (
+            lambda value: value["symmetric"].update(p95=0.2, max=0.1),
+            "p95 cannot exceed symmetric.max",
+        ),
+        (
+            lambda value: value["candidate_to_reference"].update(
+                worst_samples="invalid"
+            ),
+            "worst_samples must be an array",
+        ),
+        (
+            lambda value: value["reference_normalization"].update(
+                source_min=[0.0, 0.0]
+            ),
+            "source_min must be a 3-element array",
+        ),
+    ],
+)
+def test_surface_comparison_schema_is_validated_exhaustively(
+    tmp_path: Path,
+    mutation,
+    message: str,
+) -> None:
+    document = surface_document()
+    mutation(document)
+    surface_path = write_json(tmp_path / "invalid-surface.json", document)
+
+    with pytest.raises(ValueError, match=message):
+        compare_scenes(
+            tmp_path,
+            reference=geometry_document(),
+            candidate=geometry_document(),
+            surface_comparison=surface_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "thresholds",
+    [
+        {"max_mean_surface_distance": -0.1},
+        {"max_p95_surface_distance": float("nan")},
+        {"max_mean_surface_distance": True},
+    ],
+)
+def test_surface_gate_thresholds_reject_invalid_limits(thresholds: dict) -> None:
+    with pytest.raises(ValueError, match="must be finite and non-negative"):
+        SurfaceGateThresholds(**thresholds)
+
+
+def test_surface_thresholds_require_surface_data(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires a surface_comparison path"):
+        compare_scenes(
+            tmp_path,
+            reference=geometry_document(),
+            candidate=geometry_document(),
+            surface_gate_thresholds=SurfaceGateThresholds(),
+        )
 
 
 def test_low_single_view_fails_hard_gate_despite_passing_score(tmp_path: Path) -> None:

@@ -54,6 +54,26 @@ class FidelityGateThresholds:
             _validate_gate_threshold(name, getattr(self, name))
 
 
+@dataclass(frozen=True)
+class SurfaceGateThresholds:
+    """Non-compensating limits for normalized bidirectional surface distance.
+
+    Surface comparison is optional. These defaults match the least strict
+    surface-enabled reconstruction profile; callers can supply tighter limits
+    without changing the legacy render-and-bounds score.
+    """
+
+    max_mean_surface_distance: float = 0.035
+    max_p95_surface_distance: float = 0.080
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_mean_surface_distance",
+            "max_p95_surface_distance",
+        ):
+            _validate_gate_threshold(name, getattr(self, name))
+
+
 def _validate_gate_threshold(
     name: str,
     value: Any,
@@ -72,6 +92,310 @@ def _validate_gate_threshold(
     ):
         raise ValueError(f"{name} must be finite{qualifier}")
     return result
+
+
+def _surface_positive_integer(value: Any, *, label: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"surface comparison {label} must be a positive integer")
+    return value
+
+
+def _surface_distance(value: Any, *, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"surface comparison {label} must be a finite non-negative number"
+        )
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ValueError(
+            f"surface comparison {label} must be a finite non-negative number"
+        ) from exc
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError(
+            f"surface comparison {label} must be a finite non-negative number"
+        )
+    return result
+
+
+def _surface_statistics(
+    value: Any,
+    *,
+    label: str,
+    include_samples: bool,
+    require_worst_samples: bool,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"surface comparison {label} must be a JSON object")
+
+    statistics = {
+        name: _surface_distance(value.get(name), label=f"{label}.{name}")
+        for name in ("mean", "rms", "p95", "max")
+    }
+    tolerance = max(1.0e-12, statistics["max"] * 1.0e-12)
+    if statistics["mean"] > statistics["max"] + tolerance:
+        raise ValueError(
+            f"surface comparison {label}.mean cannot exceed {label}.max"
+        )
+    if statistics["rms"] + tolerance < statistics["mean"]:
+        raise ValueError(
+            f"surface comparison {label}.rms cannot be less than {label}.mean"
+        )
+    if statistics["rms"] > statistics["max"] + tolerance:
+        raise ValueError(
+            f"surface comparison {label}.rms cannot exceed {label}.max"
+        )
+    if statistics["p95"] > statistics["max"] + tolerance:
+        raise ValueError(
+            f"surface comparison {label}.p95 cannot exceed {label}.max"
+        )
+
+    result: dict[str, Any] = dict(statistics)
+    if include_samples:
+        result = {
+            "samples": _surface_positive_integer(
+                value.get("samples"), label=f"{label}.samples"
+            ),
+            "source_surface_area": _surface_distance(
+                value.get("source_surface_area"),
+                label=f"{label}.source_surface_area",
+            ),
+            **result,
+        }
+        if result["source_surface_area"] <= 0.0:
+            raise ValueError(
+                f"surface comparison {label}.source_surface_area must be positive"
+            )
+    if require_worst_samples:
+        worst_samples = value.get("worst_samples")
+        if not isinstance(worst_samples, list):
+            raise ValueError(
+                f"surface comparison {label}.worst_samples must be an array"
+            )
+        normalized_samples = []
+        for index, sample in enumerate(worst_samples):
+            sample_label = f"{label}.worst_samples[{index}]"
+            if not isinstance(sample, dict):
+                raise ValueError(
+                    f"surface comparison {sample_label} must be a JSON object"
+                )
+            sample_index = sample.get("sample_index")
+            if (
+                type(sample_index) is not int
+                or sample_index < 0
+                or sample_index >= result["samples"]
+            ):
+                raise ValueError(
+                    f"surface comparison {sample_label}.sample_index is out of range"
+                )
+            distance = _surface_distance(
+                sample.get("distance"), label=f"{sample_label}.distance"
+            )
+            tolerance = max(1.0e-12, result["max"] * 1.0e-12)
+            if distance > result["max"] + tolerance:
+                raise ValueError(
+                    f"surface comparison {sample_label}.distance cannot exceed {label}.max"
+                )
+            normalized_samples.append(
+                {
+                    "sample_index": sample_index,
+                    "distance": distance,
+                    "source": _surface_vector(
+                        sample.get("source"), label=f"{sample_label}.source"
+                    ),
+                    "nearest": _surface_vector(
+                        sample.get("nearest"), label=f"{sample_label}.nearest"
+                    ),
+                }
+            )
+        result["worst_samples"] = normalized_samples
+    return result
+
+
+def _surface_string(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"surface comparison {label} must be a non-empty string")
+    return value
+
+
+def _surface_finite_number(value: Any, *, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"surface comparison {label} must be a finite number")
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"surface comparison {label} must be a finite number") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"surface comparison {label} must be a finite number")
+    return result
+
+
+def _surface_vector(value: Any, *, label: str) -> list[float]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"surface comparison {label} must be a 3-element array")
+    return [
+        _surface_finite_number(item, label=f"{label}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+
+def _surface_sampling(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("surface comparison sampling must be a JSON object")
+    worst_sample_limit = value.get("worst_sample_limit_per_direction")
+    if type(worst_sample_limit) is not int or worst_sample_limit < 0:
+        raise ValueError(
+            "surface comparison sampling.worst_sample_limit_per_direction "
+            "must be a non-negative integer"
+        )
+    return {
+        "strategy": _surface_string(value.get("strategy"), label="sampling.strategy"),
+        "requested_samples_per_direction": _surface_positive_integer(
+            value.get("requested_samples_per_direction"),
+            label="sampling.requested_samples_per_direction",
+        ),
+        "percentile_method": _surface_string(
+            value.get("percentile_method"), label="sampling.percentile_method"
+        ),
+        "worst_sample_limit_per_direction": worst_sample_limit,
+    }
+
+
+def _surface_normalization(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(
+            "surface comparison reference_normalization must be a JSON object"
+        )
+    scale = _surface_distance(
+        value.get("scale"), label="reference_normalization.scale"
+    )
+    longest_dimension = _surface_distance(
+        value.get("longest_dimension"),
+        label="reference_normalization.longest_dimension",
+    )
+    if scale <= 0.0 or longest_dimension <= 0.0:
+        raise ValueError(
+            "surface comparison reference normalization scale and longest_dimension "
+            "must be positive"
+        )
+    source_min = _surface_vector(
+        value.get("source_min"), label="reference_normalization.source_min"
+    )
+    source_max = _surface_vector(
+        value.get("source_max"), label="reference_normalization.source_max"
+    )
+    if any(low > high for low, high in zip(source_min, source_max, strict=True)):
+        raise ValueError(
+            "surface comparison reference_normalization.source_min cannot exceed source_max"
+        )
+    return {
+        "source_min": source_min,
+        "source_max": source_max,
+        "scale": scale,
+        "translation": _surface_vector(
+            value.get("translation"), label="reference_normalization.translation"
+        ),
+        "longest_dimension": longest_dimension,
+    }
+
+
+def _surface_inventory(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"surface comparison surfaces.{label} must be a JSON object")
+    area = _surface_distance(value.get("area"), label=f"surfaces.{label}.area")
+    if area <= 0.0:
+        raise ValueError(f"surface comparison surfaces.{label}.area must be positive")
+    return {
+        "vertices": _surface_positive_integer(
+            value.get("vertices"), label=f"surfaces.{label}.vertices"
+        ),
+        "triangles": _surface_positive_integer(
+            value.get("triangles"), label=f"surfaces.{label}.triangles"
+        ),
+        "area": area,
+    }
+
+
+def _surface_inventories(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("surface comparison surfaces must be a JSON object")
+    return {
+        label: _surface_inventory(value.get(label), label=label)
+        for label in ("reference", "candidate")
+    }
+
+
+def _surface_comparison(path: Path) -> dict[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"surface comparison is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError("surface comparison must contain a JSON object")
+    if type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+        raise ValueError("surface comparison must use schema_version 1")
+
+    units = _surface_string(document.get("units"), label="units")
+    if units != "normalized-scene-units":
+        raise ValueError(
+            "surface comparison units must be 'normalized-scene-units'"
+        )
+    sampling = _surface_sampling(document.get("sampling"))
+    normalization = _surface_normalization(document.get("reference_normalization"))
+    surfaces = _surface_inventories(document.get("surfaces"))
+    candidate_to_reference = _surface_statistics(
+        document.get("candidate_to_reference"),
+        label="candidate_to_reference",
+        include_samples=True,
+        require_worst_samples=True,
+    )
+    reference_to_candidate = _surface_statistics(
+        document.get("reference_to_candidate"),
+        label="reference_to_candidate",
+        include_samples=True,
+        require_worst_samples=True,
+    )
+    requested_samples = sampling["requested_samples_per_direction"]
+    worst_sample_limit = sampling["worst_sample_limit_per_direction"]
+    for label, statistics, source_label in (
+        ("candidate_to_reference", candidate_to_reference, "candidate"),
+        ("reference_to_candidate", reference_to_candidate, "reference"),
+    ):
+        if statistics["samples"] != requested_samples:
+            raise ValueError(
+                f"surface comparison {label}.samples must equal "
+                "sampling.requested_samples_per_direction"
+            )
+        if len(statistics["worst_samples"]) > worst_sample_limit:
+            raise ValueError(
+                f"surface comparison {label}.worst_samples exceeds the recorded limit"
+            )
+        expected_area = surfaces[source_label]["area"]
+        tolerance = max(1.0e-12, expected_area * 1.0e-9)
+        if abs(statistics["source_surface_area"] - expected_area) > tolerance:
+            raise ValueError(
+                f"surface comparison {label}.source_surface_area does not match "
+                f"surfaces.{source_label}.area"
+            )
+    symmetric = _surface_statistics(
+        document.get("symmetric"),
+        label="symmetric",
+        include_samples=False,
+        require_worst_samples=False,
+    )
+    return {
+        "schema_version": 1,
+        "units": units,
+        "pose_policy": _surface_string(
+            document.get("pose_policy"), label="pose_policy"
+        ),
+        "sampling": sampling,
+        "reference_normalization": normalization,
+        "surfaces": surfaces,
+        "candidate_to_reference": candidate_to_reference,
+        "reference_to_candidate": reference_to_candidate,
+        "symmetric": symmetric,
+    }
 
 
 def _get_bit(data: bytes, index: int) -> bool:
@@ -421,6 +745,49 @@ def _evaluate_hard_gates(
     }
 
 
+def _add_surface_hard_gates(
+    hard_gates: dict[str, Any],
+    *,
+    surface: dict[str, Any],
+    thresholds: SurfaceGateThresholds,
+) -> None:
+    symmetric = surface["symmetric"]
+    mean_distance = float(symmetric["mean"])
+    p95_distance = float(symmetric["p95"])
+    mean_passed = mean_distance <= thresholds.max_mean_surface_distance
+    p95_passed = p95_distance <= thresholds.max_p95_surface_distance
+    results = {
+        "mean_surface_distance": _hard_gate_result(
+            value=mean_distance,
+            threshold=thresholds.max_mean_surface_distance,
+            operator="<=",
+            passed=mean_passed,
+            message=(
+                f"mean symmetric surface distance {mean_distance:.6f} must be at most "
+                f"{thresholds.max_mean_surface_distance:.6f}"
+            ),
+        ),
+        "p95_surface_distance": _hard_gate_result(
+            value=p95_distance,
+            threshold=thresholds.max_p95_surface_distance,
+            operator="<=",
+            passed=p95_passed,
+            message=(
+                f"p95 symmetric surface distance {p95_distance:.6f} must be at most "
+                f"{thresholds.max_p95_surface_distance:.6f}"
+            ),
+        ),
+    }
+    hard_gates["thresholds"].update(asdict(thresholds))
+    hard_gates["results"].update(results)
+    hard_gates["failures"].extend(
+        {"gate": name, **result}
+        for name, result in results.items()
+        if not result["passed"]
+    )
+    hard_gates["passed"] = not hard_gates["failures"]
+
+
 def compare_workspace(
     *,
     reference_masks: Path,
@@ -430,12 +797,28 @@ def compare_workspace(
     output: Path,
     min_score: float,
     gate_thresholds: FidelityGateThresholds | None = None,
+    surface_comparison: Path | None = None,
+    surface_gate_thresholds: SurfaceGateThresholds | None = None,
 ) -> dict[str, Any]:
     min_score = _score_threshold(min_score)
     if gate_thresholds is None:
         gate_thresholds = FidelityGateThresholds()
     elif not isinstance(gate_thresholds, FidelityGateThresholds):
         raise TypeError("gate_thresholds must be a FidelityGateThresholds instance")
+    if surface_comparison is None:
+        if surface_gate_thresholds is not None:
+            raise ValueError(
+                "surface_gate_thresholds requires a surface_comparison path"
+            )
+        surface = None
+    else:
+        if surface_gate_thresholds is None:
+            surface_gate_thresholds = SurfaceGateThresholds()
+        elif not isinstance(surface_gate_thresholds, SurfaceGateThresholds):
+            raise TypeError(
+                "surface_gate_thresholds must be a SurfaceGateThresholds instance"
+            )
+        surface = _surface_comparison(surface_comparison)
     reference_mask_data = _canonical_views(reference_masks, label="reference")
     candidate_mask_data = _canonical_views(candidate_masks, label="candidate")
     views = {
@@ -477,6 +860,13 @@ def compare_workspace(
         candidate_geometry=candidate_geometry,
         thresholds=gate_thresholds,
     )
+    if surface is not None:
+        assert surface_gate_thresholds is not None
+        _add_surface_hard_gates(
+            hard_gates,
+            surface=surface,
+            thresholds=surface_gate_thresholds,
+        )
     score_passed = score >= min_score
     report = {
         "schema_version": 2,
@@ -498,5 +888,9 @@ def compare_workspace(
         "reference_bounds": reference_geometry,
         "candidate_bounds": candidate_geometry,
     }
+    if surface is not None:
+        report["summary"]["mean_surface_distance"] = surface["symmetric"]["mean"]
+        report["summary"]["p95_surface_distance"] = surface["symmetric"]["p95"]
+        report["surface_comparison"] = surface
     write_json(output, report)
     return report

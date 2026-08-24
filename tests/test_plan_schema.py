@@ -37,9 +37,16 @@ def test_schema_declares_modes_and_old_plans_default_to_procedural() -> None:
     normalized = validate_plan_document(original)
     assert "reconstruction_mode" not in original
     assert normalized["reconstruction_mode"] == "procedural"
+    assert normalized["granularity"] == "medium"
+
+    granularity = PLAN_SCHEMA["properties"]["granularity"]
+    assert granularity["enum"] == ["coarse", "medium", "fine", "surface"]
+    assert granularity["default"] == "medium"
 
     original["reconstruction_mode"] = "glb-ref"
+    original["granularity"] = "fine"
     assert validate_plan_document(original)["reconstruction_mode"] == "glb-ref"
+    assert validate_plan_document(original)["granularity"] == "fine"
 
 
 def test_prompt_ready_schema_text_is_the_exact_authoritative_document() -> None:
@@ -59,6 +66,7 @@ def test_validation_collects_all_independent_schema_errors() -> None:
             "construction_strategy": "",
             "identity_features": "crest",
             "reconstruction_mode": "mesh-copy",
+            "granularity": "microscopic",
             "character_analysis": {
                 "pose": " ",
                 "proportions": [],
@@ -89,6 +97,7 @@ def test_validation_collects_all_independent_schema_errors() -> None:
         "materials",
         "parts",
         "reconstruction_mode",
+        "granularity",
         "subject",
     ):
         assert expected in rendered

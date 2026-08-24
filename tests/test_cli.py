@@ -16,6 +16,7 @@ def test_make_defaults_to_requested_codex_configuration() -> None:
     assert args.max_repairs == 2
     assert args.max_fidelity_repairs == 1
     assert args.reconstruction_mode == "procedural"
+    assert args.granularity == "medium"
     backend = create_backend(args.backend)
     assert backend.model == "gpt-5.6-sol"
     assert backend.reasoning_effort == "max"
@@ -26,6 +27,7 @@ def test_run_uses_manifest_backend_when_override_is_absent() -> None:
     assert args.workspace == Path("workspace")
     assert args.backend is None
     assert args.reconstruction_mode is None
+    assert args.granularity is None
 
 
 def test_make_accepts_glb_ref_mode() -> None:
@@ -33,6 +35,20 @@ def test_make_accepts_glb_ref_mode() -> None:
         ["make", "image.png", "model.glb", "--mode", "glb-ref"]
     )
     assert args.reconstruction_mode == "glb-ref"
+
+
+def test_commands_accept_all_granularity_levels_and_detail_alias() -> None:
+    parser = build_parser()
+    for level in ("coarse", "medium", "fine", "surface"):
+        args = parser.parse_args(
+            ["make", "image.png", "model.glb", "--granularity", level]
+        )
+        assert args.granularity == level
+
+    alias = parser.parse_args(
+        ["build", "workspace", "--detail-level", "surface"]
+    )
+    assert alias.granularity == "surface"
 
 
 def test_long_running_commands_accept_no_progress() -> None:
@@ -86,6 +102,51 @@ def test_make_routes_progress_to_stderr_and_can_disable_it(
     quiet = capsys.readouterr()
     assert quiet.err == ""
     assert "Status" in quiet.out
+
+
+def test_run_inherits_legacy_granularity_and_allows_override(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    image = tmp_path / "reference.png"
+    glb = tmp_path / "reference.glb"
+    image.write_bytes(b"image")
+    glb.write_bytes(b"glb")
+    workspace = Workspace.create(
+        base=tmp_path / "outputs",
+        slug="fixture",
+        image=image,
+        glb=glb,
+        prompt="",
+        backend="codex",
+    )
+    manifest = workspace.manifest()
+    del manifest["granularity"]
+    cli.write_json(workspace.manifest_path, manifest)
+    monkeypatch.setattr(cli.Workspace, "locate", lambda *args, **kwargs: workspace)
+    seen: list[str] = []
+
+    def fake_pipeline(_workspace, config, **kwargs):
+        seen.append(config.granularity)
+        return {"status": "prepared", "granularity": config.granularity}
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_pipeline)
+    parser = build_parser()
+
+    inherited = parser.parse_args(["run", str(workspace.root), "--no-progress"])
+    explicit = parser.parse_args(
+        [
+            "run",
+            str(workspace.root),
+            "--granularity",
+            "surface",
+            "--no-progress",
+        ]
+    )
+
+    assert cli._command_run(inherited) == 0
+    assert cli._command_run(explicit) == 0
+    assert seen == ["medium", "surface"]
+    capsys.readouterr()
 
 
 def test_redirected_build_summary_retains_comparison_json(tmp_path: Path, capsys) -> None:

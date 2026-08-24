@@ -19,6 +19,75 @@ pytestmark = pytest.mark.integration
     os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
     reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",
 )
+def test_surface_comparison_is_deterministic_and_bidirectional(tmp_path: Path) -> None:
+    runtime = BlenderRuntime.discover()
+    reference_artifacts = tmp_path / "reference-artifacts"
+    candidate_artifacts = tmp_path / "candidate-artifacts"
+    reference_program = tmp_path / "reference.py"
+    candidate_program = tmp_path / "candidate.py"
+    reference_program.write_text(
+        """
+import bpy
+
+def build():
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.5))
+""",
+        encoding="utf-8",
+    )
+    # The surface stage normalizes the one-unit reference to two units. The
+    # candidate is already in the pipeline's normalized coordinate frame.
+    candidate_program.write_text(
+        """
+import bpy
+
+def build():
+    bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 1.0))
+""",
+        encoding="utf-8",
+    )
+    for program, artifacts in (
+        (reference_program, reference_artifacts),
+        (candidate_program, candidate_artifacts),
+    ):
+        result = runtime.run_stage(
+            "build_asset",
+            ["--program", program, "--artifacts-dir", artifacts],
+            cwd=tmp_path,
+            timeout_s=180,
+        )
+        require_success(result, stage="surface-comparison fixture build")
+
+    first = tmp_path / "surface-first.json"
+    second = tmp_path / "surface-second.json"
+    arguments = [
+        "--reference-glb",
+        reference_artifacts / "model.glb",
+        "--candidate-glb",
+        candidate_artifacts / "model.glb",
+        "--samples",
+        "512",
+    ]
+    for output in (first, second):
+        result = runtime.run_stage(
+            "surface_compare",
+            [*arguments, "--output", output],
+            cwd=tmp_path,
+            timeout_s=180,
+        )
+        require_success(result, stage="integration surface comparison")
+
+    assert first.read_bytes() == second.read_bytes()
+    report = json.loads(first.read_text(encoding="utf-8"))
+    assert report["candidate_to_reference"]["samples"] == 512
+    assert report["reference_to_candidate"]["samples"] == 512
+    assert report["symmetric"]["mean"] == pytest.approx(0.0, abs=1.0e-6)
+    assert report["symmetric"]["p95"] == pytest.approx(0.0, abs=1.0e-6)
+
+
+@pytest.mark.skipif(
+    os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
+    reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",
+)
 def test_compiled_glb_probe_cannot_inherit_generated_render_handler(tmp_path: Path) -> None:
     runtime = BlenderRuntime.discover()
     artifacts = tmp_path / "artifacts"

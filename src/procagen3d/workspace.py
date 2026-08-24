@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .granularity import DEFAULT_GRANULARITY, validate_granularity
 from .reconstruction import DEFAULT_RECONSTRUCTION_MODE, validate_reconstruction_mode
 
 
@@ -71,8 +72,10 @@ class Workspace:
         prompt: str,
         backend: str,
         reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE,
+        granularity: str = DEFAULT_GRANULARITY,
     ) -> "Workspace":
         reconstruction_mode = validate_reconstruction_mode(reconstruction_mode)
+        granularity = validate_granularity(granularity)
         if not _SLUG_RE.fullmatch(slug):
             raise ValueError(f"invalid slug {slug!r}; use lowercase letters, digits, '-' or '_'")
         image = image.expanduser().resolve()
@@ -104,6 +107,7 @@ class Workspace:
             "prompt": prompt,
             "backend": backend,
             "reconstruction_mode": reconstruction_mode,
+            "granularity": granularity,
             "inputs": {
                 "image": {
                     "path": str(image_target.relative_to(root)),

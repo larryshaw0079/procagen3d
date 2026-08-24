@@ -71,6 +71,7 @@ def test_workspace_copies_inputs_and_records_provenance(tmp_path: Path) -> None:
     assert manifest["inputs"]["image"]["source"] == str(image.resolve())
     assert manifest["inputs"]["glb"]["sha256"] == hashlib.sha256(b"glb-data").hexdigest()
     assert manifest["reconstruction_mode"] == "procedural"
+    assert manifest["granularity"] == "medium"
     assert workspace.trajectory_dir(3).name == "iter_03"
 
     with pytest.raises(FileExistsError):
@@ -98,9 +99,11 @@ def test_workspace_records_glb_ref_mode(tmp_path: Path) -> None:
         prompt="",
         backend="codex",
         reconstruction_mode="glb-ref",
+        granularity="fine",
     )
 
     assert workspace.manifest()["reconstruction_mode"] == "glb-ref"
+    assert workspace.manifest()["granularity"] == "fine"
 
 
 def test_workspace_locate_by_slug_and_update_manifest(tmp_path: Path) -> None:

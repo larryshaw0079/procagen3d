@@ -135,6 +135,8 @@ def print_workspace_summary(
     table.add_row("Workspace", str(workspace))
     if report.get("score") is not None:
         table.add_row("Fidelity", f"{float(report['score']):.4f}")
+    if report.get("granularity") is not None:
+        table.add_row("Granularity", str(report["granularity"]))
     deliverables = report.get("deliverables")
     if deliverables:
         table.add_row("Blender source", str(workspace / str(deliverables["program"])))
@@ -164,6 +166,8 @@ def print_comparison(console: Console, report: dict[str, Any]) -> None:
         ("Spatial RGB", summary.get("mean_spatial_rgb_similarity")),
         ("Dimensions", summary.get("dimension_similarity")),
         ("Center", summary.get("center_similarity")),
+        ("Surface mean ↓", summary.get("mean_surface_distance")),
+        ("Surface p95 ↓", summary.get("p95_surface_distance")),
     )
     for name, value in rows:
         table.add_row(name, f"{float(value):.4f}" if isinstance(value, (int, float)) else "—")

@@ -26,6 +26,11 @@ def arguments():
         choices=("procedural", "glb-ref"),
         default="procedural",
     )
+    parser.add_argument(
+        "--granularity",
+        choices=("coarse", "medium", "fine", "surface"),
+        default="medium",
+    )
     parser.add_argument("--reference-glb", type=Path)
     raw = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     return parser.parse_args(raw)
@@ -126,6 +131,7 @@ def main():
     elif args.reference_glb is not None:
         raise RuntimeError("procedural mode must not receive --reference-glb")
     bpy.context.scene["procagen3d_reconstruction_mode"] = args.mode
+    bpy.context.scene["procagen3d_granularity"] = args.granularity
     namespace = runpy.run_path(str(args.program), run_name="__procagen3d_program__")
     build = namespace.get("build")
     if not callable(build):

@@ -17,7 +17,12 @@ from typing import Any
 from .backends import CLIBackend, create_backend
 from .blender import BlenderError, BlenderRuntime, require_success
 from .glb_probe import probe_glb
-from .metrics import compare_workspace, mask_metrics
+from .granularity import (
+    DEFAULT_GRANULARITY,
+    get_granularity_profile,
+    validate_granularity,
+)
+from .metrics import SurfaceGateThresholds, compare_workspace, mask_metrics
 from .plan_schema import PlanSchemaError, validate_plan_document
 from .progress import ProgressReporter, emit_progress, progress_step
 from .prompts import initial_prompt, repair_prompt
@@ -38,6 +43,7 @@ class PipelineConfig:
     max_fidelity_repairs: int = 1
     min_score: float = 0.35
     reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE
+    granularity: str = DEFAULT_GRANULARITY
     render_size: int = 256
     llm_timeout_s: int = 1800
     blender_timeout_s: int = 900
@@ -661,6 +667,7 @@ def build_workspace(
     *,
     min_score: float = 0.35,
     reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE,
+    granularity: str = DEFAULT_GRANULARITY,
     timeout_s: int = 900,
     trajectory_dir: Path | None = None,
     progress: ProgressReporter | None = None,
@@ -670,11 +677,13 @@ def build_workspace(
     if not 0.0 <= min_score <= 1.0:
         raise ValueError("min_score must be between 0 and 1")
     reconstruction_mode = validate_reconstruction_mode(reconstruction_mode)
+    granularity = validate_granularity(granularity)
+    granularity_profile = get_granularity_profile(granularity)
     if timeout_s <= 0:
         raise ValueError("Blender timeout must be greater than zero")
     reference_snapshot: bytes | None = None
     reference_digest: str | None = None
-    if reconstruction_mode == "glb-ref":
+    if reconstruction_mode == "glb-ref" or granularity_profile.surface_evaluation_enabled:
         reference_snapshot, reference_digest = _verified_glb_snapshot(workspace)
     source_trajectory: Path | None = None
     with progress_step(
@@ -720,6 +729,12 @@ def build_workspace(
                     f"expected {reconstruction_mode!r}, found "
                     f"{validated_plan.get('reconstruction_mode')!r}"
                 )
+            if validated_plan.get("granularity") != granularity:
+                raise PipelineError(
+                    "src/plan.json granularity must match the build granularity: "
+                    f"expected {granularity!r}, found "
+                    f"{validated_plan.get('granularity')!r}"
+                )
             _guard_program(staged_program)
             stage.complete("Plan schema and Blender source guard passed")
         with progress_step(
@@ -734,6 +749,8 @@ def build_workspace(
                 staged_artifacts,
                 "--mode",
                 reconstruction_mode,
+                "--granularity",
+                granularity,
             ]
             if reconstruction_mode == "glb-ref":
                 build_arguments.extend(["--reference-glb", staged_reference])
@@ -818,6 +835,89 @@ def build_workspace(
                 "Compiled GLB re-imported and six canonical views rendered",
                 blender_duration_s=getattr(compiled_result, "duration_s", None),
             )
+        surface_comparison_path: Path | None = None
+        if granularity_profile.surface_evaluation_enabled:
+            surface_comparison_path = staged_artifacts / "surface_comparison.json"
+            with progress_step(
+                progress,
+                "surface-fidelity",
+                "Measuring bidirectional 3D surface distance",
+            ) as stage:
+                surface_result = runtime.run_stage(
+                    "surface_compare",
+                    [
+                        "--reference-glb",
+                        staged_reference,
+                        "--candidate-glb",
+                        model_path,
+                        "--output",
+                        surface_comparison_path,
+                        "--samples",
+                        str(granularity_profile.surface_sample_budget),
+                    ],
+                    cwd=clean_root,
+                    timeout_s=timeout_s,
+                )
+                (staged_artifacts / "surface_compare.stdout.log").write_text(
+                    surface_result.stdout, encoding="utf-8"
+                )
+                (staged_artifacts / "surface_compare.stderr.log").write_text(
+                    surface_result.stderr, encoding="utf-8"
+                )
+                if not surface_result.ok:
+                    failure = workspace.root / "trajectories" / "surface_compare_failure"
+                    failure.mkdir(parents=True, exist_ok=True)
+                    (failure / "stdout.log").write_text(
+                        surface_result.stdout, encoding="utf-8"
+                    )
+                    (failure / "stderr.log").write_text(
+                        surface_result.stderr, encoding="utf-8"
+                    )
+                require_success(surface_result, stage="surface comparison")
+                if not surface_comparison_path.is_file():
+                    raise PipelineError(
+                        "Blender surface comparison did not produce its JSON report"
+                    )
+                surface_report = json.loads(
+                    surface_comparison_path.read_text(encoding="utf-8")
+                )
+                if not isinstance(surface_report, dict):
+                    raise PipelineError("surface_comparison.json must contain an object")
+                surface_report.update(
+                    granularity=granularity,
+                    reference="inputs/reference.glb",
+                    candidate="artifacts/model.glb",
+                )
+                write_json(surface_comparison_path, surface_report)
+                symmetric = surface_report.get("symmetric")
+                if not isinstance(symmetric, dict):
+                    raise PipelineError(
+                        "surface_comparison.json must contain symmetric statistics"
+                    )
+                try:
+                    mean_surface_distance = float(symmetric.get("mean"))
+                    p95_surface_distance = float(symmetric.get("p95"))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise PipelineError(
+                        "surface_comparison.json has invalid symmetric distances"
+                    ) from exc
+                if (
+                    not math.isfinite(mean_surface_distance)
+                    or mean_surface_distance < 0.0
+                    or not math.isfinite(p95_surface_distance)
+                    or p95_surface_distance < 0.0
+                ):
+                    raise PipelineError(
+                        "surface_comparison.json has invalid symmetric distances"
+                    )
+                stage.complete(
+                    "Surface distance measured — "
+                    f"mean {mean_surface_distance:.5f}, "
+                    f"p95 {p95_surface_distance:.5f}",
+                    blender_duration_s=getattr(surface_result, "duration_s", None),
+                    mean_surface_distance=mean_surface_distance,
+                    p95_surface_distance=p95_surface_distance,
+                )
         with progress_step(
             progress,
             "artifact-provenance",
@@ -845,6 +945,7 @@ def build_workspace(
                     "blend_sha256": blend_digest,
                     "clean_room": True,
                     "reconstruction_mode": reconstruction_mode,
+                    "granularity": granularity,
                     "program_is_standalone_replay_source": (
                         reconstruction_mode == "procedural"
                     ),
@@ -857,12 +958,35 @@ def build_workspace(
                         reconstruction_mode == "glb-ref"
                     ),
                     "reference_glb_sha256": reference_digest,
+                    "reference_glb_used_for_surface_evaluation": (
+                        granularity_profile.surface_evaluation_enabled
+                    ),
                     "reference_contract": (
                         "host-imported-normalized-source; originals removed before export"
                         if reconstruction_mode == "glb-ref"
-                        else "measurement-evidence-only"
+                        else (
+                            "measurement-and-host-surface-evaluation-evidence-only"
+                            if granularity_profile.surface_evaluation_enabled
+                            else "measurement-evidence-only"
+                        )
                     ),
                     "compiled_glb_verified_in_separate_process": True,
+                    "surface_distance_evaluation": (
+                        {
+                            "report": "artifacts/surface_comparison.json",
+                            "samples_per_direction": (
+                                granularity_profile.surface_sample_budget
+                            ),
+                            "max_mean_distance": (
+                                granularity_profile.max_mean_surface_distance
+                            ),
+                            "max_p95_distance": (
+                                granularity_profile.max_p95_surface_distance
+                            ),
+                        }
+                        if granularity_profile.surface_evaluation_enabled
+                        else None
+                    ),
                 },
             )
             stage.complete(
@@ -902,8 +1026,20 @@ def build_workspace(
         with progress_step(
             progress,
             "fidelity",
-            "Scoring silhouettes, spatial color, dimensions, and centering",
+            "Scoring renders, dimensions, centering, and configured surface gates",
         ) as stage:
+            surface_thresholds = None
+            if granularity_profile.surface_evaluation_enabled:
+                assert granularity_profile.max_mean_surface_distance is not None
+                assert granularity_profile.max_p95_surface_distance is not None
+                surface_thresholds = SurfaceGateThresholds(
+                    max_mean_surface_distance=(
+                        granularity_profile.max_mean_surface_distance
+                    ),
+                    max_p95_surface_distance=(
+                        granularity_profile.max_p95_surface_distance
+                    ),
+                )
             comparison = compare_workspace(
                 reference_masks=workspace.evidence_dir / "reference_views" / "masks.json",
                 candidate_masks=staged_artifacts / "renders" / "masks.json",
@@ -911,7 +1047,11 @@ def build_workspace(
                 candidate_scene=staged_artifacts / "scene_report.json",
                 output=staged_artifacts / "comparison.json",
                 min_score=min_score,
+                surface_comparison=surface_comparison_path,
+                surface_gate_thresholds=surface_thresholds,
             )
+            comparison["granularity"] = granularity
+            write_json(staged_artifacts / "comparison.json", comparison)
             if (
                 _source_snapshot(workspace.program_path, label="src/program.py")
                 != program_snapshot
@@ -948,7 +1088,11 @@ def run_pipeline(
     if config.max_fidelity_repairs < 1:
         raise ValueError("max_fidelity_repairs must be at least one")
     reconstruction_mode = validate_reconstruction_mode(config.reconstruction_mode)
-    workspace.update_manifest(reconstruction_mode=reconstruction_mode)
+    granularity = validate_granularity(config.granularity)
+    workspace.update_manifest(
+        reconstruction_mode=reconstruction_mode,
+        granularity=granularity,
+    )
     if not 0.0 <= config.min_score <= 1.0:
         raise ValueError("min_score must be between 0 and 1")
     _validate_positive_runtime(render_size=config.render_size, timeout_s=config.blender_timeout_s)
@@ -977,6 +1121,7 @@ def run_pipeline(
                 "workspace": str(workspace.root),
                 "backend": config.backend,
                 "reconstruction_mode": reconstruction_mode,
+                "granularity": granularity,
                 "stage": "reference",
                 "agent_runs": [],
                 "build_attempts": [],
@@ -990,6 +1135,7 @@ def run_pipeline(
             "status": "prepared",
             "workspace": str(workspace.root),
             "reconstruction_mode": reconstruction_mode,
+            "granularity": granularity,
             "reference": {
                 "vertices": probe["scene"]["vertex_count"],
                 "triangles": probe["scene"]["triangle_count"],
@@ -1000,6 +1146,7 @@ def run_pipeline(
         workspace.update_manifest(
             status="prepared",
             reconstruction_mode=reconstruction_mode,
+            granularity=granularity,
         )
         emit_progress(
             progress,
@@ -1025,6 +1172,7 @@ def run_pipeline(
                     image=workspace.image_path,
                     user_prompt=user_prompt,
                     reconstruction_mode=reconstruction_mode,
+                    granularity=granularity,
                 ),
                 iteration=next_iteration,
                 timeout_s=config.llm_timeout_s,
@@ -1040,6 +1188,7 @@ def run_pipeline(
                     "workspace": str(workspace.root),
                     "backend": config.backend,
                     "reconstruction_mode": reconstruction_mode,
+                    "granularity": granularity,
                     "agent_runs": [],
                     "build_attempts": [],
                     "error": str(exc),
@@ -1077,6 +1226,7 @@ def run_pipeline(
                 runtime,
                 min_score=config.min_score,
                 reconstruction_mode=reconstruction_mode,
+                granularity=granularity,
                 timeout_s=config.blender_timeout_s,
                 trajectory_dir=(
                     workspace.root / "trajectories" / f"iter_{active_iteration:02d}"
@@ -1166,6 +1316,7 @@ def run_pipeline(
                         comparison=comparison,
                         iteration=next_iteration,
                         reconstruction_mode=reconstruction_mode,
+                        granularity=granularity,
                     ),
                     iteration=next_iteration,
                     timeout_s=config.llm_timeout_s,
@@ -1193,9 +1344,10 @@ def run_pipeline(
             active_iteration = _matching_source_iteration(workspace)
             continue
 
-        # A successful render is the boundary between the independent retry
-        # budgets. The first visual repair is mandatory, even for a passing
-        # first render, so aggregate metrics cannot short-circuit visual review.
+        # A successful render (and configured surface evaluation) is the boundary
+        # between the independent retry budgets. The first fidelity repair is
+        # mandatory, even for a passing candidate, so aggregate metrics cannot
+        # short-circuit visual/surface review.
         if fidelity_repairs_used >= config.max_fidelity_repairs:
             break
         try:
@@ -1209,6 +1361,7 @@ def run_pipeline(
                     comparison=comparison,
                     iteration=next_iteration,
                     reconstruction_mode=reconstruction_mode,
+                    granularity=granularity,
                 ),
                 iteration=next_iteration,
                 timeout_s=config.llm_timeout_s,
@@ -1243,6 +1396,7 @@ def run_pipeline(
             "workspace": str(workspace.root),
             "backend": config.backend,
             "reconstruction_mode": reconstruction_mode,
+            "granularity": granularity,
             "agent_runs": agent_runs,
             "build_attempts": build_attempts,
             "retry_budget": {
@@ -1292,6 +1446,7 @@ def run_pipeline(
         "workspace": str(workspace.root),
         "backend": config.backend,
         "reconstruction_mode": reconstruction_mode,
+        "granularity": granularity,
         "agent_runs": agent_runs,
         "build_attempts": build_attempts,
         "retry_budget": {
@@ -1311,6 +1466,11 @@ def run_pipeline(
             "blend": "artifacts/scene.blend",
             "comparison": "artifacts/comparison.json",
             "build_manifest": "artifacts/build_manifest.json",
+            **(
+                {"surface_comparison": "artifacts/surface_comparison.json"}
+                if get_granularity_profile(granularity).surface_evaluation_enabled
+                else {}
+            ),
         },
     }
     write_json(workspace.root / "run_report.json", report)
@@ -1318,6 +1478,7 @@ def run_pipeline(
         status=status,
         score=report["score"],
         reconstruction_mode=reconstruction_mode,
+        granularity=granularity,
         deliverables=report["deliverables"],
     )
     if status == "complete":

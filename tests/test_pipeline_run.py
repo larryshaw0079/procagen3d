@@ -129,10 +129,16 @@ def test_cached_prepare_only_updates_manifest_status(
     monkeypatch.setattr(pipeline.BlenderRuntime, "discover", lambda explicit=None: object())
     monkeypatch.setattr(pipeline, "prepare_reference", lambda *args, **kwargs: _prepared_probe())
 
-    report = pipeline.run_pipeline(workspace, PipelineConfig(), prepare_only=True)
+    report = pipeline.run_pipeline(
+        workspace,
+        PipelineConfig(granularity="fine"),
+        prepare_only=True,
+    )
 
     assert report["status"] == "prepared"
+    assert report["granularity"] == "fine"
     assert workspace.manifest()["status"] == "prepared"
+    assert workspace.manifest()["granularity"] == "fine"
 
 
 def test_run_pipeline_forwards_progress_through_a_repair(
