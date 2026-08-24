@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shutil
 import struct
 import tempfile
@@ -13,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .backends import create_backend
+from .backends import CLIBackend, create_backend
 from .blender import BlenderError, BlenderRuntime, require_success
 from .glb_probe import probe_glb
 from .metrics import compare_workspace, mask_metrics
@@ -457,6 +458,115 @@ def _write_bytes_atomic(path: Path, value: bytes) -> None:
     temporary.replace(path)
 
 
+def _matching_source_iteration(workspace: Workspace) -> int | None:
+    """Find the newest trajectory whose reviewed source is currently active."""
+
+    if not workspace.program_path.is_file() or not workspace.plan_path.is_file():
+        return None
+    try:
+        program = workspace.program_path.read_bytes()
+        plan = workspace.plan_path.read_bytes()
+    except OSError:
+        return None
+    for iteration in range(workspace.next_trajectory_iteration() - 1, -1, -1):
+        directory = workspace.root / "trajectories" / f"iter_{iteration:02d}"
+        candidate_program = directory / "program.py"
+        candidate_plan = directory / "plan.json"
+        if (
+            directory.is_symlink()
+            or not directory.is_dir()
+            or candidate_program.is_symlink()
+            or candidate_plan.is_symlink()
+        ):
+            continue
+        try:
+            if (
+                candidate_program.read_bytes() == program
+                and candidate_plan.read_bytes() == plan
+            ):
+                return iteration
+        except OSError:
+            continue
+    return None
+
+
+def matching_source_trajectory(workspace: Workspace) -> Path | None:
+    """Return the newest regular trajectory owning the active source snapshot."""
+
+    iteration = _matching_source_iteration(workspace)
+    if iteration is None:
+        return None
+    return workspace.root / "trajectories" / f"iter_{iteration:02d}"
+
+
+def _validated_source_trajectory(
+    workspace: Workspace,
+    trajectory: Path,
+    *,
+    program_snapshot: bytes,
+    plan_snapshot: bytes,
+) -> Path:
+    """Validate that a trajectory owns the exact source being compiled."""
+
+    trajectory = trajectory.expanduser()
+    try:
+        canonical = trajectory.resolve(strict=True)
+        trajectories_root = (workspace.root / "trajectories").resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise PipelineError("source trajectory is unavailable") from exc
+    suffix = canonical.name.removeprefix("iter_")
+    if (
+        canonical != trajectory
+        or trajectory.is_symlink()
+        or not trajectory.is_dir()
+        or canonical.parent != trajectories_root
+        or not suffix.isdigit()
+    ):
+        raise PipelineError("source trajectory must be a regular iter_XX directory")
+    if (
+        _source_snapshot(canonical / "program.py", label="trajectory program.py")
+        != program_snapshot
+        or _source_snapshot(canonical / "plan.json", label="trajectory plan.json")
+        != plan_snapshot
+    ):
+        raise PipelineError("source trajectory does not match the compiled source snapshots")
+    return canonical
+
+
+def _archive_iteration_glb(source: Path, trajectory: Path) -> Path:
+    """Atomically retain one fully validated intermediate GLB without clobbering it."""
+
+    if not source.is_file() or source.is_symlink():
+        raise PipelineError("validated model.glb is unavailable for trajectory archival")
+    destination = trajectory / "model.glb"
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_file():
+            raise PipelineError("trajectory model.glb must be a regular, non-symlink file")
+        if sha256(destination) == sha256(source):
+            return destination
+        raise PipelineError("trajectory already contains a different model.glb")
+    temporary = trajectory / f".model.glb.tmp-{uuid.uuid4().hex}"
+    try:
+        shutil.copy2(source, temporary)
+        try:
+            # A hard-link publication is atomic and refuses to replace a file
+            # created by a concurrent build between validation and commit.
+            os.link(temporary, destination)
+        except FileExistsError:
+            if (
+                destination.is_symlink()
+                or not destination.is_file()
+                or sha256(destination) != sha256(source)
+            ):
+                raise PipelineError("trajectory concurrently acquired a different model.glb")
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return destination
+
+
 def _invoke_agent(
     workspace: Workspace,
     *,
@@ -474,9 +584,10 @@ def _invoke_agent(
     action = "Repairing" if is_repair else "Authoring"
     configured_model = getattr(backend, "model", None)
     model_label = f" ({configured_model})" if configured_model else ""
+    stage_name = f"agent-{iteration:02d}"
     with progress_step(
         progress,
-        f"agent-{iteration:02d}",
+        stage_name,
         f"{action} Blender source with {backend_name}{model_label}",
     ) as stage:
         trajectory = workspace.trajectory_dir(iteration)
@@ -497,16 +608,26 @@ def _invoke_agent(
                 if render_source.is_dir():
                     shutil.copytree(render_source, agent_root / "artifacts" / "renders")
             agent_trajectory = agent_root / ".trajectory"
-            result = backend.run(
-                prompt=prompt,
-                workspace=agent_root,
-                trajectory_dir=agent_trajectory,
-                image_paths=_agent_images(
+            run_arguments: dict[str, Any] = {
+                "prompt": prompt,
+                "workspace": agent_root,
+                "trajectory_dir": agent_trajectory,
+                "image_paths": _agent_images(
                     agent_root,
                     image_relative=image_relative,
                     include_candidate=include_candidate,
                 ),
-                timeout_s=timeout_s,
+                "timeout_s": timeout_s,
+            }
+            if isinstance(backend, CLIBackend) and progress is not None:
+                run_arguments["on_activity"] = lambda message: emit_progress(
+                    progress,
+                    "info",
+                    stage_name,
+                    message,
+                )
+            result = backend.run(
+                **run_arguments,
             )
             _copy_agent_transcript(result, trajectory)
             if not result.ok:
@@ -612,6 +733,7 @@ def build_workspace(
     *,
     min_score: float = 0.35,
     timeout_s: int = 900,
+    trajectory_dir: Path | None = None,
     progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
     """Compile the current source in a clean directory and compare it."""
@@ -620,6 +742,7 @@ def build_workspace(
         raise ValueError("min_score must be between 0 and 1")
     if timeout_s <= 0:
         raise ValueError("Blender timeout must be greater than zero")
+    source_trajectory: Path | None = None
     with progress_step(
         progress,
         "source-validation",
@@ -629,6 +752,13 @@ def build_workspace(
         plan_snapshot = _source_snapshot(workspace.plan_path, label="src/plan.json")
         program_digest = hashlib.sha256(program_snapshot).hexdigest()
         plan_digest = hashlib.sha256(plan_snapshot).hexdigest()
+        if trajectory_dir is not None:
+            source_trajectory = _validated_source_trajectory(
+                workspace,
+                trajectory_dir,
+                program_snapshot=program_snapshot,
+                plan_snapshot=plan_snapshot,
+            )
         stage.complete(
             f"Source snapshots captured — program {program_digest[:10]}",
             program_sha256=program_digest,
@@ -775,6 +905,35 @@ def build_workspace(
                 model_sha256=model_digest,
                 blend_sha256=blend_digest,
             )
+        if source_trajectory is not None:
+            if (
+                _source_snapshot(workspace.program_path, label="src/program.py")
+                != program_snapshot
+                or _source_snapshot(workspace.plan_path, label="src/plan.json")
+                != plan_snapshot
+            ):
+                raise PipelineError("src/program.py or src/plan.json changed during the build")
+            # Blender may have run for several minutes since the first trust
+            # check. Re-resolve the trajectory immediately before publication.
+            source_trajectory = _validated_source_trajectory(
+                workspace,
+                source_trajectory,
+                program_snapshot=program_snapshot,
+                plan_snapshot=plan_snapshot,
+            )
+            relative_glb = (
+                source_trajectory / "model.glb"
+            ).relative_to(workspace.root).as_posix()
+            with progress_step(
+                progress,
+                "trajectory-glb",
+                f"Saving validated iteration GLB to {relative_glb}",
+            ) as stage:
+                archived = _archive_iteration_glb(model_path, source_trajectory)
+                stage.complete(
+                    f"Saved intermediate GLB — {archived.relative_to(workspace.root).as_posix()}",
+                    model_sha256=model_digest,
+                )
         with progress_step(
             progress,
             "fidelity",
@@ -795,13 +954,13 @@ def build_workspace(
                 != plan_snapshot
             ):
                 raise PipelineError("src/program.py or src/plan.json changed during the build")
-            _replace_directory(staged_artifacts, workspace.artifacts_dir)
             verdict = "passed" if comparison["passed"] else "needs review"
             stage.complete(
                 f"Fidelity score {comparison['score']:.4f} — {verdict}",
                 score=comparison["score"],
                 passed=comparison["passed"],
             )
+        _replace_directory(staged_artifacts, workspace.artifacts_dir)
         return comparison
 
 
@@ -875,6 +1034,7 @@ def run_pipeline(
     agent_runs: list[dict[str, Any]] = []
     build_attempts: list[dict[str, Any]] = []
     next_iteration = workspace.next_trajectory_iteration()
+    active_iteration = _matching_source_iteration(workspace)
     if not workspace.program_path.is_file() or not workspace.plan_path.is_file():
         try:
             run = _invoke_agent(
@@ -902,6 +1062,7 @@ def run_pipeline(
             raise
         agent_runs.append(run)
         next_iteration += 1
+        active_iteration = _matching_source_iteration(workspace)
 
     last_failure: str | None = None
     comparison: dict[str, Any] | None = None
@@ -922,13 +1083,34 @@ def run_pipeline(
                 runtime,
                 min_score=config.min_score,
                 timeout_s=config.blender_timeout_s,
+                trajectory_dir=(
+                    workspace.root / "trajectories" / f"iter_{active_iteration:02d}"
+                    if active_iteration is not None
+                    else None
+                ),
                 progress=progress,
             )
             valid_artifact = True
             last_valid_program = workspace.program_path.read_bytes()
             last_valid_plan = workspace.plan_path.read_bytes()
             last_valid_comparison = comparison
-            build_attempts.append({"attempt": attempt, "built": True, "comparison": comparison})
+            built_attempt: dict[str, Any] = {
+                "attempt": attempt,
+                "built": True,
+                "comparison": comparison,
+            }
+            if active_iteration is not None:
+                archived_glb = (
+                    workspace.root
+                    / "trajectories"
+                    / f"iter_{active_iteration:02d}"
+                    / "model.glb"
+                )
+                if archived_glb.is_file() and not archived_glb.is_symlink():
+                    built_attempt["trajectory_glb"] = archived_glb.relative_to(
+                        workspace.root
+                    ).as_posix()
+            build_attempts.append(built_attempt)
             if comparison["passed"]:
                 last_failure = None
                 break
@@ -984,6 +1166,7 @@ def run_pipeline(
             break
         agent_runs.append(run)
         next_iteration += 1
+        active_iteration = _matching_source_iteration(workspace)
 
     if not valid_artifact:
         workspace.update_manifest(status="failed")

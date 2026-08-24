@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import AgentRunResult, CLIBackend, CLIInvocation, ExitReason, ParsedOutput
+from .base import ActivityCallback, AgentRunResult, CLIBackend, CLIInvocation, ExitReason, ParsedOutput
 from .codex import CodexBackend, CodexCLIBackend
 from .cursor import CursorBackend, CursorCLIBackend
 from .grok import GrokBackend, GrokCLIBackend
@@ -27,6 +27,7 @@ def create_backend(name: str, **overrides: Any) -> CLIBackend:
 
 __all__ = [
     "AgentRunResult",
+    "ActivityCallback",
     "BACKEND_NAMES",
     "CLIBackend",
     "CLIInvocation",

@@ -17,7 +17,14 @@ from . import __version__
 from .backends import BACKEND_NAMES, create_backend
 from .blender import BlenderError, BlenderRuntime
 from .glb_probe import GLBProbeError, probe_glb
-from .pipeline import PipelineConfig, PipelineError, build_workspace, prepare_reference, run_pipeline
+from .pipeline import (
+    PipelineConfig,
+    PipelineError,
+    build_workspace,
+    matching_source_trajectory,
+    prepare_reference,
+    run_pipeline,
+)
 from .process import run_process
 from .progress import progress_step
 from .rich_ui import RichProgressReporter, print_comparison, print_workspace_summary
@@ -184,6 +191,7 @@ def _command_build(args: argparse.Namespace) -> int:
                 runtime,
                 min_score=args.min_score,
                 timeout_s=args.blender_timeout,
+                trajectory_dir=matching_source_trajectory(workspace),
                 progress=progress,
             )
     except (BlenderError, PipelineError, GLBProbeError, OSError, ValueError) as exc:

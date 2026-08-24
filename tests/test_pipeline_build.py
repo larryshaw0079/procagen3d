@@ -236,6 +236,10 @@ def test_build_reports_keep_workspace_relative_provenance(
     workspace = _workspace(tmp_path)
     workspace.evidence_dir.mkdir(exist_ok=True)
     (workspace.evidence_dir / "camera_contract.json").write_text("{}", encoding="utf-8")
+    trajectory = workspace.root / "trajectories" / "iter_00"
+    trajectory.mkdir()
+    (trajectory / "program.py").write_bytes(workspace.program_path.read_bytes())
+    (trajectory / "plan.json").write_bytes(workspace.plan_path.read_bytes())
 
     class FakeRuntime:
         def __init__(self):
@@ -288,6 +292,7 @@ def test_build_reports_keep_workspace_relative_provenance(
         runtime,
         min_score=0.0,
         timeout_s=10,
+        trajectory_dir=trajectory,
         progress=events.append,
     )
 
@@ -300,8 +305,14 @@ def test_build_reports_keep_workspace_relative_provenance(
         "export-validation",
         "compiled-probe",
         "artifact-provenance",
+        "trajectory-glb",
         "fidelity",
     ]
+    assert (trajectory / "model.glb").read_bytes() == b"compiled glb"
+    assert any(
+        event.message == "Saved intermediate GLB — trajectories/iter_00/model.glb"
+        for event in events
+    )
     model_probe = json.loads(
         (workspace.artifacts_dir / "model_probe.json").read_text(encoding="utf-8")
     )
@@ -314,6 +325,125 @@ def test_build_reports_keep_workspace_relative_provenance(
     assert model_probe["path"] == "artifacts/model.glb"
     assert scene_report["program"] == "src/program.py"
     assert build_manifest["compiled_glb_verified_in_separate_process"] is True
+
+
+def test_build_rejects_a_trajectory_that_does_not_own_the_active_source(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    trajectory = workspace.root / "trajectories" / "iter_00"
+    trajectory.mkdir()
+    (trajectory / "program.py").write_text("def different():\n    pass\n", encoding="utf-8")
+    (trajectory / "plan.json").write_bytes(workspace.plan_path.read_bytes())
+
+    class UnusedRuntime:
+        def run_stage(self, *args, **kwargs):  # pragma: no cover - must not execute
+            raise AssertionError("Blender must not run for mismatched provenance")
+
+    with pytest.raises(pipeline.PipelineError, match="does not match"):
+        pipeline.build_workspace(
+            workspace,
+            UnusedRuntime(),
+            trajectory_dir=trajectory,
+            timeout_s=10,
+        )
+
+    assert not (trajectory / "model.glb").exists()
+
+
+def test_iteration_archive_never_clobbers_a_different_historical_glb(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "new.glb"
+    source.write_bytes(b"new candidate")
+    trajectory = tmp_path / "iter_00"
+    trajectory.mkdir()
+    destination = trajectory / "model.glb"
+    destination.write_bytes(b"historical candidate")
+
+    with pytest.raises(pipeline.PipelineError, match="different model.glb"):
+        pipeline._archive_iteration_glb(source, trajectory)
+
+    assert destination.read_bytes() == b"historical candidate"
+
+
+def test_iteration_archive_does_not_clobber_a_concurrent_publication(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "new.glb"
+    source.write_bytes(b"new candidate")
+    trajectory = tmp_path / "iter_00"
+    trajectory.mkdir()
+    destination = trajectory / "model.glb"
+
+    def racing_link(_source, target):
+        Path(target).write_bytes(b"concurrent candidate")
+        raise FileExistsError(target)
+
+    monkeypatch.setattr(pipeline.os, "link", racing_link)
+
+    with pytest.raises(pipeline.PipelineError, match="concurrently acquired"):
+        pipeline._archive_iteration_glb(source, trajectory)
+
+    assert destination.read_bytes() == b"concurrent candidate"
+
+
+def test_validated_iteration_glb_survives_a_later_fidelity_scoring_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.evidence_dir.mkdir(exist_ok=True)
+    (workspace.evidence_dir / "camera_contract.json").write_text("{}", encoding="utf-8")
+    trajectory = workspace.root / "trajectories" / "iter_00"
+    trajectory.mkdir()
+    (trajectory / "program.py").write_bytes(workspace.program_path.read_bytes())
+    (trajectory / "plan.json").write_bytes(workspace.plan_path.read_bytes())
+
+    class FakeRuntime:
+        def run_stage(self, stage, arguments, *, cwd, timeout_s):
+            artifacts = Path(arguments[arguments.index("--artifacts-dir") + 1])
+            artifacts.mkdir(parents=True, exist_ok=True)
+            if stage == "build_asset":
+                (artifacts / "model.glb").write_bytes(b"validated intermediate")
+                (artifacts / "scene.blend").write_bytes(b"blend")
+            elif stage == "compiled_probe":
+                write_json(
+                    artifacts / "scene_report.json",
+                    {
+                        "bounds": {
+                            "min": [0.0, 0.0, 0.0],
+                            "max": [1.0, 1.0, 1.0],
+                            "dimensions": [1.0, 1.0, 1.0],
+                            "center": [0.5, 0.5, 0.5],
+                        }
+                    },
+                )
+            return SimpleNamespace(ok=True, stdout="ok", stderr="")
+
+    monkeypatch.setattr(
+        pipeline,
+        "probe_glb",
+        lambda path: {
+            "path": str(path),
+            "self_contained": True,
+            "reference_readiness": "pass",
+        },
+    )
+    def fail_compare(**kwargs):
+        raise ValueError("scoring failed")
+
+    monkeypatch.setattr(pipeline, "compare_workspace", fail_compare)
+
+    with pytest.raises(ValueError, match="scoring failed"):
+        pipeline.build_workspace(
+            workspace,
+            FakeRuntime(),
+            trajectory_dir=trajectory,
+            timeout_s=10,
+        )
+
+    assert (trajectory / "model.glb").read_bytes() == b"validated intermediate"
+    assert not (workspace.artifacts_dir / "model.glb").exists()
 
 
 def test_failed_staged_build_preserves_previous_artifacts(

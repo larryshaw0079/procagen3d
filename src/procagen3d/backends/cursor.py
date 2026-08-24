@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar, Sequence
+from typing import Any, ClassVar, Mapping, Sequence
 
-from .base import CLIBackend, CLIInvocation, ParsedOutput, json_objects
+from .base import CLIBackend, CLIInvocation, ParsedOutput, json_objects, usage_activity
 
 
 @dataclass(frozen=True)
@@ -116,6 +116,66 @@ class CursorBackend(CLIBackend):
             usage=usage,
             error=error,
         )
+
+    def activity_message(
+        self,
+        event: Mapping[str, Any],
+        *,
+        workspace: Path,
+    ) -> str | None:
+        del workspace
+        event_type = str(event.get("type") or "")
+        subtype = str(event.get("subtype") or "")
+        if event_type == "system" and subtype == "init":
+            return "Cursor session started"
+        if event_type == "assistant":
+            return "Cursor is drafting the Blender source"
+        if event_type == "thinking":
+            return "Cursor is reasoning about the asset"
+        if event_type == "tool_call":
+            return _cursor_tool_activity(event)
+        if event_type == "retry":
+            return "Cursor is retrying its provider connection"
+        if event_type == "connection":
+            return "Cursor reported a provider connection update"
+        if event_type == "interaction_query":
+            return "Cursor requested an interaction"
+        if event_type == "task_notification":
+            return "Cursor reported a task update"
+        if event_type == "result":
+            usage = event.get("usage")
+            if subtype == "success" and not bool(event.get("is_error")):
+                return usage_activity("Cursor", usage if isinstance(usage, Mapping) else {})
+            return "Cursor reported a model-turn failure"
+        if event_type == "error":
+            return "Cursor reported a model-turn failure"
+        return None
+
+
+def _cursor_tool_activity(event: Mapping[str, Any]) -> str:
+    tool_call = event.get("tool_call")
+    payload = tool_call if isinstance(tool_call, Mapping) else event
+    names: list[str] = []
+    for key in ("name", "case", "tool_name", "toolName"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            names.append(value)
+    nested_tool = payload.get("tool")
+    if isinstance(nested_tool, Mapping):
+        names.extend(str(value) for key, value in nested_tool.items() if key == "case")
+    names.extend(str(key) for key in payload if str(key).lower().endswith("toolcall"))
+    tool_name = " ".join(names).lower()
+    if any(marker in tool_name for marker in ("read", "grep", "glob", "list", "search", "view")):
+        action = "inspecting reference evidence"
+    elif any(marker in tool_name for marker in ("write", "edit", "delete", "diff", "patch")):
+        action = "writing generated source"
+    elif any(marker in tool_name for marker in ("plan", "todo", "goal")):
+        action = "updating its implementation plan"
+    else:
+        action = "running a workspace tool"
+    status = str(event.get("subtype") or event.get("status") or "").lower()
+    verb = "finished" if status in {"completed", "success"} else "is"
+    return f"Cursor {verb} {action}"
 
 
 CursorCLIBackend = CursorBackend

@@ -1,19 +1,76 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 from procagen3d.backends import (
+    CLIBackend,
     CodexBackend,
     CodexCLIBackend,
     CursorBackend,
     CursorCLIBackend,
     GrokBackend,
     GrokCLIBackend,
+    ParsedOutput,
     create_backend,
 )
+
+
+class StreamingFixtureBackend(CLIBackend):
+    name = "fixture"
+    model = "fixture-model"
+    default_timeout_s = 5
+
+    def build_command(
+        self,
+        prompt: str,
+        workspace: Path,
+        *,
+        prompt_file: Path | None = None,
+        image_paths: Sequence[Path] = (),
+    ) -> tuple[str, ...]:
+        del prompt, prompt_file, image_paths
+        plan_path = workspace / "src" / "plan.json"
+        script = "\n".join(
+            (
+                "import json, pathlib, sys, time",
+                "print(json.dumps({'type': 'started'}, ensure_ascii=False), flush=True)",
+                f"plan = pathlib.Path({str(plan_path)!r})",
+                "plan.parent.mkdir(parents=True, exist_ok=True)",
+                "plan.write_text('1234', encoding='utf-8')",
+                "time.sleep(0.04)",
+                "print(json.dumps({'type': 'completed', 'text': '完成'}, ensure_ascii=False), flush=True)",
+                "sys.stderr.write('fixture warning\\n')",
+            )
+        )
+        return (sys.executable, "-u", "-c", script)
+
+    def parse_output(self, stdout: str, stderr: str) -> ParsedOutput:
+        del stderr
+        events = [json.loads(line) for line in stdout.splitlines()]
+        completed = any(event.get("type") == "completed" for event in events)
+        return ParsedOutput(
+            saw_terminal_event=completed,
+            terminal_success=completed,
+            final_message="complete" if completed else "",
+        )
+
+    def activity_message(
+        self,
+        event: Mapping[str, Any],
+        *,
+        workspace: Path,
+    ) -> str | None:
+        del workspace
+        if event.get("type") == "started":
+            return "Fixture provider started"
+        if event.get("type") == "completed":
+            return "Fixture provider completed"
+        return None
 
 
 class BackendCommandTests(unittest.TestCase):
@@ -263,6 +320,75 @@ class BackendParserTests(unittest.TestCase):
         self.assertFalse(cursor_error.terminal_success)
         self.assertEqual(cursor_error.error, "authentication failed")
 
+    def test_provider_activity_is_bounded_and_suppresses_raw_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            source = workspace / "src" / "program.py"
+            source.parent.mkdir()
+            source.write_text("pass\n", encoding="utf-8")
+            secret = "DO-NOT-PRINT-RAW-PAYLOAD"
+
+            codex = CodexBackend()
+            command_message = codex.activity_message(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "type": "command_execution",
+                        "command": f"rg {secret} {workspace / 'evidence'}",
+                        "aggregated_output": secret * 100,
+                    },
+                },
+                workspace=workspace,
+            )
+            file_message = codex.activity_message(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "file_change",
+                        "changes": [{"path": str(source), "kind": "add"}],
+                    },
+                },
+                workspace=workspace,
+            )
+            grok_message = GrokBackend().activity_message(
+                {"type": "text", "data": secret},
+                workspace=workspace,
+            )
+            cursor_message = CursorBackend().activity_message(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"text": secret}]},
+                },
+                workspace=workspace,
+            )
+
+            self.assertIn("inspecting reference evidence", command_message or "")
+            self.assertEqual(file_message, "Codex created src/program.py")
+            self.assertIn("drafting", grok_message or "")
+            self.assertIn("drafting", cursor_message or "")
+            for message in (command_message, file_message, grok_message, cursor_message):
+                self.assertNotIn(secret, message or "")
+                self.assertNotIn(str(workspace), message or "")
+
+    def test_terminal_activity_reports_only_numeric_usage(self) -> None:
+        workspace = Path(tempfile.gettempdir()).resolve()
+        message = CodexBackend().activity_message(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "output_tokens": 41313,
+                    "reasoning_output_tokens": 13232,
+                    "private": "not surfaced",
+                },
+            },
+            workspace=workspace,
+        )
+
+        self.assertEqual(
+            message,
+            "Codex model turn completed — 41,313 output tokens, 13,232 reasoning tokens",
+        )
+
 
 class BackendFactoryAndRunTests(unittest.TestCase):
     def test_factory_names_and_opentopos_style_aliases(self) -> None:
@@ -303,6 +429,35 @@ class BackendFactoryAndRunTests(unittest.TestCase):
             self.assertEqual(payload["returncode"], 127)
             self.assertEqual(payload["command"][0], str(missing_cli))
             self.assertTrue((trajectory / "final_message.txt").is_file())
+
+    def test_streamed_activity_preserves_exact_trajectory_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            trajectory = workspace / "trajectories" / "iter_00"
+            activity: list[str] = []
+            result = StreamingFixtureBackend().run(
+                prompt="write source",
+                workspace=workspace,
+                trajectory_dir=trajectory,
+                timeout_s=3,
+                on_activity=activity.append,
+                heartbeat_interval_s=0.01,
+            )
+
+            expected = (
+                '{"type": "started"}\n'
+                '{"type": "completed", "text": "完成"}\n'
+            )
+            self.assertTrue(result.ok)
+            self.assertEqual(result.stdout, expected)
+            self.assertEqual(result.transcript_path.read_text(encoding="utf-8"), expected)
+            self.assertEqual(result.stderr, "fixture warning\n")
+            self.assertEqual(result.stderr_path.read_text(encoding="utf-8"), "fixture warning\n")
+            self.assertIn("Fixture provider started", activity)
+            self.assertIn("Fixture provider completed", activity)
+            self.assertTrue(any("process still running" in message for message in activity))
+            self.assertTrue(any("plan.json 4 B" in message for message in activity))
+            self.assertTrue(any("program.py not created" in message for message in activity))
 
 
 if __name__ == "__main__":

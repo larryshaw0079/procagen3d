@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar, Sequence
+from typing import Any, ClassVar, Mapping, Sequence
 
-from .base import CLIBackend, ParsedOutput, json_objects
+from .base import CLIBackend, ParsedOutput, json_objects, usage_activity
 
 
 _SUCCESS_STOP_REASONS = {"completed", "end_turn", "stop", "success"}
@@ -134,6 +134,38 @@ class GrokBackend(CLIBackend):
             error=error,
         )
 
+    def activity_message(
+        self,
+        event: Mapping[str, Any],
+        *,
+        workspace: Path,
+    ) -> str | None:
+        del workspace
+        event_type = str(event.get("type") or "")
+        if event_type == "thought":
+            return "Grok is reasoning about the asset"
+        if event_type == "text":
+            return "Grok is drafting the Blender source"
+        if event_type == "plan":
+            return "Grok updated its implementation plan"
+        if event_type in {"auto_compact_start", "auto_compact_started"}:
+            return "Grok is compacting its working context"
+        if event_type in {"auto_compact_end", "auto_compact_completed"}:
+            return "Grok finished compacting its working context"
+        if event_type == "tool_call":
+            return _grok_tool_activity(event, completed=False)
+        if event_type == "tool_call_update":
+            return _grok_tool_activity(event, completed=True)
+        if event_type == "usage":
+            usage = event.get("usage") or event.get("data")
+            return usage_activity("Grok", usage if isinstance(usage, Mapping) else {})
+        if event_type == "end":
+            usage = event.get("usage")
+            return usage_activity("Grok", usage if isinstance(usage, Mapping) else {})
+        if event_type in {"error", "max_turns_reached"}:
+            return "Grok reported a model-turn failure"
+        return None
+
 
 def _dict_value(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
@@ -143,6 +175,26 @@ def _float_value(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     return None
+
+
+def _grok_tool_activity(event: Mapping[str, Any], *, completed: bool) -> str:
+    payload = event.get("data")
+    values = [event, payload] if isinstance(payload, Mapping) else [event]
+    tool_name = ""
+    for value in values:
+        candidate = value.get("toolName") or value.get("tool_name") or value.get("name")
+        if isinstance(candidate, str):
+            tool_name = candidate.lower()
+            break
+    if any(marker in tool_name for marker in ("read", "grep", "glob", "list", "search", "view")):
+        action = "inspecting reference evidence"
+    elif any(marker in tool_name for marker in ("write", "edit", "replace", "patch")):
+        action = "writing generated source"
+    elif any(marker in tool_name for marker in ("plan", "todo")):
+        action = "updating its implementation plan"
+    else:
+        action = "running a workspace tool"
+    return f"Grok finished {action}" if completed else f"Grok is {action}"
 
 
 GrokCLIBackend = GrokBackend

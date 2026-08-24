@@ -64,9 +64,11 @@ Long operations now report their intermediate stages: reference inspection,
 canonical rendering, each agent author/repair pass, the clean Blender build,
 GLB re-import, and fidelity scoring. Interactive terminals use a Rich spinner;
 redirected or CI logs receive explicit start and completion lines. Progress is
-written to stderr, while transcripts and Blender output remain in their normal
-workspace log files. Add `--no-progress` to `make`, `run`, or `build` for a
-quiet invocation.
+written to stderr. During an agent pass, sanitized provider milestones and a
+30-second heartbeat show elapsed time, structured-event count, last CLI-output
+age, and the current sizes of `plan.json` and `program.py`. Raw reasoning,
+commands, command output, and provider JSON remain only in the workspace logs.
+Add `--no-progress` to `make`, `run`, or `build` for a quiet invocation.
 
 ## Agent defaults
 
@@ -83,7 +85,10 @@ High Fast model ID.
 
 Each backend is a shell-free subprocess adapter. It records the prompt, JSONL
 transcript, stderr, terminal result, usage, model, and modified-file list in
-`trajectories/iter_XX`. Agents may change only `src/`.
+`trajectories/iter_XX`. After a candidate passes GLB validation and clean
+re-import, its executed result is also retained as
+`trajectories/iter_XX/model.glb`; later repairs cannot overwrite an earlier
+iteration's GLB. Agents may change only `src/`.
 
 ## Pipeline
 

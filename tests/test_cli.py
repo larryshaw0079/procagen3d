@@ -103,6 +103,48 @@ def test_redirected_build_summary_retains_comparison_json(tmp_path: Path, capsys
     assert "compiled GLB:" in paths
 
 
+def test_build_archives_against_the_matching_agent_trajectory(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    image = tmp_path / "reference.png"
+    glb = tmp_path / "reference.glb"
+    image.write_bytes(b"image")
+    glb.write_bytes(b"glb")
+    workspace = Workspace.create(
+        base=tmp_path / "outputs",
+        slug="fixture",
+        image=image,
+        glb=glb,
+        prompt="",
+        backend="codex",
+    )
+    workspace.program_path.write_text("def build():\n    pass\n", encoding="utf-8")
+    workspace.plan_path.write_text("{}\n", encoding="utf-8")
+    trajectory = workspace.trajectory_dir(0)
+    (trajectory / "program.py").write_bytes(workspace.program_path.read_bytes())
+    (trajectory / "plan.json").write_bytes(workspace.plan_path.read_bytes())
+
+    monkeypatch.setattr(cli.Workspace, "locate", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(
+        cli.BlenderRuntime,
+        "discover",
+        lambda explicit=None: type("Runtime", (), {"executable": Path("/fake/blender")})(),
+    )
+    monkeypatch.setattr(cli, "prepare_reference", lambda *args, **kwargs: {})
+    seen: list[Path | None] = []
+
+    def fake_build(*args, **kwargs):
+        seen.append(kwargs.get("trajectory_dir"))
+        return {"score": 1.0, "passed": True, "summary": {}}
+
+    monkeypatch.setattr(cli, "build_workspace", fake_build)
+    args = build_parser().parse_args(["build", str(workspace.root), "--no-progress"])
+
+    assert cli._command_build(args) == 0
+    assert seen == [trajectory]
+    assert "compiled GLB:" in capsys.readouterr().out
+
+
 def test_cursor_and_grok_defaults_are_explicit() -> None:
     cursor = create_backend("cursor")
     grok = create_backend("grok")

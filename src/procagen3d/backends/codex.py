@@ -4,9 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar, Sequence
+from typing import Any, ClassVar, Mapping, Sequence
 
-from .base import CLIBackend, CLIInvocation, ParsedOutput, json_objects
+from .base import (
+    CLIBackend,
+    CLIInvocation,
+    ParsedOutput,
+    json_objects,
+    source_change_paths,
+    usage_activity,
+)
 
 
 @dataclass(frozen=True)
@@ -106,6 +113,109 @@ class CodexBackend(CLIBackend):
             usage=usage,
             error=error,
         )
+
+    def activity_message(
+        self,
+        event: Mapping[str, Any],
+        *,
+        workspace: Path,
+    ) -> str | None:
+        event_type = event.get("type")
+        if event_type == "thread.started":
+            return "Codex session started"
+        if event_type == "turn.started":
+            return "Codex began analyzing the reference and planning the asset"
+        if event_type == "turn.completed":
+            usage = event.get("usage")
+            return usage_activity("Codex", usage if isinstance(usage, Mapping) else {})
+        if event_type in {"turn.failed", "error"}:
+            return "Codex reported a model-turn failure"
+        if event_type not in {"item.started", "item.updated", "item.completed"}:
+            return None
+
+        item = event.get("item")
+        if not isinstance(item, Mapping):
+            return None
+        item_type = item.get("type")
+        completed = event_type == "item.completed"
+
+        if item_type == "command_execution":
+            action = _classify_command(str(item.get("command") or ""))
+            if completed:
+                exit_code = item.get("exit_code")
+                if isinstance(exit_code, int) and exit_code != 0:
+                    return f"Codex workspace check failed — exit code {exit_code}"
+                return f"Codex finished {action}"
+            return f"Codex is {action}"
+
+        if item_type == "file_change":
+            paths = source_change_paths(event, workspace=workspace)
+            if not paths:
+                return "Codex is updating generated source"
+            shown = ", ".join(paths[:2])
+            if len(paths) > 2:
+                shown += f" (+{len(paths) - 2} more)"
+            if not completed:
+                return f"Codex is writing {shown}"
+            changes = item.get("changes")
+            kinds = (
+                {
+                    str(change.get("kind"))
+                    for change in changes
+                    if isinstance(change, Mapping)
+                }
+                if isinstance(changes, list)
+                else set()
+            )
+            verb = "created" if kinds == {"add"} else "updated"
+            return f"Codex {verb} {shown}"
+
+        if item_type == "agent_message" and completed:
+            return "Codex posted a progress update"
+        if item_type == "reasoning" and completed:
+            return "Codex completed a reasoning step"
+        if item_type == "web_search":
+            return "Codex is inspecting supporting information"
+        if item_type == "mcp_tool_call":
+            return "Codex is running a connected workspace tool"
+        if item_type == "todo_list" and completed:
+            return "Codex updated its implementation checklist"
+        if item_type == "error":
+            return "Codex reported an item-level failure"
+        return None
+
+
+def _classify_command(command: str) -> str:
+    lowered = command.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "evidence/",
+            "/evidence",
+            "reference_scene",
+            "reference_views",
+            "camera_contract",
+            "glb_probe",
+            "inputs/reference",
+        )
+    ):
+        return "inspecting reference evidence"
+    if any(
+        marker in lowered
+        for marker in (
+            "py_compile",
+            "compileall",
+            "ast.parse",
+            "json.load",
+            "jq -e",
+            "src/program.py",
+            "src/plan.json",
+        )
+    ):
+        return "validating generated source"
+    if "git status" in lowered or "git diff" in lowered:
+        return "checking workspace changes"
+    return "running a workspace check"
 
 
 # Descriptive alias for callers following OpenTopos's backend naming scheme.

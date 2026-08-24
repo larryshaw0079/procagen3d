@@ -117,6 +117,28 @@ class SymlinkSourceBackend(FakeBackend):
         return result
 
 
+class ActivityBackend(FakeBackend):
+    def run(
+        self,
+        *,
+        prompt,
+        workspace,
+        trajectory_dir,
+        image_paths,
+        timeout_s,
+        on_activity=None,
+    ):
+        if on_activity is not None:
+            on_activity("Provider is inspecting reference evidence")
+        return super().run(
+            prompt=prompt,
+            workspace=workspace,
+            trajectory_dir=trajectory_dir,
+            image_paths=image_paths,
+            timeout_s=timeout_s,
+        )
+
+
 def test_agent_runs_in_disposable_copy_and_promotes_only_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -139,6 +161,38 @@ def test_agent_runs_in_disposable_copy_and_promotes_only_source(
     assert json.loads(workspace.plan_path.read_text(encoding="utf-8"))["subject"] == "fixture"
     assert (workspace.root / "trajectories" / "iter_00" / "transcript.jsonl").is_file()
     assert result["model"] == "fake-model"
+
+
+def test_cli_backend_activity_is_forwarded_without_closing_the_agent_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = make_workspace(tmp_path)
+    fake = ActivityBackend()
+    events = []
+    monkeypatch.setattr(pipeline, "create_backend", lambda name: fake)
+    # The production branch is intentionally based on CLIBackend so ordinary
+    # duck-typed test/custom backends keep their existing fixed run signature.
+    monkeypatch.setattr(pipeline, "CLIBackend", ActivityBackend)
+
+    pipeline._invoke_agent(
+        workspace,
+        backend_name="codex",
+        prompt="author",
+        iteration=0,
+        timeout_s=10,
+        progress=events.append,
+    )
+
+    activity = [
+        event
+        for event in events
+        if event.kind == "info" and "inspecting reference" in event.message
+    ]
+    assert len(activity) == 1
+    assert activity[0].stage == "agent-00"
+    assert activity[0].elapsed_s is None
+    assert events[0].kind == "start"
+    assert events[-1].kind == "success"
 
 
 def test_unauthorized_agent_write_is_discarded(

@@ -197,3 +197,48 @@ def test_run_pipeline_forwards_progress_through_a_repair(
     ] == ["Build attempt 1 of 2", "Build attempt 2 of 2"]
     assert events[-1].kind == "success"
     assert events[-1].stage == "pipeline"
+
+
+def test_resume_routes_glb_to_the_trajectory_matching_restored_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    iter_00 = workspace.root / "trajectories" / "iter_00"
+    iter_01 = workspace.root / "trajectories" / "iter_01"
+    iter_00.mkdir()
+    iter_01.mkdir()
+    (iter_00 / "program.py").write_bytes(workspace.program_path.read_bytes())
+    (iter_00 / "plan.json").write_bytes(workspace.plan_path.read_bytes())
+    (iter_01 / "program.py").write_text("def rejected():\n    pass\n", encoding="utf-8")
+    (iter_01 / "plan.json").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline.BlenderRuntime, "discover", lambda explicit=None: object())
+    monkeypatch.setattr(pipeline, "prepare_reference", lambda *args, **kwargs: _prepared_probe())
+    seen_trajectory: list[Path | None] = []
+
+    def fake_build(*args, **kwargs):
+        trajectory = kwargs.get("trajectory_dir")
+        seen_trajectory.append(trajectory)
+        assert trajectory == iter_00
+        (iter_00 / "model.glb").write_bytes(b"restored source model")
+        write_json(
+            workspace.artifacts_dir / "build_manifest.json",
+            {
+                "program_sha256": sha256(workspace.program_path),
+                "plan_sha256": sha256(workspace.plan_path),
+            },
+        )
+        return {"score": 1.0, "passed": True}
+
+    monkeypatch.setattr(pipeline, "build_workspace", fake_build)
+
+    report = pipeline.run_pipeline(
+        workspace,
+        PipelineConfig(max_repairs=0, min_score=0.9),
+    )
+
+    assert seen_trajectory == [iter_00]
+    assert report["build_attempts"][0]["trajectory_glb"] == (
+        "trajectories/iter_00/model.glb"
+    )
+    assert not (iter_01 / "model.glb").exists()

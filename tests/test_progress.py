@@ -129,6 +129,28 @@ def test_rich_reporter_non_tty_prints_start_and_done_lines() -> None:
     assert "1.2s" in output
 
 
+def test_agent_activity_line_keeps_the_blocking_stage_active() -> None:
+    stream = StringIO()
+    reporter = RichProgressReporter(
+        Console(file=stream, force_terminal=False, color_system=None, width=160)
+    )
+
+    reporter(ProgressEvent("start", "agent-00", "Authoring Blender source"))
+    reporter(
+        ProgressEvent(
+            "info",
+            "agent-00",
+            "Codex process still running — 30s elapsed; plan.json 14.6 KiB",
+        )
+    )
+
+    assert reporter._active_stage == "agent-00"
+    assert "process still running" in stream.getvalue()
+
+    reporter(ProgressEvent("success", "agent-00", "Codex produced source", elapsed_s=31.0))
+    assert reporter._active_stage is None
+
+
 def test_rich_cleanup_cannot_mask_pipeline_exception() -> None:
     class BrokenStatus:
         def stop(self) -> None:
