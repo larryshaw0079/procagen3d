@@ -40,13 +40,18 @@ def main():
             obj.data.pose_position = "REST"
     validate_drawable_scene()
 
-    report = geometry_report(include_components=False)
+    report = geometry_report(include_components=True)
     report["artifact"] = "model.glb"
     report["pose_policy"] = "compiled GLB, frame-0, armatures-in-rest-position"
-    write_json(args.artifacts_dir / "scene_report.json", report)
 
     contract = json.loads(args.camera_contract.read_text(encoding="utf-8"))
-    render_views(args.artifacts_dir / "renders", contract)
+    masks = render_views(args.artifacts_dir / "renders", contract)
+    report["canonical_evidence"] = {
+        "renders": "renders",
+        "masks": "renders/masks.json",
+        "diagnostics": "renders/" + masks["diagnostics"]["manifest"],
+    }
+    write_json(args.artifacts_dir / "scene_report.json", report)
     print("PROCAGEN3D_COMPILED_GLB_READY")
 
 

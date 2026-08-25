@@ -130,6 +130,94 @@ def surface_document(
     }
 
 
+def enhanced_surface_document(
+    *,
+    mean_normal_angle: float = 12.0,
+    visible_coverage: float = 0.95,
+    candidate_area: float = 7.0,
+) -> dict:
+    value = surface_document()
+    value["surfaces"]["candidate"]["area"] = candidate_area
+    value["candidate_to_reference"]["source_surface_area"] = candidate_area
+    value["normal_aware"] = {
+        "normal_angle_degrees": {
+            "mean": mean_normal_angle,
+            "rms": max(mean_normal_angle, 14.0),
+            "p95": max(mean_normal_angle, 18.0),
+            "max": max(mean_normal_angle, 25.0),
+        }
+    }
+    for direction in ("candidate_to_reference", "reference_to_candidate"):
+        value[direction]["visible_external_proxy"] = {
+            "coverage": {
+                "thresholds": [
+                    {
+                        "distance": threshold,
+                        "distance_and_normal_aligned_fraction": visible_coverage,
+                    }
+                    for threshold in (0.005, 0.010, 0.020, 0.040, 0.080)
+                ]
+            }
+        }
+    return value
+
+
+def test_surface_comparison_preserves_diagnostic_identities(
+    tmp_path: Path,
+) -> None:
+    document = enhanced_surface_document()
+    document["surfaces"]["candidate"]["objects"] = [
+        {
+            "name": "Body",
+            "object_index": 0,
+            "vertices": 12,
+            "triangles": 20,
+            "area": 7.0,
+        }
+    ]
+    sample = document["candidate_to_reference"]["worst_samples"][0]
+    sample.update(
+        source_identity={
+            "object": "Body",
+            "object_index": 0,
+            "polygon_index": 3,
+            "triangle_index_in_object": 4,
+            "surface_triangle_index": 4,
+        },
+        target_identity={
+            "object": "ReferenceBody",
+            "object_index": 0,
+            "polygon_index": 2,
+            "triangle_index_in_object": 3,
+            "surface_triangle_index": 3,
+        },
+        source_normal=[0.0, 0.0, 1.0],
+        target_normal=[0.0, 0.1, 0.995],
+        normal_cosine=0.995,
+        normal_angle_degrees=5.73,
+        unoriented_normal_angle_degrees=5.73,
+        signed_target_plane_offset=0.01,
+        point_to_plane_distance=0.01,
+        normal_aware_distance=0.061,
+        visible_from=["front", "top"],
+    )
+    path = write_json(tmp_path / "surface-identities.json", document)
+
+    report = compare_scenes(
+        tmp_path,
+        reference=geometry_document(),
+        candidate=geometry_document(),
+        surface_comparison=path,
+    )
+
+    normalized = report["surface_comparison"]
+    assert normalized["surfaces"]["candidate"]["objects"][0]["name"] == "Body"
+    worst = normalized["candidate_to_reference"]["worst_samples"][0]
+    assert worst["source_identity"]["object"] == "Body"
+    assert worst["target_identity"]["polygon_index"] == 2
+    assert worst["visible_from"] == ["front", "top"]
+
+
 def write_json(path: Path, value: dict) -> Path:
     path.write_text(json.dumps(value), encoding="utf-8")
     return path
@@ -371,6 +459,57 @@ def test_surface_distances_add_diagnostics_and_noncompensating_gates(
         "mean_surface_distance",
         "p95_surface_distance",
     ]
+
+
+def test_enhanced_surface_gates_cover_normals_visibility_and_area(
+    tmp_path: Path,
+) -> None:
+    thresholds = SurfaceGateThresholds(
+        max_mean_surface_distance=0.035,
+        max_p95_surface_distance=0.080,
+        max_mean_normal_angle_degrees=20.0,
+        min_visible_coverage=0.90,
+        min_surface_area_ratio=0.80,
+        max_surface_area_ratio=1.25,
+    )
+    accepted_path = write_json(
+        tmp_path / "enhanced-surface.json", enhanced_surface_document()
+    )
+    accepted = compare_scenes(
+        tmp_path,
+        reference=geometry_document(),
+        candidate=geometry_document(),
+        surface_comparison=accepted_path,
+        surface_gate_thresholds=thresholds,
+    )
+    assert accepted["passed"]
+    assert accepted["summary"]["mean_normal_angle_degrees"] == 12.0
+    assert accepted["summary"]["visible_surface_coverage"] == 0.95
+    assert accepted["summary"]["surface_area_ratio"] == pytest.approx(7.0 / 6.0)
+
+    rejected_path = write_json(
+        tmp_path / "bad-enhanced-surface.json",
+        enhanced_surface_document(
+            mean_normal_angle=35.0,
+            visible_coverage=0.50,
+            candidate_area=9.0,
+        ),
+    )
+    rejected = compare_scenes(
+        tmp_path,
+        reference=geometry_document(),
+        candidate=geometry_document(),
+        surface_comparison=rejected_path,
+        surface_gate_thresholds=thresholds,
+    )
+    failed = {
+        item["gate"] for item in rejected["hard_gates"]["failures"]
+    }
+    assert {
+        "mean_normal_angle_degrees",
+        "visible_surface_coverage",
+        "maximum_surface_area_ratio",
+    } <= failed
 
 
 @pytest.mark.parametrize(

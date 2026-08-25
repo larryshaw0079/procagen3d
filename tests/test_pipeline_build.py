@@ -46,6 +46,10 @@ def _workspace(tmp_path: Path) -> Workspace:
 def _write_evidence(root: Path, *, size: int = 128) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "reference_views").mkdir()
+    for kind in ("depth", "normal", "object_id"):
+        (root / "reference_views" / "diagnostics" / kind).mkdir(
+            parents=True, exist_ok=True
+        )
     write_json(
         root / "glb_probe.json",
         {"self_contained": True, "reference_readiness": "pass"},
@@ -98,6 +102,25 @@ def _write_evidence(root: Path, *, size: int = 128) -> None:
     for name in pipeline.CANONICAL_VIEWS:
         header = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", size, size)
         (root / "reference_views" / f"{name}.png").write_bytes(header)
+        for kind in ("depth", "normal", "object_id"):
+            (root / "reference_views" / "diagnostics" / kind / f"{name}.png").write_bytes(
+                header
+            )
+    write_json(
+        root / "reference_views" / "diagnostics" / "manifest.json",
+        {
+            "schema_version": 1,
+            "views": {
+                name: {
+                    "depth_range": [0.0, 2.0],
+                    "depth": f"diagnostics/depth/{name}.png",
+                    "normal": f"diagnostics/normal/{name}.png",
+                    "object_id": f"diagnostics/object_id/{name}.png",
+                }
+                for name in pipeline.CANONICAL_VIEWS
+            },
+        },
+    )
 
 
 def test_complete_evidence_requires_v2_masks_at_the_requested_resolution(tmp_path: Path) -> None:

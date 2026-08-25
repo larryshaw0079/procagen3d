@@ -9,6 +9,13 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Sequence
 
 from .granularity import DEFAULT_GRANULARITY, GRANULARITY_LEVELS
+from .quality import (
+    DETAIL_RICHNESS_LEVELS,
+    MATERIAL_FIDELITY_LEVELS,
+    STRUCTURAL_COHERENCE_LEVELS,
+    SURFACE_FIDELITY_LEVELS,
+    resolve_quality_profile,
+)
 from .reconstruction import DEFAULT_RECONSTRUCTION_MODE, RECONSTRUCTION_MODES
 
 
@@ -26,6 +33,82 @@ _CHARACTER_LIST_FIELDS = (
     "left_right_asymmetry",
     "inferred_features",
 )
+
+_VECTOR3: dict[str, Any] = {
+    "type": "array",
+    "minItems": 3,
+    "maxItems": 3,
+    "items": {"type": "number"},
+}
+
+_BOUNDS3: dict[str, Any] = {
+    "type": "object",
+    "required": ["min", "max"],
+    "properties": {
+        "min": _VECTOR3,
+        "max": _VECTOR3,
+    },
+    "additionalProperties": False,
+}
+
+_ATTACHMENT_TYPES = (
+    "root",
+    "fused",
+    "surface-contact",
+    "embedded",
+    "articulated",
+    "intentional-gap",
+)
+
+_ATTACHMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "parent_id",
+        "type",
+        "contact_region",
+        "max_gap",
+        "max_penetration",
+        "min_contact_area",
+    ],
+    "properties": {
+        "parent_id": _NON_EMPTY_STRING,
+        "type": {"type": "string", "enum": list(_ATTACHMENT_TYPES)},
+        "contact_region": _BOUNDS3,
+        "max_gap": {"type": "number", "minimum": 0},
+        "max_penetration": {"type": "number", "minimum": 0},
+        "min_contact_area": {"type": "number", "minimum": 0},
+    },
+    "additionalProperties": False,
+}
+
+_PART_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "id",
+        "name",
+        "shape_family",
+        "approximate_bounds",
+        "visual_role",
+        "object_names",
+        "attachment",
+    ],
+    "properties": {
+        "id": _NON_EMPTY_STRING,
+        "name": _NON_EMPTY_STRING,
+        "shape_family": _NON_EMPTY_STRING,
+        "approximate_bounds": _BOUNDS3,
+        "visual_role": _NON_EMPTY_STRING,
+        "object_names": {
+            "type": "array",
+            "minItems": 1,
+            "items": _NON_EMPTY_STRING,
+        },
+        "attachment": _ATTACHMENT_SCHEMA,
+    },
+    # Agents may retain measurements or construction notes alongside the
+    # executable fields above.
+    "additionalProperties": True,
+}
 
 
 PLAN_SCHEMA: dict[str, Any] = {
@@ -76,6 +159,38 @@ PLAN_SCHEMA: dict[str, Any] = {
                 "and enable bidirectional 3D surface-distance gates."
             ),
         },
+        "quality_profile": {
+            "type": "object",
+            "required": [
+                "surface_fidelity",
+                "detail_richness",
+                "material_fidelity",
+                "structural_coherence",
+            ],
+            "properties": {
+                "surface_fidelity": {
+                    "type": "string",
+                    "enum": list(SURFACE_FIDELITY_LEVELS),
+                },
+                "detail_richness": {
+                    "type": "string",
+                    "enum": list(DETAIL_RICHNESS_LEVELS),
+                },
+                "material_fidelity": {
+                    "type": "string",
+                    "enum": list(MATERIAL_FIDELITY_LEVELS),
+                },
+                "structural_coherence": {
+                    "type": "string",
+                    "enum": list(STRUCTURAL_COHERENCE_LEVELS),
+                },
+            },
+            "additionalProperties": False,
+            "description": (
+                "Independent acceptance requirements. Missing legacy values are "
+                "derived from granularity, while newly authored plans must state them."
+            ),
+        },
         "coordinate_frame": {
             "type": "object",
             "description": (
@@ -97,7 +212,7 @@ PLAN_SCHEMA: dict[str, Any] = {
                 "Semantic parts. Each object should describe its name, shape family, "
                 "approximate bounds, parent or attachment, and visual role."
             ),
-            "items": {"type": "object"},
+            "items": _PART_SCHEMA,
         },
         "materials": {"type": "array"},
         "construction_strategy": {
@@ -313,6 +428,20 @@ def _iter_violations(
             )
 
     if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        minimum = schema.get("minimum")
+        if minimum is not None and value < minimum:
+            yield PlanSchemaViolation(
+                path,
+                "minimum",
+                f"must be at least {minimum}",
+            )
+        maximum = schema.get("maximum")
+        if maximum is not None and value > maximum:
+            yield PlanSchemaViolation(
+                path,
+                "maximum",
+                f"must be at most {maximum}",
+            )
         exclusive_minimum = schema.get("exclusiveMinimum")
         if exclusive_minimum is not None and value <= exclusive_minimum:
             yield PlanSchemaViolation(
@@ -350,18 +479,328 @@ def plan_schema_violations(value: Any) -> tuple[PlanSchemaViolation, ...]:
     )
 
 
-def validate_plan_document(value: Any) -> dict[str, Any]:
-    """Validate and return a shallow normalized plan.
+def _part_id(value: str, *, fallback: str) -> str:
+    identifier = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return identifier or fallback
 
-    ``reconstruction_mode`` and ``granularity`` were added after the original
-    plan contract. Old plans remain valid and receive compatibility defaults;
-    newly authored plans should include both fields explicitly.
+
+def _number_vector(value: Any) -> list[float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    result: list[float] = []
+    for item in value:
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(item)
+        ):
+            return None
+        result.append(float(item))
+    return result
+
+
+def _normalized_bounds(value: Any, *, dimensions: Any) -> dict[str, list[float]]:
+    minimum: list[float] | None = None
+    maximum: list[float] | None = None
+    if isinstance(value, Mapping):
+        minimum = _number_vector(value.get("min"))
+        maximum = _number_vector(value.get("max"))
+    elif isinstance(value, (list, tuple)):
+        if len(value) == 2:
+            minimum = _number_vector(value[0])
+            maximum = _number_vector(value[1])
+        elif len(value) == 6:
+            minimum = _number_vector(value[:3])
+            maximum = _number_vector(value[3:])
+    if minimum is not None and maximum is not None:
+        return {"min": minimum, "max": maximum}
+
+    size = _number_vector(dimensions) or [1.0, 1.0, 1.0]
+    return {
+        "min": [-size[0] * 0.5, -size[1] * 0.5, 0.0],
+        "max": [size[0] * 0.5, size[1] * 0.5, size[2]],
+    }
+
+
+def _contact_region(
+    child: Mapping[str, list[float]],
+    parent: Mapping[str, list[float]],
+) -> dict[str, list[float]]:
+    low = [max(child["min"][axis], parent["min"][axis]) for axis in range(3)]
+    high = [min(child["max"][axis], parent["max"][axis]) for axis in range(3)]
+    for axis in range(3):
+        if low[axis] > high[axis]:
+            midpoint = (low[axis] + high[axis]) * 0.5
+            low[axis] = midpoint
+            high[axis] = midpoint
+    return {"min": low, "max": high}
+
+
+def _normalize_parts(value: Any, *, dimensions: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+    normalized: list[Any] = []
+    used_ids: set[str] = set()
+    root_id = "asset_root"
+    root_bounds: dict[str, list[float]] | None = None
+    for index, raw in enumerate(value):
+        if not isinstance(raw, Mapping):
+            normalized.append(raw)
+            continue
+        part = dict(raw)
+        name_value = part.get("name", part.get("semantic_name", f"part_{index + 1}"))
+        name = name_value if isinstance(name_value, str) and name_value.strip() else f"part_{index + 1}"
+        if "id" in part:
+            # Typed plans use IDs as foreign keys from attachments and generated
+            # Blender-object metadata. Preserve an explicitly supplied ID exactly;
+            # schema/semantic validation must reject bad or duplicate IDs rather
+            # than silently changing the graph it describes.
+            identifier = part["id"]
+        else:
+            identifier = _part_id(
+                name if isinstance(name, str) else f"part_{index + 1}",
+                fallback=f"part_{index + 1}",
+            )
+            base_identifier = identifier
+            suffix = 2
+            while identifier in used_ids:
+                identifier = f"{base_identifier}_{suffix}"
+                suffix += 1
+        if isinstance(identifier, str):
+            used_ids.add(identifier)
+        if index == 0:
+            root_id = identifier if isinstance(identifier, str) else "asset_root"
+
+        raw_bounds = part.get("approximate_bounds", part.get("approx_bounds"))
+        bounds = _normalized_bounds(raw_bounds, dimensions=dimensions)
+        if index == 0:
+            root_bounds = bounds
+        assert root_bounds is not None
+
+        object_names = part.get("object_names")
+        if not (
+            isinstance(object_names, list)
+            and object_names
+            and all(isinstance(item, str) and item.strip() for item in object_names)
+        ):
+            object_names = [name]
+
+        attachment = part.get("attachment")
+        if not isinstance(attachment, Mapping):
+            attachment = {}
+        attachment = dict(attachment)
+        if index == 0:
+            attachment.setdefault("parent_id", "__root__")
+            attachment.setdefault("type", "root")
+            region = bounds
+        else:
+            attachment.setdefault("parent_id", root_id)
+            attachment.setdefault("type", "surface-contact")
+            region = _contact_region(bounds, root_bounds)
+        attachment.setdefault("contact_region", region)
+        attachment.setdefault("max_gap", 0.02)
+        attachment.setdefault("max_penetration", 0.02)
+        attachment.setdefault("min_contact_area", 0.0)
+
+        part.update(
+            id=identifier,
+            name=name,
+            shape_family=(
+                part.get("shape_family")
+                if isinstance(part.get("shape_family"), str)
+                and str(part.get("shape_family")).strip()
+                else "unspecified"
+            ),
+            approximate_bounds=bounds,
+            visual_role=(
+                part.get("visual_role")
+                if isinstance(part.get("visual_role"), str)
+                and str(part.get("visual_role")).strip()
+                else "unspecified"
+            ),
+            object_names=list(object_names),
+            attachment=attachment,
+        )
+        normalized.append(part)
+    return normalized
+
+
+def _semantic_plan_violations(value: Mapping[str, Any]) -> tuple[PlanSchemaViolation, ...]:
+    violations: list[PlanSchemaViolation] = []
+    parts = value.get("parts")
+    if not isinstance(parts, list) or not all(isinstance(item, Mapping) for item in parts):
+        return ()
+    ids = [
+        item.get("id") if isinstance(item.get("id"), str) else None
+        for item in parts
+    ]
+    known = {identifier for identifier in ids if identifier is not None}
+    parents: dict[str, str] = {}
+    root_indexes: list[int] = []
+    for index, part in enumerate(parts):
+        identifier = ids[index]
+        if identifier is not None and ids.count(identifier) > 1:
+            violations.append(
+                PlanSchemaViolation(
+                    ("parts", index, "id"),
+                    "uniquePartId",
+                    f"part id {identifier!r} must be unique",
+                )
+            )
+        bounds = part.get("approximate_bounds")
+        if isinstance(bounds, Mapping):
+            minimum = bounds.get("min")
+            maximum = bounds.get("max")
+            if isinstance(minimum, list) and isinstance(maximum, list):
+                for axis, (low, high) in enumerate(zip(minimum, maximum)):
+                    if (
+                        isinstance(low, (int, float))
+                        and isinstance(high, (int, float))
+                        and low > high
+                    ):
+                        violations.append(
+                            PlanSchemaViolation(
+                                ("parts", index, "approximate_bounds", "min", axis),
+                                "orderedBounds",
+                                "must not exceed the matching maximum",
+                            )
+                        )
+        attachment = part.get("attachment")
+        if not isinstance(attachment, Mapping):
+            continue
+        parent_id = attachment.get("parent_id")
+        kind = attachment.get("type")
+        if kind == "root":
+            root_indexes.append(index)
+            if parent_id != "__root__":
+                violations.append(
+                    PlanSchemaViolation(
+                        ("parts", index, "attachment", "parent_id"),
+                        "rootParent",
+                        "a root attachment must use '__root__'",
+                    )
+                )
+        elif kind in _ATTACHMENT_TYPES and isinstance(parent_id, str):
+            if parent_id == identifier:
+                violations.append(
+                    PlanSchemaViolation(
+                        ("parts", index, "attachment", "parent_id"),
+                        "selfParent",
+                        "a part cannot attach to itself",
+                    )
+                )
+            elif parent_id not in known:
+                violations.append(
+                    PlanSchemaViolation(
+                        ("parts", index, "attachment", "parent_id"),
+                        "knownParent",
+                        "must reference another declared part id",
+                    )
+                )
+            elif identifier is not None:
+                parents[identifier] = parent_id
+
+        contact_region = attachment.get("contact_region")
+        if isinstance(contact_region, Mapping):
+            minimum = contact_region.get("min")
+            maximum = contact_region.get("max")
+            if isinstance(minimum, list) and isinstance(maximum, list):
+                for axis, (low, high) in enumerate(zip(minimum, maximum)):
+                    if (
+                        isinstance(low, (int, float))
+                        and isinstance(high, (int, float))
+                        and low > high
+                    ):
+                        violations.append(
+                            PlanSchemaViolation(
+                                (
+                                    "parts",
+                                    index,
+                                    "attachment",
+                                    "contact_region",
+                                    "min",
+                                    axis,
+                                ),
+                                "orderedBounds",
+                                "must not exceed the matching maximum",
+                            )
+                        )
+
+    if len(root_indexes) != 1:
+        violations.append(
+            PlanSchemaViolation(
+                ("parts",),
+                "singleRoot",
+                "attachment graph must contain exactly one root part",
+            )
+        )
+
+    cyclic_ids: set[str] = set()
+    for start in parents:
+        path: list[str] = []
+        positions: dict[str, int] = {}
+        current = start
+        while current in parents and current not in positions:
+            positions[current] = len(path)
+            path.append(current)
+            current = parents[current]
+        if current in positions:
+            cyclic_ids.update(path[positions[current] :])
+    for index, identifier in enumerate(ids):
+        if identifier in cyclic_ids:
+            violations.append(
+                PlanSchemaViolation(
+                    ("parts", index, "attachment", "parent_id"),
+                    "acyclicAttachment",
+                    "attachment parent references must not form a cycle",
+                )
+            )
+    return tuple(violations)
+
+
+def validate_plan_document(value: Any) -> dict[str, Any]:
+    """Validate and return a normalized, executable plan.
+
+    Old plans remain readable: mode, granularity, independent quality axes,
+    part identifiers, bounds, and typed attachment constraints receive
+    deterministic compatibility defaults. Newly authored plans should include
+    every field explicitly.
     """
 
-    violations = plan_schema_violations(value)
+    if not isinstance(value, Mapping):
+        normalized: Any = value
+    else:
+        normalized = dict(value)
+        normalized.setdefault("reconstruction_mode", DEFAULT_RECONSTRUCTION_MODE)
+        normalized.setdefault("granularity", DEFAULT_GRANULARITY)
+        granularity = normalized.get("granularity")
+        preset_granularity = (
+            granularity if granularity in GRANULARITY_LEVELS else DEFAULT_GRANULARITY
+        )
+        profile = resolve_quality_profile(preset_granularity).as_dict()
+        supplied_profile = normalized.get("quality_profile")
+        if isinstance(supplied_profile, Mapping):
+            profile.update(supplied_profile)
+        elif supplied_profile is not None:
+            profile = supplied_profile
+        normalized["quality_profile"] = profile
+        normalized["parts"] = _normalize_parts(
+            normalized.get("parts"), dimensions=normalized.get("dimensions")
+        )
+
+    violations = list(plan_schema_violations(normalized))
+    if isinstance(normalized, Mapping):
+        violations.extend(_semantic_plan_violations(normalized))
     if violations:
-        raise PlanSchemaError(violations)
-    normalized = dict(value)
-    normalized.setdefault("reconstruction_mode", DEFAULT_RECONSTRUCTION_MODE)
-    normalized.setdefault("granularity", DEFAULT_GRANULARITY)
+        raise PlanSchemaError(
+            sorted(
+                violations,
+                key=lambda item: (
+                    tuple(str(component) for component in item.path),
+                    item.keyword,
+                    item.message,
+                ),
+            )
+        )
+    assert isinstance(normalized, dict)
     return normalized

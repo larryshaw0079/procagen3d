@@ -8,6 +8,7 @@ from typing import Any
 
 from .granularity import DEFAULT_GRANULARITY, validate_granularity
 from .plan_schema import plan_schema_text
+from .quality import QualityProfile, resolve_quality_profile
 from .reconstruction import DEFAULT_RECONSTRUCTION_MODE, validate_reconstruction_mode
 
 
@@ -61,6 +62,23 @@ def _granularity_contract(granularity: str) -> str:
 - In procedural mode this remains a best-effort authored approximation from evidence; exact reference-derived topology requires `glb-ref`."""
 
 
+def _material_export_contract() -> str:
+    return """Material/export contract:
+- The host exports `model.glb` without baking Blender procedural shader graphs.
+- For every visible color block, use glTF-safe direct constants on unlinked Principled BSDF `Base Color`, `Metallic`, and `Roughness` inputs, and assign that material to the intended geometry.
+- Do not connect Noise Texture, Color Ramp, Wave Texture, or other procedural nodes to exported Principled inputs unless `build()` explicitly converts or bakes the result into a self-contained image texture that the GLB exporter embeds.
+- Setting only `Material.diffuse_color` does not preserve a linked unsupported `Base Color` graph through GLB export. Without an explicit bake, create variation with additional direct-constant materials, vertex colors, or geometry."""
+
+
+def _quality_contract(profile: QualityProfile) -> str:
+    value = json.dumps(profile.as_dict(), sort_keys=True)
+    return f"""Independent quality profile: `{value}`.
+- Surface fidelity controls bidirectional distance, visible coverage, surface-area, and normal-aware comparison; it is independent of how many authored details are requested.
+- Detail richness requires declared semantic parts to map to real Blender object names and retains enough geometric richness to express the reference's visible forms.
+- Material fidelity applies non-compensating spatial-color, palette, and exported glTF material gates. Implicit white is never a substitute for an authored visible color.
+- Structural coherence applies topology, component, winding/normal, degeneracy, contact, and unexpected-intersection gates. Use the typed attachment tolerances in the plan; do not leave visually attached parts merely intersecting or floating."""
+
+
 def initial_prompt(
     *,
     root: Path,
@@ -68,10 +86,14 @@ def initial_prompt(
     user_prompt: str,
     reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE,
     granularity: str = DEFAULT_GRANULARITY,
+    quality_profile: QualityProfile | None = None,
 ) -> str:
     image_name = _relative(image, root)
     mode_contract = _mode_contract(reconstruction_mode)
     granularity_contract = _granularity_contract(granularity)
+    material_export_contract = _material_export_contract()
+    quality_profile = quality_profile or resolve_quality_profile(granularity)
+    quality_contract = _quality_contract(quality_profile)
     schema_text = plan_schema_text()
     return f"""You are the geometry author inside a GLB-guided Blender asset workspace.
 
@@ -85,6 +107,7 @@ Evidence available in this workspace:
 - Normalized geometry, components, bounds and cross-sections: `evidence/reference_scene.json`
 - Exact camera contract: `evidence/camera_contract.json`
 - Canonical GLB renders: `evidence/reference_views/front.png`, `back.png`, `left.png`, `right.png`, `top.png`, `iso.png`
+- Canonical depth, world-normal, and object-ID diagnostics: `evidence/reference_views/diagnostics/` with `manifest.json`
 
 Treat node and material names as unreliable: many source GLBs are one anonymous merged mesh. Infer meaningful parts from the image, silhouettes, bounds, sections, and views. Follow the selected mode's reference-use contract exactly.
 
@@ -92,11 +115,15 @@ Treat node and material names as unreliable: many source GLBs are one anonymous 
 
 {granularity_contract}
 
+{material_export_contract}
+
+{quality_contract}
+
 Do not discover, invoke, or depend on a ProcAgen3D/Codex skill. This workspace contract is complete and the retired skill implementation is intentionally out of scope.
 
 Create exactly these two deliverables:
 
-1. `src/plan.json`: valid JSON conforming to the exact JSON Schema below. Set `reconstruction_mode` to `{reconstruction_mode}` and `granularity` to `{granularity}`, matching the selected host configuration. Each part should record a semantic name, shape family, approximate bounds, parent/attachment, and visual role. For a character or hybrid, use `proportions` to describe head-to-body and limb proportions. Empty character-analysis lists are valid when a feature is absent; put every uncertain or hidden feature in `inferred_features`.
+1. `src/plan.json`: valid JSON conforming to the exact JSON Schema below. Set `reconstruction_mode` to `{reconstruction_mode}`, `granularity` to `{granularity}`, and `quality_profile` to `{json.dumps(quality_profile.as_dict(), sort_keys=True)}`, matching the selected host configuration. Give every part a stable `id`, exact Blender `object_names`, numeric bounds, shape family, visual role, and typed `attachment` containing a declared parent ID, contact region, attachment type, maximum gap/penetration, and minimum contact area. For a character or hybrid, use `proportions` to describe head-to-body and limb proportions. Empty character-analysis lists are valid when a feature is absent; put every uncertain or hidden feature in `inferred_features`.
 2. `src/program.py`: mode-conforming Blender Python source defining a callable `build()` with no arguments. `build()` constructs the complete asset as editable, semantically named Blender geometry. The selected mode contract above states whether this file is standalone or requires the provenance-locked host reference preload.
 
 Authoritative `src/plan.json` JSON Schema (copy its field names and types exactly):
@@ -126,10 +153,14 @@ def repair_prompt(
     iteration: int,
     reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE,
     granularity: str = DEFAULT_GRANULARITY,
+    quality_profile: QualityProfile | None = None,
 ) -> str:
     comparison_text = json.dumps(comparison, indent=2) if comparison else "No fidelity report was produced."
     mode_contract = _mode_contract(reconstruction_mode)
     granularity_contract = _granularity_contract(granularity)
+    material_export_contract = _material_export_contract()
+    quality_profile = quality_profile or resolve_quality_profile(granularity)
+    quality_contract = _quality_contract(quality_profile)
     schema_text = plan_schema_text()
     return f"""Repair iteration {iteration} for the GLB-guided Blender reconstruction.
 
@@ -142,12 +173,16 @@ The current source is `src/program.py`; its plan is `src/plan.json`. Preserve wo
 
 {granularity_contract}
 
-The plan must set `reconstruction_mode` to `{reconstruction_mode}` and `granularity` to `{granularity}`, matching the selected host configuration, and conform to this authoritative JSON Schema exactly:
+{material_export_contract}
+
+{quality_contract}
+
+The plan must set `reconstruction_mode` to `{reconstruction_mode}`, `granularity` to `{granularity}`, and `quality_profile` to `{json.dumps(quality_profile.as_dict(), sort_keys=True)}`, matching the selected host configuration, and conform to this authoritative JSON Schema exactly. Every non-root part must name its exact Blender objects and declare its parent, attachment type, contact region, and numeric gap/penetration/contact tolerances:
 ```json
 {schema_text}
 ```
 
-The current compiled candidate views are `artifacts/renders/front.png`, `back.png`, `left.png`, `right.png`, `top.png`, and `iso.png`. Compare them directly with the corresponding `evidence/reference_views/*.png` images when they are present.
+The current compiled candidate views are `artifacts/renders/front.png`, `back.png`, `left.png`, `right.png`, `top.png`, and `iso.png`. Compare them directly with the corresponding `evidence/reference_views/*.png` images when they are present. Use the candidate `artifacts/renders/diagnostics/` depth, world-normal, and object-ID views beside the reference diagnostics to localize incoherent surfaces, missing parts, and wrong part boundaries. When present, use `artifacts/surface_residuals/` heatmaps to repair the largest visible residual regions first.
 
 Build/static failure (if any):
 {failure or 'None; the program built successfully.'}

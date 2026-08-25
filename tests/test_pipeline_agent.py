@@ -143,6 +143,17 @@ class ActivityBackend(FakeBackend):
         )
 
 
+class NonSuccessBackend(FakeBackend):
+    def run(self, **kwargs):
+        result = super().run(**kwargs)
+        result.ok = False
+        result.exit_reason = "timeout"
+        result.timed_out = True
+        result.returncode = 124
+        result.error = "provider timed out"
+        return result
+
+
 def test_agent_runs_in_disposable_copy_and_promotes_only_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -165,6 +176,33 @@ def test_agent_runs_in_disposable_copy_and_promotes_only_source(
     assert json.loads(workspace.plan_path.read_text(encoding="utf-8"))["subject"] == "fixture"
     assert (workspace.root / "trajectories" / "iter_00" / "transcript.jsonl").is_file()
     assert result["model"] == "fake-model"
+
+
+def test_non_success_agent_salvages_valid_bounded_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = make_workspace(tmp_path)
+    fake = NonSuccessBackend()
+    monkeypatch.setattr(pipeline, "create_backend", lambda name: fake)
+
+    result = pipeline._invoke_agent(
+        workspace,
+        backend_name="codex",
+        prompt="author",
+        iteration=0,
+        timeout_s=10,
+    )
+
+    assert result["provider_success"] is False
+    assert result["salvaged"] is True
+    assert result["timed_out"] is True
+    assert "provider timed out" in result["error"]
+    assert workspace.program_path.is_file()
+    assert workspace.plan_path.is_file()
+    trajectory = workspace.root / "trajectories" / "iter_00"
+    assert (trajectory / "program.py").read_bytes() == workspace.program_path.read_bytes()
+    assert (trajectory / "plan.json").read_bytes() == workspace.plan_path.read_bytes()
+    assert (trajectory / "result.json").is_file()
 
 
 def test_cli_backend_activity_is_forwarded_without_closing_the_agent_stage(

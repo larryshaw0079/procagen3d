@@ -72,6 +72,12 @@ def test_workspace_copies_inputs_and_records_provenance(tmp_path: Path) -> None:
     assert manifest["inputs"]["glb"]["sha256"] == hashlib.sha256(b"glb-data").hexdigest()
     assert manifest["reconstruction_mode"] == "procedural"
     assert manifest["granularity"] == "medium"
+    assert manifest["quality_profile"] == {
+        "surface_fidelity": "off",
+        "detail_richness": "standard",
+        "material_fidelity": "faithful",
+        "structural_coherence": "coherent",
+    }
     assert workspace.trajectory_dir(3).name == "iter_03"
 
     with pytest.raises(FileExistsError):
@@ -104,6 +110,37 @@ def test_workspace_records_glb_ref_mode(tmp_path: Path) -> None:
 
     assert workspace.manifest()["reconstruction_mode"] == "glb-ref"
     assert workspace.manifest()["granularity"] == "fine"
+    assert workspace.manifest()["quality_profile"] == {
+        "surface_fidelity": "balanced",
+        "detail_richness": "rich",
+        "material_fidelity": "faithful",
+        "structural_coherence": "coherent",
+    }
+
+
+def test_workspace_records_partial_quality_override(tmp_path: Path) -> None:
+    image = tmp_path / "image.png"
+    glb = tmp_path / "model.glb"
+    image.write_bytes(b"image")
+    glb.write_bytes(b"glb")
+
+    workspace = Workspace.create(
+        base=tmp_path / "outputs",
+        slug="strict-color",
+        image=image,
+        glb=glb,
+        prompt="",
+        backend="codex",
+        granularity="fine",
+        quality_profile={"material_fidelity": "strict"},
+    )
+
+    assert workspace.manifest()["quality_profile"] == {
+        "surface_fidelity": "balanced",
+        "detail_richness": "rich",
+        "material_fidelity": "strict",
+        "structural_coherence": "coherent",
+    }
 
 
 def test_workspace_locate_by_slug_and_update_manifest(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ GLB_VERSION = 2
 JSON_CHUNK = 0x4E4F534A
 BIN_CHUNK = 0x004E4942
 MAX_DECODED_POSITION_COUNT = 2_000_000
+GLTF_DEFAULT_BASE_COLOR_FACTOR = (1.0, 1.0, 1.0, 1.0)
 
 _COMPONENTS: dict[int, tuple[str, int]] = {
     5120: ("b", 1),   # BYTE
@@ -758,6 +759,183 @@ def _semantic_assessment(
     }
 
 
+def _unit_interval(value: Any, *, label: str, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GLBProbeError(f"{label} must be a number between 0 and 1")
+    converted = float(value)
+    if not math.isfinite(converted) or not 0.0 <= converted <= 1.0:
+        raise GLBProbeError(f"{label} must be a finite number between 0 and 1")
+    return converted
+
+
+def _base_color_factor(value: Any, *, label: str) -> list[float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != 4:
+        raise GLBProbeError(f"{label} must contain four numbers between 0 and 1")
+    converted = [
+        _unit_interval(component, label=f"{label}[{index}]", default=1.0)
+        for index, component in enumerate(value)
+    ]
+    return converted
+
+
+def _base_color_texture(
+    value: Any,
+    *,
+    material_index: int,
+    textures: Sequence[Any],
+) -> dict[str, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise GLBProbeError(
+            f"material {material_index} pbrMetallicRoughness.baseColorTexture must be an object"
+        )
+    texture_index = value.get("index")
+    if isinstance(texture_index, bool) or not isinstance(texture_index, int):
+        raise GLBProbeError(
+            f"material {material_index} pbrMetallicRoughness.baseColorTexture "
+            "must contain an integer index"
+        )
+    _record_at(textures, texture_index, "texture")
+    tex_coord = value.get("texCoord", 0)
+    if isinstance(tex_coord, bool) or not isinstance(tex_coord, int) or tex_coord < 0:
+        raise GLBProbeError(
+            f"material {material_index} pbrMetallicRoughness.baseColorTexture "
+            "texCoord must be a non-negative integer"
+        )
+    return {"index": texture_index, "tex_coord": tex_coord}
+
+
+def _material_records(
+    materials: Sequence[Any],
+    textures: Sequence[Any],
+    primitive_usage: Sequence[int],
+    vertex_color_usage: Sequence[int],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for index in range(len(materials)):
+        material = _record_at(materials, index, "material")
+        pbr_value = material.get("pbrMetallicRoughness")
+        if pbr_value is None:
+            pbr: dict[str, Any] = {}
+        elif isinstance(pbr_value, dict):
+            pbr = pbr_value
+        else:
+            raise GLBProbeError(
+                f"material {index} pbrMetallicRoughness must be an object"
+            )
+        factor = _base_color_factor(
+            pbr.get("baseColorFactor"),
+            label=f"material {index} pbrMetallicRoughness.baseColorFactor",
+        )
+        texture = _base_color_texture(
+            pbr.get("baseColorTexture"),
+            material_index=index,
+            textures=textures,
+        )
+        usage_count = primitive_usage[index]
+        vertex_color_count = vertex_color_usage[index]
+        default_white_count = (
+            usage_count - vertex_color_count
+            if factor is None and texture is None
+            else 0
+        )
+        records.append(
+            {
+                "index": index,
+                "name": material.get("name"),
+                "alpha_mode": material.get("alphaMode", "OPAQUE"),
+                "double_sided": bool(material.get("doubleSided", False)),
+                "base_color_factor": factor,
+                "effective_base_color_factor": factor
+                if factor is not None
+                else list(GLTF_DEFAULT_BASE_COLOR_FACTOR),
+                "base_color_factor_source": "declared"
+                if factor is not None
+                else "glTF-default",
+                "base_color_texture": texture,
+                "metallic_factor": _unit_interval(
+                    pbr.get("metallicFactor"),
+                    label=f"material {index} pbrMetallicRoughness.metallicFactor",
+                    default=1.0,
+                ),
+                "roughness_factor": _unit_interval(
+                    pbr.get("roughnessFactor"),
+                    label=f"material {index} pbrMetallicRoughness.roughnessFactor",
+                    default=1.0,
+                ),
+                "primitive_usage_count": usage_count,
+                "vertex_color_primitive_usage_count": vertex_color_count,
+                "default_white_primitive_usage_count": default_white_count,
+                "default_white_risk": default_white_count > 0,
+            }
+        )
+    return records
+
+
+def _material_diagnostics(
+    material_records: Sequence[dict[str, Any]],
+    *,
+    primitive_count: int,
+    primitives_without_material: int,
+    materialless_vertex_color_primitives: int,
+) -> dict[str, Any]:
+    palette: dict[tuple[float, ...], dict[str, Any]] = {}
+    for record in material_records:
+        factor = record["base_color_factor"]
+        if factor is None or not record["primitive_usage_count"]:
+            continue
+        key = tuple(float(component) for component in factor)
+        entry = palette.setdefault(
+            key,
+            {
+                "base_color_factor": list(key),
+                "material_indices": [],
+                "primitive_usage_count": 0,
+            },
+        )
+        entry["material_indices"].append(record["index"])
+        entry["primitive_usage_count"] += record["primitive_usage_count"]
+
+    materialless_default_white = (
+        primitives_without_material - materialless_vertex_color_primitives
+    )
+    material_default_white = sum(
+        int(record["default_white_primitive_usage_count"])
+        for record in material_records
+    )
+    default_white_count = material_default_white + materialless_default_white
+    used_records = [record for record in material_records if record["primitive_usage_count"]]
+    return {
+        "used_material_count": len(used_records),
+        "unused_material_count": len(material_records) - len(used_records),
+        "primitive_count_with_material": primitive_count - primitives_without_material,
+        "primitive_count_without_material": primitives_without_material,
+        "primitive_count_with_vertex_color": sum(
+            int(record["vertex_color_primitive_usage_count"])
+            for record in material_records
+        )
+        + materialless_vertex_color_primitives,
+        "used_material_count_with_base_color_factor": sum(
+            record["base_color_factor"] is not None for record in used_records
+        ),
+        "used_material_count_with_base_color_texture": sum(
+            record["base_color_texture"] is not None for record in used_records
+        ),
+        "default_white_risk": default_white_count > 0,
+        "default_white_material_indices": [
+            record["index"] for record in used_records if record["default_white_risk"]
+        ],
+        "primitive_count_at_default_white_risk": default_white_count,
+        "materialless_primitive_count_at_default_white_risk": materialless_default_white,
+        "declared_base_color_palette": [palette[key] for key in sorted(palette)],
+    }
+
+
 def probe_glb(path: Path) -> dict[str, Any]:
     """Return a deterministic, JSON-serialisable GLB evidence report."""
 
@@ -843,6 +1021,10 @@ def probe_glb(path: Path) -> dict[str, Any]:
     primitives_with_normals = 0
     drawable_names: list[str] = []
     used_materials: set[int] = set()
+    material_primitive_usage = [0] * len(materials)
+    material_vertex_color_usage = [0] * len(materials)
+    primitives_without_material = 0
+    materialless_vertex_color_primitives = 0
     for mesh_index, mesh_value in enumerate(meshes):
         mesh = _record_at(meshes, mesh_index, "mesh")
         primitives = mesh.get("primitives", [])
@@ -867,6 +1049,7 @@ def probe_glb(path: Path) -> dict[str, Any]:
                 )
             position_index = attributes.get("POSITION")
             material_index = primitive.get("material")
+            has_vertex_color = "COLOR_0" in attributes
             if material_index is not None:
                 material_index = int(material_index)
                 if not 0 <= material_index < len(materials):
@@ -875,6 +1058,13 @@ def probe_glb(path: Path) -> dict[str, Any]:
                         f"missing material {material_index}"
                     )
                 used_materials.add(material_index)
+                material_primitive_usage[material_index] += 1
+                if has_vertex_color:
+                    material_vertex_color_usage[material_index] += 1
+            else:
+                primitives_without_material += 1
+                if has_vertex_color:
+                    materialless_vertex_color_primitives += 1
             position_bounds: dict[str, Any] | None = None
             vertex_count = 0
             if position_index is None:
@@ -939,6 +1129,26 @@ def probe_glb(path: Path) -> dict[str, Any]:
         if merged is not None:
             mesh_record["bounds"] = merged
         mesh_records.append(mesh_record)
+
+    material_records = _material_records(
+        materials,
+        textures,
+        material_primitive_usage,
+        material_vertex_color_usage,
+    )
+    material_diagnostics = _material_diagnostics(
+        material_records,
+        primitive_count=primitive_count,
+        primitives_without_material=primitives_without_material,
+        materialless_vertex_color_primitives=materialless_vertex_color_primitives,
+    )
+    default_white_count = material_diagnostics["primitive_count_at_default_white_risk"]
+    if default_white_count:
+        warnings.append(
+            f"{default_white_count} of {primitive_count} primitives can render with glTF's "
+            "implicit white base color; verify this is intentional or bake/convert unsupported "
+            "Blender shader graphs before export"
+        )
 
     if primitive_count and primitives_with_normals < primitive_count:
         warnings.append(
@@ -1094,19 +1304,8 @@ def probe_glb(path: Path) -> dict[str, Any]:
         "nodes": node_records,
         "instances": instances,
         "meshes": mesh_records,
-        "materials": [
-            {
-                "index": index,
-                "name": material.get("name") if isinstance(material, dict) else None,
-                "alpha_mode": material.get("alphaMode", "OPAQUE")
-                if isinstance(material, dict)
-                else None,
-                "double_sided": bool(material.get("doubleSided", False))
-                if isinstance(material, dict)
-                else False,
-            }
-            for index, material in enumerate(materials)
-        ],
+        "materials": material_records,
+        "material_diagnostics": material_diagnostics,
         "images": [
             {
                 "index": index,

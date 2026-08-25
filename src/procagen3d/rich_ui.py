@@ -137,6 +137,20 @@ def print_workspace_summary(
         table.add_row("Fidelity", f"{float(report['score']):.4f}")
     if report.get("granularity") is not None:
         table.add_row("Granularity", str(report["granularity"]))
+    quality_profile = report.get("quality_profile")
+    if isinstance(quality_profile, dict):
+        table.add_row(
+            "Quality",
+            "/".join(
+                str(quality_profile.get(name, "?"))
+                for name in (
+                    "surface_fidelity",
+                    "detail_richness",
+                    "material_fidelity",
+                    "structural_coherence",
+                )
+            ),
+        )
     deliverables = report.get("deliverables")
     if deliverables:
         table.add_row("Blender source", str(workspace / str(deliverables["program"])))
@@ -164,10 +178,14 @@ def print_comparison(console: Console, report: dict[str, Any]) -> None:
         ("Silhouette IoU", summary.get("mean_silhouette_iou")),
         ("Area", summary.get("mean_area_similarity")),
         ("Spatial RGB", summary.get("mean_spatial_rgb_similarity")),
+        ("Palette", summary.get("mean_palette_similarity")),
         ("Dimensions", summary.get("dimension_similarity")),
         ("Center", summary.get("center_similarity")),
         ("Surface mean ↓", summary.get("mean_surface_distance")),
         ("Surface p95 ↓", summary.get("p95_surface_distance")),
+        ("Normal angle ↓", summary.get("mean_normal_angle_degrees")),
+        ("Visible coverage", summary.get("visible_surface_coverage")),
+        ("Surface area ratio", summary.get("surface_area_ratio")),
     )
     for name, value in rows:
         table.add_row(name, f"{float(value):.4f}" if isinstance(value, (int, float)) else "—")

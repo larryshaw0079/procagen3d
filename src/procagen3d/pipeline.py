@@ -10,22 +10,34 @@ import shutil
 import struct
 import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from .backends import CLIBackend, create_backend
 from .blender import BlenderError, BlenderRuntime, require_success
 from .glb_probe import probe_glb
-from .granularity import (
-    DEFAULT_GRANULARITY,
-    get_granularity_profile,
-    validate_granularity,
+from .granularity import DEFAULT_GRANULARITY, validate_granularity
+from .metrics import (
+    DetailGateThresholds,
+    FidelityGateThresholds,
+    MaterialGateThresholds,
+    StructuralGateThresholds,
+    SurfaceGateThresholds,
+    compare_workspace,
+    mask_metrics,
 )
-from .metrics import SurfaceGateThresholds, compare_workspace, mask_metrics
 from .plan_schema import PlanSchemaError, validate_plan_document
 from .progress import ProgressReporter, emit_progress, progress_step
 from .prompts import initial_prompt, repair_prompt
+from .quality import (
+    DETAIL_QUALITY_SETTINGS,
+    MATERIAL_QUALITY_SETTINGS,
+    STRUCTURAL_QUALITY_SETTINGS,
+    SURFACE_QUALITY_SETTINGS,
+    QualityProfile,
+    resolve_quality_profile,
+)
 from .reconstruction import DEFAULT_RECONSTRUCTION_MODE, validate_reconstruction_mode
 from .source_guard import SourceGuardError, assert_safe_source
 from .workspace import Workspace, sha256, write_json
@@ -33,6 +45,14 @@ from .workspace import Workspace, sha256, write_json
 
 class PipelineError(RuntimeError):
     """A recoverable stage failure that prevents a valid deliverable."""
+
+
+class _AgentInvocationError(PipelineError):
+    """An agent failure carrying its bounded run-report summary."""
+
+    def __init__(self, message: str, *, run: dict[str, Any]):
+        super().__init__(message)
+        self.run = run
 
 
 @dataclass(frozen=True)
@@ -47,6 +67,11 @@ class PipelineConfig:
     render_size: int = 256
     llm_timeout_s: int = 1800
     blender_timeout_s: int = 900
+    max_initial_agent_retries: int = 1
+    surface_fidelity: str | None = None
+    detail_richness: str | None = None
+    material_fidelity: str | None = None
+    structural_coherence: str | None = None
 
 
 CANONICAL_VIEWS = ("front", "back", "left", "right", "top", "iso")
@@ -86,6 +111,12 @@ def _complete_evidence(root: Path, *, render_size: int) -> bool:
         root / "camera_contract.json",
         root / "reference_views" / "masks.json",
         *(root / "reference_views" / f"{name}.png" for name in CANONICAL_VIEWS),
+        root / "reference_views" / "diagnostics" / "manifest.json",
+        *(
+            root / "reference_views" / "diagnostics" / kind / f"{name}.png"
+            for kind in ("depth", "normal", "object_id")
+            for name in CANONICAL_VIEWS
+        ),
     ]
     if not all(not path.is_symlink() and path.is_file() for path in expected):
         return False
@@ -94,7 +125,15 @@ def _complete_evidence(root: Path, *, render_size: int) -> bool:
         scene = json.loads((root / "reference_scene.json").read_text(encoding="utf-8"))
         camera = json.loads((root / "camera_contract.json").read_text(encoding="utf-8"))
         masks = json.loads((root / "reference_views" / "masks.json").read_text(encoding="utf-8"))
-        if not all(isinstance(value, dict) for value in (glb_report, scene, camera, masks)):
+        diagnostics = json.loads(
+            (root / "reference_views" / "diagnostics" / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        if not all(
+            isinstance(value, dict)
+            for value in (glb_report, scene, camera, masks, diagnostics)
+        ):
             return False
         if not glb_report.get("self_contained") or glb_report.get("reference_readiness") != "pass":
             return False
@@ -154,6 +193,13 @@ def _complete_evidence(root: Path, *, render_size: int) -> bool:
                     return False
         if set(mask_views) != set(CANONICAL_VIEWS):
             return False
+        diagnostic_views = diagnostics.get("views")
+        if diagnostics.get("schema_version") != 1 or not isinstance(
+            diagnostic_views, dict
+        ):
+            return False
+        if set(diagnostic_views) != set(CANONICAL_VIEWS):
+            return False
         for name in CANONICAL_VIEWS:
             record = mask_views[name]
             if not isinstance(record, dict):
@@ -169,6 +215,24 @@ def _complete_evidence(root: Path, *, render_size: int) -> bool:
                 or struct.unpack(">II", header[16:24]) != (render_size, render_size)
             ):
                 return False
+            diagnostic_record = diagnostic_views[name]
+            if not isinstance(diagnostic_record, dict):
+                return False
+            for kind in ("depth", "normal", "object_id"):
+                expected_relative = f"diagnostics/{kind}/{name}.png"
+                if diagnostic_record.get(kind) != expected_relative:
+                    return False
+                diagnostic_header = (
+                    root / "reference_views" / expected_relative
+                ).read_bytes()[:24]
+                if (
+                    len(diagnostic_header) != 24
+                    or diagnostic_header[:8] != b"\x89PNG\r\n\x1a\n"
+                    or diagnostic_header[12:16] != b"IHDR"
+                    or struct.unpack(">II", diagnostic_header[16:24])
+                    != (render_size, render_size)
+                ):
+                    return False
         return True
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, struct.error):
         return False
@@ -368,8 +432,27 @@ def _source_snapshot(path: Path, *, label: str) -> bytes:
 def _agent_images(root: Path, *, image_relative: Path, include_candidate: bool) -> tuple[Path, ...]:
     paths = [root / image_relative]
     paths.extend(root / "evidence" / "reference_views" / f"{name}.png" for name in CANONICAL_VIEWS)
+    paths.extend(
+        root
+        / "evidence"
+        / "reference_views"
+        / "diagnostics"
+        / kind
+        / f"{name}.png"
+        for kind in ("depth", "normal", "object_id")
+        for name in CANONICAL_VIEWS
+    )
     if include_candidate:
         paths.extend(root / "artifacts" / "renders" / f"{name}.png" for name in CANONICAL_VIEWS)
+        paths.extend(
+            root / "artifacts" / "renders" / "diagnostics" / kind / f"{name}.png"
+            for kind in ("depth", "normal", "object_id")
+            for name in CANONICAL_VIEWS
+        )
+        paths.extend(
+            root / "artifacts" / "surface_residuals" / f"{name}.png"
+            for name in CANONICAL_VIEWS
+        )
     return tuple(path for path in paths if path.is_file())
 
 
@@ -386,10 +469,141 @@ def _copy_agent_transcript(result: Any, destination: Path) -> None:
             shutil.copy2(source, destination / source.name)
 
 
+def _agent_run_payload(
+    result: Any,
+    *,
+    files_modified: list[str] | None = None,
+    salvaged: bool = False,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Keep report metadata bounded while full provider evidence stays in trajectory files."""
+
+    return {
+        "backend": getattr(result, "backend", None),
+        "model": getattr(result, "model", None),
+        "duration_s": getattr(result, "duration_s", None),
+        "usage": getattr(result, "usage", {}) or {},
+        "files_modified": files_modified or [],
+        "provider_success": bool(getattr(result, "ok", False)),
+        "exit_reason": getattr(result, "exit_reason", None),
+        "timed_out": bool(getattr(result, "timed_out", False)),
+        "returncode": getattr(result, "returncode", None),
+        "salvaged": salvaged,
+        **({"error": error} if error else {}),
+    }
+
+
+def _retain_bounded_agent_source(staged_src: Path, trajectory: Path) -> None:
+    """Retain regular source candidates for review without trusting or promoting them."""
+
+    for source, label, destination in (
+        (
+            staged_src / "program.py",
+            "agent src/program.py",
+            trajectory / "rejected_program.py",
+        ),
+        (
+            staged_src / "plan.json",
+            "agent src/plan.json",
+            trajectory / "rejected_plan.json",
+        ),
+    ):
+        try:
+            candidate_value = _source_snapshot(source, label=label)
+        except PipelineError:
+            continue
+        destination.write_bytes(candidate_value)
+
+
+def _annotated_agent_run(
+    value: dict[str, Any],
+    *,
+    iteration: int,
+    phase: str,
+) -> dict[str, Any]:
+    run = dict(value)
+    run.setdefault("iteration", iteration)
+    run.setdefault("phase", phase)
+    return run
+
+
+def _failed_agent_run(
+    exc: PipelineError,
+    *,
+    iteration: int,
+    phase: str,
+) -> dict[str, Any]:
+    if isinstance(exc, _AgentInvocationError):
+        value = exc.run
+    else:
+        value = {
+            "provider_success": False,
+            "salvaged": False,
+            "error": str(exc),
+        }
+    return _annotated_agent_run(value, iteration=iteration, phase=phase)
+
+
 def _write_bytes_atomic(path: Path, value: bytes) -> None:
     temporary = path.with_suffix(path.suffix + ".restore-tmp")
     temporary.write_bytes(value)
     temporary.replace(path)
+
+
+def _comparison_quality(comparison: dict[str, Any], *, attempt: int) -> tuple[Any, ...]:
+    """Return a deterministic higher-is-better key for candidate retention."""
+
+    raw_score = comparison.get("score")
+    score = (
+        float(raw_score)
+        if isinstance(raw_score, (int, float))
+        and not isinstance(raw_score, bool)
+        and math.isfinite(raw_score)
+        else float("-inf")
+    )
+    hard_gates = comparison.get("hard_gates")
+    hard_passed = bool(hard_gates.get("passed")) if isinstance(hard_gates, dict) else False
+    failures = hard_gates.get("failures") if isinstance(hard_gates, dict) else None
+    failure_count = len(failures) if isinstance(failures, list) else 0
+    # Non-compensating gate state outranks the aggregate score. An earlier
+    # build attempt makes otherwise equal selection stable across platforms.
+    return (
+        bool(comparison.get("passed")),
+        hard_passed,
+        -failure_count,
+        score,
+        -attempt,
+    )
+
+
+def _comparison_failure(comparison: dict[str, Any], *, min_score: float) -> str | None:
+    if comparison.get("passed"):
+        return None
+    hard_gate_failures = comparison.get("hard_gates", {}).get("failures", [])
+    failed_names = [
+        str(item.get("gate"))
+        for item in hard_gate_failures
+        if isinstance(item, dict) and item.get("gate")
+    ]
+    failure_parts: list[str] = []
+    if not bool(comparison.get("score_passed", comparison.get("passed"))):
+        failure_parts.append(
+            f"aggregate score {float(comparison['score']):.4f} below {min_score:.4f}"
+        )
+    if failed_names:
+        failure_parts.append("hard gates failed: " + ", ".join(failed_names))
+    return "; ".join(failure_parts) or "fidelity acceptance failed"
+
+
+def _snapshot_directory(source: Path, destination: Path) -> None:
+    """Replace a private best-candidate snapshot with a complete directory copy."""
+
+    staged = destination.parent / f".{destination.name}.stage-{uuid.uuid4().hex}"
+    shutil.copytree(source, staged)
+    if destination.exists():
+        _replace_directory(staged, destination)
+    else:
+        staged.replace(destination)
 
 
 def _matching_source_iteration(workspace: Workspace) -> int | None:
@@ -564,15 +778,17 @@ def _invoke_agent(
                 **run_arguments,
             )
             _copy_agent_transcript(result, trajectory)
+            provider_failure: str | None = None
             if not result.ok:
                 detail = (
-                    result.error
-                    or result.stderr[-2000:]
-                    or result.final_message
-                    or result.exit_reason
+                    getattr(result, "error", None)
+                    or getattr(result, "stderr", "")[-2000:]
+                    or getattr(result, "final_message", "")
+                    or getattr(result, "exit_reason", "error")
                 )
-                raise PipelineError(
-                    f"{backend_name} agent failed ({result.exit_reason}): {detail}"
+                provider_failure = (
+                    f"{backend_name} agent failed "
+                    f"({getattr(result, 'exit_reason', 'error')}): {detail}"
                 )
             staged_src = agent_root / "src"
             try:
@@ -584,13 +800,17 @@ def _invoke_agent(
                 or staged_src.is_symlink()
                 or not staged_src.is_dir()
             ):
-                raise PipelineError(
+                message = (
                     "agent src/ must remain a regular, non-symlink directory "
                     "inside the disposable workspace"
                 )
+                raise _AgentInvocationError(
+                    message,
+                    run=_agent_run_payload(result, error=message),
+                )
             changed_relative: list[str] = []
             unauthorized: list[str] = []
-            for path in result.files_modified:
+            for path in getattr(result, "files_modified", ()):
                 try:
                     candidate = Path(path).expanduser()
                     if not candidate.is_absolute():
@@ -608,30 +828,42 @@ def _invoke_agent(
             if unauthorized:
                 # Keep bounded, regular candidates for forensic review after an
                 # expensive rejected run, but never promote them into src/.
-                for source, label, destination in (
-                    (
-                        staged_program,
-                        "agent src/program.py",
-                        trajectory / "rejected_program.py",
+                _retain_bounded_agent_source(staged_src, trajectory)
+                message = "agent changed files outside src/: " + ", ".join(unauthorized)
+                raise _AgentInvocationError(
+                    message,
+                    run=_agent_run_payload(
+                        result,
+                        files_modified=changed_relative,
+                        error=message,
                     ),
-                    (
-                        staged_plan,
-                        "agent src/plan.json",
-                        trajectory / "rejected_plan.json",
-                    ),
-                ):
-                    try:
-                        candidate_value = _source_snapshot(source, label=label)
-                    except PipelineError:
-                        continue
-                    destination.write_bytes(candidate_value)
-                raise PipelineError(
-                    "agent changed files outside src/: " + ", ".join(unauthorized)
                 )
             # Snapshot both required deliverables before any source promotion.
-            # The plan and AST contracts are checked in source-guard.
-            program_value = _source_snapshot(staged_program, label="agent src/program.py")
-            plan_value = _source_snapshot(staged_plan, label="agent src/plan.json")
+            try:
+                program_value = _source_snapshot(
+                    staged_program,
+                    label="agent src/program.py",
+                )
+                plan_value = _source_snapshot(staged_plan, label="agent src/plan.json")
+                if provider_failure is not None:
+                    # A provider timeout/non-success may still leave a complete
+                    # source pair. Salvage only after the same host-owned schema
+                    # and AST safety checks used before Blender execution.
+                    _validate_plan(staged_plan)
+                    _guard_program(staged_program)
+            except PipelineError as exc:
+                _retain_bounded_agent_source(staged_src, trajectory)
+                message = str(exc)
+                if provider_failure is not None:
+                    message = f"{provider_failure}; source salvage rejected: {message}"
+                raise _AgentInvocationError(
+                    message,
+                    run=_agent_run_payload(
+                        result,
+                        files_modified=changed_relative,
+                        error=message,
+                    ),
+                ) from exc
             # Preserve the exact reviewed candidates before committing them to src/.
             # A trajectory-write failure must not leave source changed while the
             # invocation reports an error.
@@ -645,18 +877,25 @@ def _invoke_agent(
                 (promoted_src / "program.py").write_bytes(program_value)
                 (promoted_src / "plan.json").write_bytes(plan_value)
                 _replace_directory(promoted_src, workspace.src_dir)
-            payload = {
-                "backend": result.backend,
-                "model": result.model,
-                "duration_s": result.duration_s,
-                "usage": result.usage,
-                "files_modified": changed_relative,
-            }
-            stage.complete(
-                f"{backend_name} produced plan.json and program.py",
-                model=result.model,
+            salvaged = provider_failure is not None
+            payload = _agent_run_payload(
+                result,
                 files_modified=changed_relative,
-                provider_duration_s=result.duration_s,
+                salvaged=salvaged,
+                error=provider_failure,
+            )
+            stage.complete(
+                (
+                    f"{backend_name} timed out/failed after producing valid source; "
+                    "salvaged plan.json and program.py"
+                    if salvaged
+                    else f"{backend_name} produced plan.json and program.py"
+                ),
+                kind="warning" if salvaged else "success",
+                model=getattr(result, "model", None),
+                files_modified=changed_relative,
+                provider_duration_s=getattr(result, "duration_s", None),
+                salvaged=salvaged,
             )
     return payload
 
@@ -668,6 +907,7 @@ def build_workspace(
     min_score: float = 0.35,
     reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE,
     granularity: str = DEFAULT_GRANULARITY,
+    quality_profile: QualityProfile | None = None,
     timeout_s: int = 900,
     trajectory_dir: Path | None = None,
     progress: ProgressReporter | None = None,
@@ -678,12 +918,13 @@ def build_workspace(
         raise ValueError("min_score must be between 0 and 1")
     reconstruction_mode = validate_reconstruction_mode(reconstruction_mode)
     granularity = validate_granularity(granularity)
-    granularity_profile = get_granularity_profile(granularity)
+    quality_profile = quality_profile or resolve_quality_profile(granularity)
+    surface_settings = SURFACE_QUALITY_SETTINGS[quality_profile.surface_fidelity]
     if timeout_s <= 0:
         raise ValueError("Blender timeout must be greater than zero")
     reference_snapshot: bytes | None = None
     reference_digest: str | None = None
-    if reconstruction_mode == "glb-ref" or granularity_profile.surface_evaluation_enabled:
+    if reconstruction_mode == "glb-ref" or surface_settings.enabled:
         reference_snapshot, reference_digest = _verified_glb_snapshot(workspace)
     source_trajectory: Path | None = None
     with progress_step(
@@ -734,6 +975,12 @@ def build_workspace(
                     "src/plan.json granularity must match the build granularity: "
                     f"expected {granularity!r}, found "
                     f"{validated_plan.get('granularity')!r}"
+                )
+            if validated_plan.get("quality_profile") != quality_profile.as_dict():
+                raise PipelineError(
+                    "src/plan.json quality_profile must match the resolved build profile: "
+                    f"expected {quality_profile.as_dict()!r}, found "
+                    f"{validated_plan.get('quality_profile')!r}"
                 )
             _guard_program(staged_program)
             stage.complete("Plan schema and Blender source guard passed")
@@ -836,7 +1083,7 @@ def build_workspace(
                 blender_duration_s=getattr(compiled_result, "duration_s", None),
             )
         surface_comparison_path: Path | None = None
-        if granularity_profile.surface_evaluation_enabled:
+        if surface_settings.enabled:
             surface_comparison_path = staged_artifacts / "surface_comparison.json"
             with progress_step(
                 progress,
@@ -853,7 +1100,7 @@ def build_workspace(
                         "--output",
                         surface_comparison_path,
                         "--samples",
-                        str(granularity_profile.surface_sample_budget),
+                        str(surface_settings.sample_budget),
                     ],
                     cwd=clean_root,
                     timeout_s=timeout_s,
@@ -885,6 +1132,7 @@ def build_workspace(
                     raise PipelineError("surface_comparison.json must contain an object")
                 surface_report.update(
                     granularity=granularity,
+                    quality_profile=quality_profile.as_dict(),
                     reference="inputs/reference.glb",
                     candidate="artifacts/model.glb",
                 )
@@ -946,6 +1194,7 @@ def build_workspace(
                     "clean_room": True,
                     "reconstruction_mode": reconstruction_mode,
                     "granularity": granularity,
+                    "quality_profile": quality_profile.as_dict(),
                     "program_is_standalone_replay_source": (
                         reconstruction_mode == "procedural"
                     ),
@@ -959,14 +1208,14 @@ def build_workspace(
                     ),
                     "reference_glb_sha256": reference_digest,
                     "reference_glb_used_for_surface_evaluation": (
-                        granularity_profile.surface_evaluation_enabled
+                        surface_settings.enabled
                     ),
                     "reference_contract": (
                         "host-imported-normalized-source; originals removed before export"
                         if reconstruction_mode == "glb-ref"
                         else (
                             "measurement-and-host-surface-evaluation-evidence-only"
-                            if granularity_profile.surface_evaluation_enabled
+                            if surface_settings.enabled
                             else "measurement-evidence-only"
                         )
                     ),
@@ -975,16 +1224,27 @@ def build_workspace(
                         {
                             "report": "artifacts/surface_comparison.json",
                             "samples_per_direction": (
-                                granularity_profile.surface_sample_budget
+                                surface_settings.sample_budget
                             ),
                             "max_mean_distance": (
-                                granularity_profile.max_mean_surface_distance
+                                surface_settings.max_mean_distance
                             ),
                             "max_p95_distance": (
-                                granularity_profile.max_p95_surface_distance
+                                surface_settings.max_p95_distance
                             ),
+                            "max_mean_normal_angle_degrees": (
+                                surface_settings.max_mean_normal_angle_degrees
+                            ),
+                            "min_visible_coverage": (
+                                surface_settings.min_visible_coverage
+                            ),
+                            "surface_area_ratio_range": [
+                                surface_settings.min_surface_area_ratio,
+                                surface_settings.max_surface_area_ratio,
+                            ],
+                            "residual_artifacts": "artifacts/surface_residuals",
                         }
-                        if granularity_profile.surface_evaluation_enabled
+                        if surface_settings.enabled
                         else None
                     ),
                 },
@@ -1026,20 +1286,29 @@ def build_workspace(
         with progress_step(
             progress,
             "fidelity",
-            "Scoring renders, dimensions, centering, and configured surface gates",
+            "Scoring color, detail, surface, material, and structural hard gates",
         ) as stage:
             surface_thresholds = None
-            if granularity_profile.surface_evaluation_enabled:
-                assert granularity_profile.max_mean_surface_distance is not None
-                assert granularity_profile.max_p95_surface_distance is not None
+            if surface_settings.enabled:
+                assert surface_settings.max_mean_distance is not None
+                assert surface_settings.max_p95_distance is not None
                 surface_thresholds = SurfaceGateThresholds(
-                    max_mean_surface_distance=(
-                        granularity_profile.max_mean_surface_distance
+                    max_mean_surface_distance=surface_settings.max_mean_distance,
+                    max_p95_surface_distance=surface_settings.max_p95_distance,
+                    max_mean_normal_angle_degrees=(
+                        surface_settings.max_mean_normal_angle_degrees
                     ),
-                    max_p95_surface_distance=(
-                        granularity_profile.max_p95_surface_distance
-                    ),
+                    min_visible_coverage=surface_settings.min_visible_coverage,
+                    min_surface_area_ratio=surface_settings.min_surface_area_ratio,
+                    max_surface_area_ratio=surface_settings.max_surface_area_ratio,
                 )
+            material_settings = MATERIAL_QUALITY_SETTINGS[
+                quality_profile.material_fidelity
+            ]
+            detail_settings = DETAIL_QUALITY_SETTINGS[quality_profile.detail_richness]
+            structural_settings = STRUCTURAL_QUALITY_SETTINGS[
+                quality_profile.structural_coherence
+            ]
             comparison = compare_workspace(
                 reference_masks=workspace.evidence_dir / "reference_views" / "masks.json",
                 candidate_masks=staged_artifacts / "renders" / "masks.json",
@@ -1047,10 +1316,33 @@ def build_workspace(
                 candidate_scene=staged_artifacts / "scene_report.json",
                 output=staged_artifacts / "comparison.json",
                 min_score=min_score,
+                gate_thresholds=FidelityGateThresholds(
+                    min_mean_spatial_rgb_similarity=(
+                        material_settings.min_spatial_rgb_similarity
+                    ),
+                    min_mean_palette_similarity=(
+                        material_settings.min_palette_similarity
+                    ),
+                ),
                 surface_comparison=surface_comparison_path,
                 surface_gate_thresholds=surface_thresholds,
+                reference_probe=workspace.evidence_dir / "glb_probe.json",
+                candidate_probe=staged_artifacts / "model_probe.json",
+                plan=staged_plan,
+                material_gate_thresholds=MaterialGateThresholds(
+                    max_default_white_primitive_fraction=(
+                        material_settings.max_default_white_primitive_fraction
+                    )
+                ),
+                detail_gate_thresholds=DetailGateThresholds(
+                    **asdict(detail_settings)
+                ),
+                structural_gate_thresholds=StructuralGateThresholds(
+                    **asdict(structural_settings)
+                ),
             )
             comparison["granularity"] = granularity
+            comparison["quality_profile"] = quality_profile.as_dict()
             write_json(staged_artifacts / "comparison.json", comparison)
             if (
                 _source_snapshot(workspace.program_path, label="src/program.py")
@@ -1083,15 +1375,25 @@ def run_pipeline(
     force_probe: bool = False,
     progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
+    if config.max_initial_agent_retries < 0:
+        raise ValueError("max_initial_agent_retries cannot be negative")
     if config.max_repairs < 0:
         raise ValueError("max_repairs cannot be negative")
     if config.max_fidelity_repairs < 1:
         raise ValueError("max_fidelity_repairs must be at least one")
     reconstruction_mode = validate_reconstruction_mode(config.reconstruction_mode)
     granularity = validate_granularity(config.granularity)
+    quality_profile = resolve_quality_profile(
+        granularity,
+        surface_fidelity=config.surface_fidelity,
+        detail_richness=config.detail_richness,
+        material_fidelity=config.material_fidelity,
+        structural_coherence=config.structural_coherence,
+    )
     workspace.update_manifest(
         reconstruction_mode=reconstruction_mode,
         granularity=granularity,
+        quality_profile=quality_profile.as_dict(),
     )
     if not 0.0 <= config.min_score <= 1.0:
         raise ValueError("min_score must be between 0 and 1")
@@ -1122,6 +1424,7 @@ def run_pipeline(
                 "backend": config.backend,
                 "reconstruction_mode": reconstruction_mode,
                 "granularity": granularity,
+                "quality_profile": quality_profile.as_dict(),
                 "stage": "reference",
                 "agent_runs": [],
                 "build_attempts": [],
@@ -1136,6 +1439,7 @@ def run_pipeline(
             "workspace": str(workspace.root),
             "reconstruction_mode": reconstruction_mode,
             "granularity": granularity,
+            "quality_profile": quality_profile.as_dict(),
             "reference": {
                 "vertices": probe["scene"]["vertex_count"],
                 "triangles": probe["scene"]["triangle_count"],
@@ -1147,6 +1451,7 @@ def run_pipeline(
             status="prepared",
             reconstruction_mode=reconstruction_mode,
             granularity=granularity,
+            quality_profile=quality_profile.as_dict(),
         )
         emit_progress(
             progress,
@@ -1162,54 +1467,103 @@ def run_pipeline(
     build_attempts: list[dict[str, Any]] = []
     next_iteration = workspace.next_trajectory_iteration()
     active_iteration = _matching_source_iteration(workspace)
+    initial_agent_retries_used = 0
+    build_repairs_used = 0
     if not workspace.program_path.is_file() or not workspace.plan_path.is_file():
-        try:
-            run = _invoke_agent(
-                workspace,
-                backend_name=config.backend,
-                prompt=initial_prompt(
-                    root=workspace.root,
-                    image=workspace.image_path,
-                    user_prompt=user_prompt,
-                    reconstruction_mode=reconstruction_mode,
-                    granularity=granularity,
-                ),
-                iteration=next_iteration,
-                timeout_s=config.llm_timeout_s,
-                progress=progress,
+        while True:
+            iteration = next_iteration
+            phase = "initial" if initial_agent_retries_used == 0 else "initial-retry"
+            try:
+                run = _invoke_agent(
+                    workspace,
+                    backend_name=config.backend,
+                    prompt=initial_prompt(
+                        root=workspace.root,
+                        image=workspace.image_path,
+                        user_prompt=user_prompt,
+                        reconstruction_mode=reconstruction_mode,
+                        granularity=granularity,
+                        quality_profile=quality_profile,
+                    ),
+                    iteration=iteration,
+                    timeout_s=config.llm_timeout_s,
+                    progress=progress,
+                )
+            except PipelineError as exc:
+                agent_runs.append(
+                    _failed_agent_run(exc, iteration=iteration, phase=phase)
+                )
+                next_iteration += 1
+                if initial_agent_retries_used < config.max_initial_agent_retries:
+                    initial_agent_retries_used += 1
+                    emit_progress(
+                        progress,
+                        "warning",
+                        "initial-agent",
+                        "Initial agent failed; retrying in a new preserved trajectory",
+                        error=str(exc),
+                        retry=initial_agent_retries_used,
+                        maximum=config.max_initial_agent_retries,
+                    )
+                    continue
+                workspace.update_manifest(status="failed")
+                write_json(
+                    workspace.root / "run_report.json",
+                    {
+                        "schema_version": 1,
+                        "status": "failed",
+                        "workspace": str(workspace.root),
+                        "backend": config.backend,
+                        "reconstruction_mode": reconstruction_mode,
+                        "granularity": granularity,
+                        "quality_profile": quality_profile.as_dict(),
+                        "agent_runs": agent_runs,
+                        "build_attempts": [],
+                        "retry_budget": {
+                            "initial_agent": {
+                                "used": initial_agent_retries_used,
+                                "maximum": config.max_initial_agent_retries,
+                            },
+                            "schema_build": {
+                                "used": 0,
+                                "maximum": config.max_repairs,
+                            },
+                            "post_render": {
+                                "used": 0,
+                                "maximum": config.max_fidelity_repairs,
+                            },
+                        },
+                        "error": str(exc),
+                    },
+                )
+                raise
+            agent_runs.append(
+                _annotated_agent_run(run, iteration=iteration, phase=phase)
             )
-        except PipelineError as exc:
-            workspace.update_manifest(status="failed")
-            write_json(
-                workspace.root / "run_report.json",
-                {
-                    "schema_version": 1,
-                    "status": "failed",
-                    "workspace": str(workspace.root),
-                    "backend": config.backend,
-                    "reconstruction_mode": reconstruction_mode,
-                    "granularity": granularity,
-                    "agent_runs": [],
-                    "build_attempts": [],
-                    "error": str(exc),
-                },
-            )
-            raise
-        agent_runs.append(run)
-        next_iteration += 1
+            next_iteration += 1
+            break
         active_iteration = _matching_source_iteration(workspace)
 
     last_failure: str | None = None
     comparison: dict[str, Any] | None = None
     valid_artifact = False
-    last_valid_program: bytes | None = None
-    last_valid_plan: bytes | None = None
-    last_valid_comparison: dict[str, Any] | None = None
-    build_repairs_used = 0
     fidelity_repairs_used = 0
     build_attempt = 0
     build_phase = "initial"
     maximum_builds = 1 + config.max_repairs + config.max_fidelity_repairs
+    best_snapshot_context = tempfile.TemporaryDirectory(
+        prefix=".procagen3d-best-",
+        dir=workspace.root,
+    )
+    best_artifacts = Path(best_snapshot_context.name) / "artifacts"
+    best_program: bytes | None = None
+    best_plan: bytes | None = None
+    best_comparison: dict[str, Any] | None = None
+    best_quality: tuple[Any, ...] | None = None
+    best_attempt: int | None = None
+    best_iteration: int | None = None
+    latest_valid_attempt: int | None = None
+    improvement_stalled = False
     while True:
         emit_progress(
             progress,
@@ -1227,6 +1581,7 @@ def run_pipeline(
                 min_score=config.min_score,
                 reconstruction_mode=reconstruction_mode,
                 granularity=granularity,
+                quality_profile=quality_profile,
                 timeout_s=config.blender_timeout_s,
                 trajectory_dir=(
                     workspace.root / "trajectories" / f"iter_{active_iteration:02d}"
@@ -1236,14 +1591,15 @@ def run_pipeline(
                 progress=progress,
             )
             valid_artifact = True
-            last_valid_program = workspace.program_path.read_bytes()
-            last_valid_plan = workspace.plan_path.read_bytes()
-            last_valid_comparison = comparison
+            latest_valid_attempt = build_attempt
+            quality = _comparison_quality(comparison, attempt=build_attempt)
+            improved = best_quality is None or quality > best_quality
             built_attempt: dict[str, Any] = {
                 "attempt": build_attempt,
                 "phase": build_phase,
                 "built": True,
                 "comparison": comparison,
+                "improved": improved,
             }
             if active_iteration is not None:
                 archived_glb = (
@@ -1256,31 +1612,37 @@ def run_pipeline(
                     built_attempt["trajectory_glb"] = archived_glb.relative_to(
                         workspace.root
                     ).as_posix()
+            if improved:
+                _snapshot_directory(workspace.artifacts_dir, best_artifacts)
+                best_program = workspace.program_path.read_bytes()
+                best_plan = workspace.plan_path.read_bytes()
+                best_comparison = comparison
+                best_quality = quality
+                best_attempt = build_attempt
+                best_iteration = active_iteration
             build_attempts.append(built_attempt)
-            if comparison["passed"]:
-                last_failure = None
-            else:
-                hard_gate_failures = comparison.get("hard_gates", {}).get("failures", [])
-                failed_names = [
-                    str(item.get("gate"))
-                    for item in hard_gate_failures
-                    if isinstance(item, dict) and item.get("gate")
-                ]
-                score_failure = not bool(comparison.get("score_passed", comparison["passed"]))
-                failure_parts = []
-                if score_failure:
-                    failure_parts.append(
-                        f"aggregate score {comparison['score']:.4f} below {config.min_score:.4f}"
-                    )
-                if failed_names:
-                    failure_parts.append("hard gates failed: " + ", ".join(failed_names))
-                last_failure = "; ".join(failure_parts) or "fidelity acceptance failed"
+            last_failure = _comparison_failure(comparison, min_score=config.min_score)
+            if last_failure:
                 emit_progress(
                     progress,
                     "warning",
                     "build-attempt",
                     last_failure,
                 )
+            if comparison.get("passed"):
+                last_failure = None
+                break
+            if build_phase == "post-render-repair" and not improved:
+                improvement_stalled = True
+                emit_progress(
+                    progress,
+                    "warning",
+                    "build-attempt",
+                    "Post-render repair did not improve the retained candidate; stopping early",
+                    best_attempt=best_attempt,
+                    stalled_attempt=build_attempt,
+                )
+                break
         except (PipelineError, BlenderError, OSError, ValueError) as exc:
             last_failure = str(exc)
             build_attempts.append(
@@ -1305,6 +1667,9 @@ def run_pipeline(
             )
             if build_repairs_used >= config.max_repairs:
                 break
+            repair_iteration = next_iteration
+            next_iteration += 1
+            build_repairs_used += 1
             try:
                 run = _invoke_agent(
                     workspace,
@@ -1314,11 +1679,12 @@ def run_pipeline(
                         user_prompt=user_prompt,
                         failure=last_failure,
                         comparison=comparison,
-                        iteration=next_iteration,
+                        iteration=repair_iteration,
                         reconstruction_mode=reconstruction_mode,
                         granularity=granularity,
+                        quality_profile=quality_profile,
                     ),
-                    iteration=next_iteration,
+                    iteration=repair_iteration,
                     timeout_s=config.llm_timeout_s,
                     include_candidate=valid_artifact,
                     is_repair=True,
@@ -1326,6 +1692,13 @@ def run_pipeline(
                 )
             except PipelineError as repair_exc:
                 last_failure = str(repair_exc)
+                agent_runs.append(
+                    _failed_agent_run(
+                        repair_exc,
+                        iteration=repair_iteration,
+                        phase="schema-build-repair",
+                    )
+                )
                 build_attempts.append(
                     {
                         "attempt": build_attempt,
@@ -1336,20 +1709,26 @@ def run_pipeline(
                     }
                 )
                 break
-            agent_runs.append(run)
-            build_repairs_used += 1
+            agent_runs.append(
+                _annotated_agent_run(
+                    run,
+                    iteration=repair_iteration,
+                    phase="schema-build-repair",
+                )
+            )
             build_attempt += 1
             build_phase = "schema-build-repair"
-            next_iteration += 1
             active_iteration = _matching_source_iteration(workspace)
             continue
 
-        # A successful render (and configured surface evaluation) is the boundary
-        # between the independent retry budgets. The first fidelity repair is
-        # mandatory, even for a passing candidate, so aggregate metrics cannot
-        # short-circuit visual/surface review.
+        # Successful candidates enter an adaptive fidelity loop. Stop on pass,
+        # on the first non-improving valid repair, or when the independent
+        # post-render budget is exhausted.
         if fidelity_repairs_used >= config.max_fidelity_repairs:
             break
+        repair_iteration = next_iteration
+        next_iteration += 1
+        fidelity_repairs_used += 1
         try:
             run = _invoke_agent(
                 workspace,
@@ -1359,11 +1738,12 @@ def run_pipeline(
                     user_prompt=user_prompt,
                     failure=last_failure,
                     comparison=comparison,
-                    iteration=next_iteration,
+                    iteration=repair_iteration,
                     reconstruction_mode=reconstruction_mode,
                     granularity=granularity,
+                    quality_profile=quality_profile,
                 ),
-                iteration=next_iteration,
+                iteration=repair_iteration,
                 timeout_s=config.llm_timeout_s,
                 include_candidate=True,
                 is_repair=True,
@@ -1371,6 +1751,13 @@ def run_pipeline(
             )
         except PipelineError as exc:
             last_failure = str(exc)
+            agent_runs.append(
+                _failed_agent_run(
+                    exc,
+                    iteration=repair_iteration,
+                    phase="post-render-repair",
+                )
+            )
             build_attempts.append(
                 {
                     "attempt": build_attempt,
@@ -1381,11 +1768,15 @@ def run_pipeline(
                 }
             )
             break
-        agent_runs.append(run)
-        fidelity_repairs_used += 1
+        agent_runs.append(
+            _annotated_agent_run(
+                run,
+                iteration=repair_iteration,
+                phase="post-render-repair",
+            )
+        )
         build_attempt += 1
         build_phase = "post-render-repair"
-        next_iteration += 1
         active_iteration = _matching_source_iteration(workspace)
 
     if not valid_artifact:
@@ -1397,9 +1788,14 @@ def run_pipeline(
             "backend": config.backend,
             "reconstruction_mode": reconstruction_mode,
             "granularity": granularity,
+            "quality_profile": quality_profile.as_dict(),
             "agent_runs": agent_runs,
             "build_attempts": build_attempts,
             "retry_budget": {
+                "initial_agent": {
+                    "used": initial_agent_retries_used,
+                    "maximum": config.max_initial_agent_retries,
+                },
                 "schema_build": {"used": build_repairs_used, "maximum": config.max_repairs},
                 "post_render": {
                     "used": fidelity_repairs_used,
@@ -1416,7 +1812,45 @@ def run_pipeline(
             "Pipeline failed without a valid compiled GLB",
             error=last_failure,
         )
+        best_snapshot_context.cleanup()
         raise PipelineError(last_failure or "no valid artifact was produced")
+
+    if (
+        best_program is None
+        or best_plan is None
+        or best_comparison is None
+        or best_attempt is None
+        or not best_artifacts.is_dir()
+    ):
+        best_snapshot_context.cleanup()
+        raise PipelineError("valid builds completed without a retainable best candidate")
+
+    current_source_is_best = (
+        workspace.program_path.is_file()
+        and workspace.plan_path.is_file()
+        and workspace.program_path.read_bytes() == best_program
+        and workspace.plan_path.read_bytes() == best_plan
+    )
+    candidate_restored = latest_valid_attempt != best_attempt or not current_source_is_best
+    if not current_source_is_best:
+        rejected = workspace.root / "trajectories" / f"iter_{max(0, next_iteration - 1):02d}"
+        rejected.mkdir(parents=True, exist_ok=True)
+        if workspace.program_path.is_file():
+            shutil.copy2(workspace.program_path, rejected / "rejected_program.py")
+        if workspace.plan_path.is_file():
+            shutil.copy2(workspace.plan_path, rejected / "rejected_plan.json")
+        _write_bytes_atomic(workspace.program_path, best_program)
+        _write_bytes_atomic(workspace.plan_path, best_plan)
+
+    # Always publish from the private snapshot so the selected artifacts and
+    # source are one deterministic candidate, never whichever build ran last.
+    _replace_directory(best_artifacts, workspace.artifacts_dir)
+    comparison = best_comparison
+    for attempt_record in build_attempts:
+        attempt_record["selected"] = bool(
+            attempt_record.get("built")
+            and attempt_record.get("attempt") == best_attempt
+        )
 
     artifact_manifest = json.loads(
         (workspace.artifacts_dir / "build_manifest.json").read_text(encoding="utf-8")
@@ -1425,19 +1859,27 @@ def run_pipeline(
         artifact_manifest.get("program_sha256") == sha256(workspace.program_path)
         and artifact_manifest.get("plan_sha256") == sha256(workspace.plan_path)
     )
-    if not source_matches_artifact and last_valid_program is not None and last_valid_plan is not None:
-        rejected = workspace.root / "trajectories" / f"iter_{max(0, next_iteration - 1):02d}"
-        rejected.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(workspace.program_path, rejected / "rejected_program.py")
-        shutil.copy2(workspace.plan_path, rejected / "rejected_plan.json")
-        _write_bytes_atomic(workspace.program_path, last_valid_program)
-        _write_bytes_atomic(workspace.plan_path, last_valid_plan)
-        comparison = last_valid_comparison
-        restoration = (
-            "The last failed repair was retained in its trajectory; source was restored "
-            "to the last compiled artifact."
+    best_snapshot_context.cleanup()
+    if not source_matches_artifact:
+        raise PipelineError("selected best-candidate artifacts do not match restored source")
+
+    warning_parts: list[str] = []
+    acceptance_warning = _comparison_failure(comparison, min_score=config.min_score)
+    if acceptance_warning:
+        warning_parts.append(acceptance_warning)
+    if improvement_stalled:
+        warning_parts.append(
+            f"Post-render improvement stalled at build attempt {build_attempt}; "
+            f"best build attempt {best_attempt} was retained"
         )
-        last_failure = f"{last_failure}. {restoration}" if last_failure else restoration
+    if candidate_restored:
+        warning_parts.append(
+            "The last failed or non-improving repair was retained in its trajectory; "
+            "source was restored to the best compiled artifact"
+        )
+    if last_failure and last_failure not in warning_parts:
+        warning_parts.append(last_failure)
+    last_failure = ". ".join(warning_parts) or None
 
     status = "complete" if comparison and comparison["passed"] else "needs-review"
     report = {
@@ -1447,14 +1889,26 @@ def run_pipeline(
         "backend": config.backend,
         "reconstruction_mode": reconstruction_mode,
         "granularity": granularity,
+        "quality_profile": quality_profile.as_dict(),
         "agent_runs": agent_runs,
         "build_attempts": build_attempts,
         "retry_budget": {
+            "initial_agent": {
+                "used": initial_agent_retries_used,
+                "maximum": config.max_initial_agent_retries,
+            },
             "schema_build": {"used": build_repairs_used, "maximum": config.max_repairs},
             "post_render": {
                 "used": fidelity_repairs_used,
                 "maximum": config.max_fidelity_repairs,
             },
+        },
+        "best_candidate": {
+            "build_attempt": best_attempt,
+            "trajectory_iteration": best_iteration,
+            "score": comparison["score"] if comparison else None,
+            "passed": comparison["passed"] if comparison else False,
+            "restored": candidate_restored,
         },
         "score": comparison["score"] if comparison else None,
         "passed": comparison["passed"] if comparison else False,
@@ -1467,8 +1921,11 @@ def run_pipeline(
             "comparison": "artifacts/comparison.json",
             "build_manifest": "artifacts/build_manifest.json",
             **(
-                {"surface_comparison": "artifacts/surface_comparison.json"}
-                if get_granularity_profile(granularity).surface_evaluation_enabled
+                {
+                    "surface_comparison": "artifacts/surface_comparison.json",
+                    "surface_residuals": "artifacts/surface_residuals/manifest.json",
+                }
+                if SURFACE_QUALITY_SETTINGS[quality_profile.surface_fidelity].enabled
                 else {}
             ),
         },
@@ -1479,6 +1936,7 @@ def run_pipeline(
         score=report["score"],
         reconstruction_mode=reconstruction_mode,
         granularity=granularity,
+        quality_profile=quality_profile.as_dict(),
         deliverables=report["deliverables"],
     )
     if status == "complete":

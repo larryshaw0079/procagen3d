@@ -82,6 +82,120 @@ def build():
     assert report["reference_to_candidate"]["samples"] == 512
     assert report["symmetric"]["mean"] == pytest.approx(0.0, abs=1.0e-6)
     assert report["symmetric"]["p95"] == pytest.approx(0.0, abs=1.0e-6)
+    assert report["area_comparison"]["candidate_to_reference_ratio"] == pytest.approx(1.0)
+    assert report["normal_aware"]["normal_angle_degrees"]["max"] == pytest.approx(0.0)
+    assert report["candidate_to_reference"]["coverage"]["thresholds"][0][
+        "distance_and_normal_aligned_fraction"
+    ] == pytest.approx(1.0)
+    assert report["candidate_to_reference"]["visible_external_proxy"][
+        "visible_from_any_view_samples"
+    ] > 0
+    worst = report["candidate_to_reference"]["worst_samples"][0]
+    assert worst["source_identity"]["object"]
+    assert worst["source_identity"]["polygon_index"] >= 0
+    assert worst["target_identity"]["surface_triangle_index"] >= 0
+    assert len(worst["source_normal"]) == 3
+
+    residual_manifest = tmp_path / report["residual_artifacts"]["manifest"]
+    residuals = json.loads(residual_manifest.read_text(encoding="utf-8"))
+    assert set(residuals["directions"]) == {
+        "candidate_to_reference",
+        "reference_to_candidate",
+    }
+    for direction in residuals["directions"].values():
+        assert set(direction) == {"distance", "normal_angle"}
+        for metric in direction.values():
+            assert set(metric["views"]) == set(CANONICAL_VIEWS)
+            assert all((tmp_path / path).is_file() for path in metric["views"].values())
+
+
+@pytest.mark.skipif(
+    os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
+    reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",
+)
+def test_surface_comparison_penalizes_reversed_normals(tmp_path: Path) -> None:
+    runtime = BlenderRuntime.discover()
+    reference_artifacts = tmp_path / "reference-artifacts"
+    candidate_artifacts = tmp_path / "candidate-artifacts"
+    reference_program = tmp_path / "reference.py"
+    candidate_program = tmp_path / "candidate.py"
+    reference_program.write_text(
+        """
+import bpy
+
+def build():
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.5))
+""",
+        encoding="utf-8",
+    )
+    candidate_program.write_text(
+        """
+import bpy
+
+def build():
+    vertices = [
+        (-1.0, -1.0, 0.0),
+        (1.0, -1.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (-1.0, 1.0, 0.0),
+        (-1.0, -1.0, 2.0),
+        (1.0, -1.0, 2.0),
+        (1.0, 1.0, 2.0),
+        (-1.0, 1.0, 2.0),
+    ]
+    outward_faces = [
+        (0, 3, 2, 1),
+        (4, 5, 6, 7),
+        (0, 1, 5, 4),
+        (1, 2, 6, 5),
+        (2, 3, 7, 6),
+        (3, 0, 4, 7),
+    ]
+    mesh = bpy.data.meshes.new("InsideOutCubeMesh")
+    mesh.from_pydata(vertices, [], [tuple(reversed(face)) for face in outward_faces])
+    mesh.update()
+    cube = bpy.data.objects.new("InsideOutCube", mesh)
+    bpy.context.scene.collection.objects.link(cube)
+""",
+        encoding="utf-8",
+    )
+    for program, artifacts in (
+        (reference_program, reference_artifacts),
+        (candidate_program, candidate_artifacts),
+    ):
+        result = runtime.run_stage(
+            "build_asset",
+            ["--program", program, "--artifacts-dir", artifacts],
+            cwd=tmp_path,
+            timeout_s=180,
+        )
+        require_success(result, stage="reversed-normal fixture build")
+
+    output = tmp_path / "surface-reversed.json"
+    compared = runtime.run_stage(
+        "surface_compare",
+        [
+            "--reference-glb",
+            reference_artifacts / "model.glb",
+            "--candidate-glb",
+            candidate_artifacts / "model.glb",
+            "--samples",
+            "256",
+            "--output",
+            output,
+        ],
+        cwd=tmp_path,
+        timeout_s=180,
+    )
+    require_success(compared, stage="reversed-normal surface comparison")
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["symmetric"]["mean"] == pytest.approx(0.0, abs=1.0e-6)
+    assert report["normal_aware"]["normal_angle_degrees"]["mean"] == pytest.approx(
+        180.0, abs=1.0e-6
+    )
+    assert report["normal_aware"]["distance"]["mean"] == pytest.approx(0.02, abs=1.0e-6)
+    assert report["candidate_to_reference"]["coverage"]["normal_aligned_fraction"] == 0.0
 
 
 @pytest.mark.skipif(
@@ -160,9 +274,183 @@ def build():
     assert report["geometry_object_count"] == 1
     assert report["mesh_count"] == 1
     assert max(report["bounds"]["dimensions"]) <= 2.01
+    assert report["structure"]["global_welded_components"]["count"] == 1
+    sphere_structure = report["objects"][0]["structure"]
+    assert sphere_structure["connected_components"]["count"] == 1
+    assert sphere_structure["topology"]["boundary_edges"] == 0
+    assert sphere_structure["topology"]["closed_manifold_proxy"] is True
+    assert sphere_structure["normal_consistency"]["manifold_edge_consistency"] == 1.0
+    assert sphere_structure["self_intersection_proxy"]["triangle_pairs"] == 0
     assert {path.stem for path in (artifacts / "renders").glob("*.png")} == set(
         CANONICAL_VIEWS
     )
+    evidence = report["canonical_evidence"]
+    diagnostic_manifest = artifacts / evidence["diagnostics"]
+    diagnostics = json.loads(diagnostic_manifest.read_text(encoding="utf-8"))
+    assert set(diagnostics["views"]) == set(CANONICAL_VIEWS)
+    assert diagnostics["objects"][0]["object"] == "OnlyExportedSphere"
+    for kind in ("depth", "normal", "object_id"):
+        assert {
+            path.stem
+            for path in (artifacts / "renders" / "diagnostics" / kind).glob("*.png")
+        } == set(CANONICAL_VIEWS)
+
+
+@pytest.mark.skipif(
+    os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
+    reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",
+)
+def test_compiled_probe_reports_open_detached_and_intersecting_geometry(
+    tmp_path: Path,
+) -> None:
+    runtime = BlenderRuntime.discover()
+    artifacts = tmp_path / "artifacts"
+    program = tmp_path / "program.py"
+    source = '''
+import bpy
+
+def build():
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.5))
+    bpy.context.object.name = "MainBody"
+
+    bpy.ops.mesh.primitive_cube_add(size=0.8, location=(0.4, 0.0, 0.7))
+    bpy.context.object.name = "IntersectingWindow"
+
+    mesh = bpy.data.meshes.new("DetachedOpenPanelMesh")
+    mesh.from_pydata(
+        [(2.0, -0.5, 0.0), (2.0, 0.5, 0.0), (2.0, 0.5, 1.0), (2.0, -0.5, 1.0)],
+        [],
+        [(0, 1, 2, 3)],
+    )
+    mesh.update()
+    panel = bpy.data.objects.new("DetachedOpenPanel", mesh)
+    bpy.context.scene.collection.objects.link(panel)
+'''
+    assert_safe_source(source)
+    program.write_text(source, encoding="utf-8")
+    build = runtime.run_stage(
+        "build_asset",
+        ["--program", program, "--artifacts-dir", artifacts],
+        cwd=tmp_path,
+        timeout_s=180,
+    )
+    require_success(build, stage="structural diagnostics fixture build")
+
+    target = [1.0, 0.0, 0.6]
+    contract = tmp_path / "camera_contract.json"
+    locations = {
+        "front": [1.0, -5.0, 0.6],
+        "back": [1.0, 5.0, 0.6],
+        "left": [-4.0, 0.0, 0.6],
+        "right": [6.0, 0.0, 0.6],
+        "top": [1.0, 0.0, 5.6],
+        "iso": [4.0, -3.0, 3.6],
+    }
+    write_json(
+        contract,
+        {
+            "projection": "ORTHO",
+            "resolution": [32, 32],
+            "views": [
+                {
+                    "name": name,
+                    "location": locations[name],
+                    "target": target,
+                    "ortho_scale": 4.0,
+                }
+                for name in CANONICAL_VIEWS
+            ],
+        },
+    )
+    compiled = runtime.run_stage(
+        "compiled_probe",
+        [
+            "--glb",
+            artifacts / "model.glb",
+            "--artifacts-dir",
+            artifacts,
+            "--camera-contract",
+            contract,
+        ],
+        cwd=tmp_path,
+        timeout_s=180,
+    )
+    require_success(compiled, stage="structural diagnostics compiled probe")
+
+    report = json.loads((artifacts / "scene_report.json").read_text(encoding="utf-8"))
+    assert report["structure"]["global_welded_components"]["count"] == 3
+    interaction = report["structure"]["contact_intersection_proxy"]
+    assert interaction["triangle_intersection_pair_count"] >= 1
+    assert ["IntersectingWindow", "MainBody"] in [
+        sorted(item["objects"]) for item in interaction["triangle_intersection_pairs"]
+    ]
+    panel = next(item for item in report["objects"] if item["name"] == "DetachedOpenPanel")
+    assert panel["structure"]["topology"]["boundary_edges"] == 4
+    assert panel["structure"]["topology"]["closed_manifold_proxy"] is False
+    assert "DetachedOpenPanel" in interaction["isolated_objects"]
+
+
+@pytest.mark.skipif(
+    os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
+    reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",
+)
+def test_reference_probe_reports_structural_and_canonical_diagnostics(
+    tmp_path: Path,
+) -> None:
+    runtime = BlenderRuntime.discover()
+    source_artifacts = tmp_path / "source-artifacts"
+    program = tmp_path / "reference.py"
+    program.write_text(
+        """
+import bpy
+
+def build():
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.5))
+    bpy.context.object.name = "ReferenceCube"
+""",
+        encoding="utf-8",
+    )
+    build = runtime.run_stage(
+        "build_asset",
+        ["--program", program, "--artifacts-dir", source_artifacts],
+        cwd=tmp_path,
+        timeout_s=180,
+    )
+    require_success(build, stage="reference diagnostics fixture build")
+
+    evidence = tmp_path / "evidence"
+    probed = runtime.run_stage(
+        "reference_probe",
+        [
+            "--glb",
+            source_artifacts / "model.glb",
+            "--evidence-dir",
+            evidence,
+            "--size",
+            "64",
+        ],
+        cwd=tmp_path,
+        timeout_s=180,
+    )
+    require_success(probed, stage="reference diagnostics probe")
+
+    report = json.loads((evidence / "reference_scene.json").read_text(encoding="utf-8"))
+    assert report["structure"]["global_welded_components"]["count"] == 1
+    assert report["objects"][0]["structure"]["topology"]["closed_manifold_proxy"]
+    assert report["canonical_evidence"] == {
+        "renders": "evidence/reference_views",
+        "masks": "evidence/reference_views/masks.json",
+        "diagnostics": "evidence/reference_views/diagnostics/manifest.json",
+    }
+    contract = json.loads((evidence / "camera_contract.json").read_text(encoding="utf-8"))
+    assert {view["name"] for view in contract["views"]} == set(CANONICAL_VIEWS)
+    diagnostics = json.loads(
+        (evidence / "reference_views" / "diagnostics" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert diagnostics["path_base"] == "canonical-render-root"
+    assert set(diagnostics["views"]) == set(CANONICAL_VIEWS)
 
 
 @pytest.mark.skipif(

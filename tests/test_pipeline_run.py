@@ -256,9 +256,132 @@ def test_schema_build_and_post_render_repairs_have_independent_budgets(
         "post-render-repair",
     ]
     assert report["retry_budget"] == {
+        "initial_agent": {"used": 0, "maximum": 1},
         "schema_build": {"used": 1, "maximum": 1},
         "post_render": {"used": 1, "maximum": 1},
     }
+
+
+def test_initial_agent_failure_retries_in_a_new_trajectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    plan = workspace.plan_path.read_bytes()
+    program = workspace.program_path.read_bytes()
+    workspace.plan_path.unlink()
+    workspace.program_path.unlink()
+    monkeypatch.setattr(pipeline.BlenderRuntime, "discover", lambda explicit=None: object())
+    monkeypatch.setattr(pipeline, "prepare_reference", lambda *args, **kwargs: _prepared_probe())
+    invocations: list[int] = []
+
+    def fake_agent(*args, **kwargs):
+        iteration = kwargs["iteration"]
+        invocations.append(iteration)
+        trajectory = workspace.trajectory_dir(iteration)
+        if len(invocations) == 1:
+            write_json(trajectory / "result.json", {"success": False, "exit_reason": "timeout"})
+            raise PipelineError("initial provider timeout")
+        workspace.program_path.write_bytes(program)
+        workspace.plan_path.write_bytes(plan)
+        (trajectory / "program.py").write_bytes(program)
+        (trajectory / "plan.json").write_bytes(plan)
+        return {"backend": "fake", "model": "fake", "files_modified": ["src/program.py"]}
+
+    def fake_build(*args, **kwargs):
+        write_json(
+            workspace.artifacts_dir / "build_manifest.json",
+            {
+                "program_sha256": sha256(workspace.program_path),
+                "plan_sha256": sha256(workspace.plan_path),
+            },
+        )
+        return {"score": 1.0, "score_passed": True, "passed": True}
+
+    monkeypatch.setattr(pipeline, "_invoke_agent", fake_agent)
+    monkeypatch.setattr(pipeline, "build_workspace", fake_build)
+
+    report = pipeline.run_pipeline(
+        workspace,
+        PipelineConfig(max_initial_agent_retries=1, max_repairs=0),
+    )
+
+    assert invocations == [0, 1]
+    assert [run["phase"] for run in report["agent_runs"]] == ["initial", "initial-retry"]
+    assert report["agent_runs"][0]["error"] == "initial provider timeout"
+    assert report["retry_budget"]["initial_agent"] == {"used": 1, "maximum": 1}
+    assert report["status"] == "complete"
+
+
+def test_post_render_repairs_stop_on_stall_and_restore_best_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    monkeypatch.setattr(pipeline.BlenderRuntime, "discover", lambda explicit=None: object())
+    monkeypatch.setattr(pipeline, "prepare_reference", lambda *args, **kwargs: _prepared_probe())
+    scores = [0.5, 0.7, 0.6]
+    build_calls = 0
+    repair_calls = 0
+
+    def fake_build(*args, **kwargs):
+        nonlocal build_calls
+        score = scores[build_calls]
+        build_calls += 1
+        (workspace.artifacts_dir / "candidate.txt").write_text(
+            str(build_calls), encoding="utf-8"
+        )
+        write_json(
+            workspace.artifacts_dir / "build_manifest.json",
+            {
+                "program_sha256": sha256(workspace.program_path),
+                "plan_sha256": sha256(workspace.plan_path),
+            },
+        )
+        return {
+            "score": score,
+            "score_passed": False,
+            "passed": False,
+            "hard_gates": {"passed": False, "failures": []},
+        }
+
+    def fake_agent(*args, **kwargs):
+        nonlocal repair_calls
+        repair_calls += 1
+        iteration = kwargs["iteration"]
+        workspace.program_path.write_text(
+            f"def build():\n    return {repair_calls}\n", encoding="utf-8"
+        )
+        trajectory = workspace.trajectory_dir(iteration)
+        (trajectory / "program.py").write_bytes(workspace.program_path.read_bytes())
+        (trajectory / "plan.json").write_bytes(workspace.plan_path.read_bytes())
+        return {"backend": "fake", "model": "fake", "files_modified": ["src/program.py"]}
+
+    monkeypatch.setattr(pipeline, "build_workspace", fake_build)
+    monkeypatch.setattr(pipeline, "_invoke_agent", fake_agent)
+
+    report = pipeline.run_pipeline(
+        workspace,
+        PipelineConfig(max_repairs=0, max_fidelity_repairs=3, min_score=0.9),
+    )
+
+    assert build_calls == 3
+    assert repair_calls == 2
+    assert report["score"] == 0.7
+    assert report["best_candidate"] == {
+        "build_attempt": 1,
+        "trajectory_iteration": 0,
+        "score": 0.7,
+        "passed": False,
+        "restored": True,
+    }
+    assert [attempt["selected"] for attempt in report["build_attempts"]] == [
+        False,
+        True,
+        False,
+    ]
+    assert report["retry_budget"]["post_render"] == {"used": 2, "maximum": 3}
+    assert "improvement stalled" in report["warning"].lower()
+    assert workspace.program_path.read_text(encoding="utf-8").endswith("return 1\n")
+    assert (workspace.artifacts_dir / "candidate.txt").read_text(encoding="utf-8") == "2"
 
 
 def test_resume_routes_glb_to_the_trajectory_matching_restored_source(

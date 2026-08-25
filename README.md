@@ -17,7 +17,58 @@ The reconstruction mode makes the source-of-truth claim explicit:
 
 Generated programs cannot read/import files themselves in either mode.
 
+Version: **0.1.1 (ongoing)**. The previous baseline is **0.1.0**.
+
 ![ProcAgen3D teaser](assets/teaser.png)
+
+## Changelog
+
+### 0.1.1 (ongoing)
+
+This update implements the six reconstruction-quality fixes identified by the
+procedural-output audit, in the recommended order:
+
+1. **GLB-safe color and materials.** Generation and repair prompts now require
+   direct glTF-safe Principled constants or explicitly baked embedded textures.
+   The GLB probe reports base-color factors/textures, primitive usage, vertex
+   colors, declared palettes, and implicit-white risk. Spatial RGB, foreground
+   palette, and default-white primitive fractions are non-compensating gates.
+2. **Structural coherence gates.** Fresh Blender probes measure per-object and
+   global components, boundary/non-manifold edges, winding and outward-normal
+   proxies, degenerate/poor triangles, self-intersections, inter-object
+   intersections, near contacts, and isolated objects. Declared attachment
+   failures and unexpected intersections can no longer be hidden by a good
+   silhouette score.
+3. **Normal-aware visible-surface evidence.** Reference and candidate probes
+   now emit canonical depth, world-normal, and object-ID renders. Surface
+   comparison adds oriented/unoriented normal error, point-to-plane and
+   normal-aware distances, visible/external coverage, surface-area ratios,
+   per-object identities, worst-sample identities, and six-view residual
+   heatmaps under `artifacts/surface_residuals/`.
+4. **Executable attachment plans.** Every normalized plan part has a stable ID,
+   exact Blender object names, numeric bounds, and a typed parent attachment
+   with contact region, maximum gap/penetration, and minimum contact area.
+   Duplicate IDs, missing/self parents, cycles, reversed bounds, and malformed
+   tolerances are rejected. Older free-text plans receive deterministic
+   compatibility normalization.
+5. **Adaptive repair and recovery.** Initial agent failures receive a fresh
+   bounded retry. Valid source left by a timeout/non-success can be safely
+   salvaged after the normal schema and AST guards. Fidelity repair stops on
+   pass, first stall, or budget exhaustion; every valid candidate is ranked and
+   the deterministic best source plus complete artifact set is restored.
+6. **Independent quality profiles.** Surface fidelity, detail richness,
+   material fidelity, and structural coherence are selectable separately and
+   recorded in the workspace, plan, artifact manifest, comparison, and run
+   report. Granularity remains a convenient preset. For highly complex cars,
+   mecha, characters, or dense scenes where strict fidelity matters more than
+   an independently authored procedural claim, use `--mode glb-ref` as the
+   reference-cage/derived-geometry path.
+
+### 0.1.0
+
+Initial baseline: provenance-locked image/GLB workspaces, procedural and
+`glb-ref` modes, agent-authored `plan.json` plus `program.py`, clean Blender
+build/export, canonical render scoring, and bounded repair trajectories.
 
 ## Install with uv
 
@@ -55,26 +106,47 @@ For an explicitly glb-ref reconstruction:
 uv run procagen3d make IMAGE GLB --mode glb-ref
 ```
 
-Geometry granularity is independent of reconstruction provenance:
+Geometry granularity is independent of reconstruction provenance and now acts
+as a preset for four independent quality axes:
 
 ```sh
 uv run procagen3d make IMAGE GLB --granularity fine
 uv run procagen3d make IMAGE GLB --mode glb-ref --granularity surface
 ```
 
-| Granularity | Authoring target | 3D surface acceptance |
-| --- | --- | --- |
-| `coarse` | Fast semantic blockout and major silhouette | Disabled |
-| `medium` | Compact editable geometry and secondary forms (compatibility default) | Disabled |
-| `fine` | Surface-conforming contour cages, lofts, panels, recesses, and anatomy | 20k deterministic samples per direction; mean/p95 gates |
-| `surface` | Strictest attainable surface fit and explicit plane/concavity transitions | 80k samples per direction; tighter mean/p95 gates |
+| Granularity preset | Surface fidelity | Detail richness | Material fidelity | Structural coherence |
+| --- | --- | --- | --- | --- |
+| `coarse` | `off` | `basic` | `basic` | `basic` |
+| `medium` (default) | `off` | `standard` | `faithful` | `coherent` |
+| `fine` | `balanced` (20k samples/direction) | `rich` | `faithful` | `coherent` |
+| `surface` | `strict` (80k samples/direction) | `maximum` | `strict` | `strict` |
+
+Override any axis without changing the others:
+
+```sh
+uv run procagen3d make IMAGE GLB \
+  --granularity fine \
+  --surface-fidelity strict \
+  --detail-richness maximum \
+  --material-fidelity strict \
+  --structural-coherence strict
+```
+
+The choices are `off|balanced|strict` for surface,
+`basic|standard|rich|maximum` for detail, `basic|faithful|strict` for material,
+and `basic|coherent|strict` for structure. The resolved four-axis object is
+recorded as `quality_profile`; a resumed workspace inherits it unless an axis
+is explicitly overridden.
 
 Fine levels do not equate detail with subdivision count. They tell the authoring
 agent to replace primitive-only fitting with custom procedural surfaces, then
 run a host-owned bidirectional BVH comparison after export. Candidate-to-reference
 distance detects excess/inflated geometry; reference-to-candidate distance detects
-missing form. The report includes worst 3D residual coordinates for the repair
-loop. In `procedural` mode this is necessarily a best-effort authored
+missing form. Normal-aware and point-to-plane statistics catch wrong-facing or
+incoherent surfaces, visible-coverage gates focus canonical exterior evidence,
+and area-ratio gates catch missing or inflated shells. Per-object residuals,
+worst identities, and six-view heatmaps drive the repair loop. In `procedural`
+mode this is necessarily a best-effort authored
 approximation from images and measurements; use `glb-ref` when reference-derived
 geometry is acceptable. Increase `--max-fidelity-repairs` for difficult fine or
 surface assets.
@@ -112,8 +184,11 @@ uv run procagen3d run outputs/my-asset-procedural \
 
 These are independent budgets: schema/source-guard/Blender failures use
 `--max-repairs`; only successful rendered candidates use
-`--max-fidelity-repairs`. At least one post-render repair is mandatory, so an
-aggregate score cannot end the full agent pipeline before visual feedback.
+`--max-fidelity-repairs`. Fidelity repair is adaptive: the pipeline stops when
+a candidate passes, when the first valid repair fails to improve the retained
+best candidate, or when the budget is exhausted. The default initial-authoring
+retry is one and can be set with `--max-initial-agent-retries`; safely complete
+source left by an agent timeout is validated and salvaged before retrying.
 
 Long operations now report their intermediate stages: reference inspection,
 canonical rendering, each agent author/repair pass, the clean Blender build,
@@ -157,8 +232,8 @@ image + offline GLB
         └─ isolated Blender reference probe
              ├─ canonical normalization (Z-up, grounded, longest side = 2)
              ├─ evaluated bounds and recomputed mesh geometry
-             ├─ welded-component hypotheses and Z cross-sections
-             └─ canonical renders + packed silhouette/RGB evidence
+             ├─ topology/contact diagnostics and XYZ cross-sections
+             └─ canonical beauty, silhouette/RGB, depth, normal, and object-ID evidence
                          │
                          ▼
                Codex / Grok / Cursor CLI
@@ -171,9 +246,10 @@ image + offline GLB
                          │
              re-import exact GLB + same-camera renders
                          │
-        render diagnostics + optional bidirectional surface distance
+        color/material + detail + structural diagnostics
+        optional normal-aware bidirectional surface distance + heatmaps
                          │
-                  non-compensating gates → split repair loops
+        non-compensating gates → adaptive repair → best-candidate rollback
 ```
 
 The sample GLBs are deliberately handled as semantically weak evidence: most
@@ -189,6 +265,14 @@ clothing layers, attachments, held props, and character-relative left/right.
 This release verifies the evaluated rest-pose GLB. A generated program may build
 an armature, but the pipeline does not yet certify skin weights, animation clips,
 IK, or walk cycles; those remain explicit limitations rather than implied output.
+
+For every subject kind, `parts` is an executable structural contract. A part
+declares `id`, `object_names`, numeric `approximate_bounds`, and an `attachment`
+with `parent_id`, one of `root|fused|surface-contact|embedded|articulated|intentional-gap`,
+numeric contact bounds, `max_gap`, `max_penetration`, and `min_contact_area`.
+Structural scoring resolves those names against the re-imported GLB and reports
+missing semantic objects, unjoined parts, and intersections not authorized by a
+`fused` or `embedded` relationship.
 
 The generated `program.py` must define a synchronous, zero-argument `build()`.
 It may use `bpy`, `bmesh`, `mathutils`, `math`, and `random`, but it may not read
@@ -225,7 +309,9 @@ outputs/<name>-<mode>/
 │   ├── glb_probe.json
 │   ├── reference_scene.json
 │   ├── camera_contract.json
-│   └── reference_views/{front,back,left,right,top,iso}.png
+│   └── reference_views/
+│       ├── {front,back,left,right,top,iso}.png
+│       └── diagnostics/{depth,normal,object_id}/
 ├── src/
 │   ├── plan.json
 │   └── program.py
@@ -236,28 +322,41 @@ outputs/<name>-<mode>/
 │   ├── model_probe.json
 │   ├── build_manifest.json
 │   ├── comparison.json
-│   ├── surface_comparison.json  # fine/surface only
+│   ├── surface_comparison.json  # surface fidelity balanced/strict
+│   ├── surface_residuals/       # distance + normal heatmaps
 │   └── renders/
+│       └── diagnostics/{depth,normal,object_id}/
 ├── trajectories/iter_XX/
 └── run_report.json
 ```
 
-`complete` requires both `--min-score` (default 0.35) and every hard gate:
-mean silhouette IoU, worst-view silhouette IoU, worst-view foreground-area
-similarity, center distance, and ground-plane offset. These gates are
-non-compensating, so correct overall dimensions can no longer hide collapsed or
-misplaced geometry. `fine` and `surface` add non-compensating bidirectional mean
-and p95 surface-distance gates. `needs-review` still contains a valid program,
-BLEND, and GLB, but exhausted the fidelity-repair budget without passing. Build/static failures
-never ship as valid artifacts. Commands return exit code 2 for `needs-review`,
-so CI can distinguish it from a passing result while retaining the last matching
-source/artifact pair.
+`complete` requires both `--min-score` (default 0.35) and every enabled hard
+gate. The base gates cover mean/worst-view silhouette, foreground area,
+centering, ground offset, spatial RGB, and palette. Material gates cover
+implicit-white exported primitives. Detail gates cover candidate/reference
+triangle richness and declared semantic-object coverage. Structural gates cover
+isolated components, boundary/non-manifold edges, inconsistent/inward normals,
+degenerate and poor triangles, unjoined typed attachments, self-intersections,
+and unexpected inter-object intersections. Balanced/strict surface profiles add
+bidirectional mean/p95 distance, mean oriented-normal angle, visible
+distance-and-normal coverage, and surface-area ratio. These gates are
+non-compensating, so good dimensions or silhouette cannot hide white materials,
+floating windows, fragmented body shells, or missing detail.
+
+`needs-review` still contains a valid program, BLEND, and GLB, but exhausted or
+stalled its fidelity-repair loop without passing. The published source and
+artifact directory are restored from the deterministic best valid candidate,
+while rejected iterations and their GLBs remain under `trajectories/`. Build or
+static failures never ship as valid artifacts. Commands return exit code 2 for
+`needs-review`, so CI can distinguish it from a passing result.
 
 Reference evidence and build artifacts are assembled in same-filesystem staging
 directories and promoted as complete directory transactions. A failed probe or
 repair therefore leaves the previous valid evidence/artifact set intact. The
 candidate report and renders are produced from a fresh re-import of the exported
 GLB, so unsupported pre-export Blender state cannot improve its fidelity score.
+The pure-Python GLB probe separately verifies that visible materials survived as
+glTF-representable factors, textures, or vertex colors.
 
 ## Commands
 
@@ -283,15 +382,17 @@ uv run pytest -q
 PROCAGEN3D_RUN_BLENDER_TESTS=1 uv run pytest -q tests/test_blender_integration.py
 ```
 
-Tests cover GLB parsing/accessor transforms, semantic-boundary detection,
-generated-source policy, exact/exhaustive plan-schema validation, split repair
-budgets, workspace provenance, hard fidelity gates, finite scene validation,
-atomic host-pipeline behavior, granularity compatibility, surface-report schema,
-and portable build provenance. The opt-in Blender
+Tests cover GLB parsing/accessor transforms and material survivability,
+semantic-boundary detection, generated-source policy, typed attachment-plan
+validation, independent quality profiles, initial retry/source salvage,
+adaptive best-candidate repair, workspace provenance, color/detail/material/
+structural/surface hard gates, finite scene validation, atomic host-pipeline
+behavior, and portable build provenance. The opt-in Blender
 integration tests save and export in one process, re-import in a second factory
 process, verify custom-mesh transforms through translated parent empties, and
-verify deterministic bidirectional surface distance and that glb-ref export
-contains only newly created candidates.
+verify topology/contact reports, depth/normal/object-ID evidence, deterministic
+normal-aware bidirectional surface distance and heatmaps, reversed-normal
+detection, and that glb-ref export contains only newly created candidates.
 
 ## Design lineage
 

@@ -122,6 +122,136 @@ def test_parse_and_probe_interleaved_geometry_in_world_space(tmp_path: Path) -> 
     assert report["semantic_decomposition"]["reliable_boundary"] == "merged-single-drawable"
 
 
+def test_probe_reports_exported_pbr_palette_usage_and_default_white_risk(
+    tmp_path: Path,
+) -> None:
+    source = _triangle_glb(tmp_path, include_bounds=True)
+    document, binary, _ = parse_glb(source)
+    base_primitive = document["meshes"][0]["primitives"][0]
+    position = base_primitive["attributes"]["POSITION"]
+    indices = base_primitive["indices"]
+    document["materials"] = [
+        {
+            "name": "Direct red",
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [0.7, 0.1, 0.05, 1.0],
+                "metallicFactor": 0.2,
+                "roughnessFactor": 0.3,
+            },
+        },
+        {
+            "name": "Baked texture",
+            "pbrMetallicRoughness": {
+                "baseColorTexture": {"index": 0, "texCoord": 1},
+            },
+        },
+        {"name": "Implicit white"},
+        {
+            "name": "Unused green",
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [0.1, 0.6, 0.2, 1.0],
+            },
+        },
+    ]
+    document["textures"] = [{"source": 0}]
+    document["images"] = [{"uri": "data:image/png;base64,AA=="}]
+    document["meshes"][0]["primitives"] = [
+        {"attributes": {"POSITION": position}, "indices": indices, "material": 0},
+        {"attributes": {"POSITION": position}, "indices": indices, "material": 1},
+        {"attributes": {"POSITION": position}, "indices": indices, "material": 2},
+        {
+            "attributes": {"POSITION": position, "COLOR_0": position},
+            "indices": indices,
+            "material": 2,
+        },
+        {"attributes": {"POSITION": position}, "indices": indices},
+        {
+            "attributes": {"POSITION": position, "COLOR_0": position},
+            "indices": indices,
+        },
+    ]
+    declared_length = document["buffers"][0]["byteLength"]
+    glb = _write_glb(
+        tmp_path / "material-diagnostics.glb",
+        document,
+        binary[:declared_length],
+    )
+
+    report = probe_glb(glb)
+
+    direct, textured, implicit, unused = report["materials"]
+    assert direct["base_color_factor"] == [0.7, 0.1, 0.05, 1.0]
+    assert direct["effective_base_color_factor"] == [0.7, 0.1, 0.05, 1.0]
+    assert direct["base_color_factor_source"] == "declared"
+    assert direct["base_color_texture"] is None
+    assert direct["metallic_factor"] == 0.2
+    assert direct["roughness_factor"] == 0.3
+    assert direct["primitive_usage_count"] == 1
+    assert direct["default_white_risk"] is False
+
+    assert textured["base_color_factor"] is None
+    assert textured["effective_base_color_factor"] == [1.0, 1.0, 1.0, 1.0]
+    assert textured["base_color_factor_source"] == "glTF-default"
+    assert textured["base_color_texture"] == {"index": 0, "tex_coord": 1}
+    assert textured["default_white_risk"] is False
+
+    assert implicit["primitive_usage_count"] == 2
+    assert implicit["vertex_color_primitive_usage_count"] == 1
+    assert implicit["default_white_primitive_usage_count"] == 1
+    assert implicit["default_white_risk"] is True
+    assert unused["primitive_usage_count"] == 0
+    assert unused["default_white_risk"] is False
+
+    diagnostics = report["material_diagnostics"]
+    assert diagnostics == {
+        "used_material_count": 3,
+        "unused_material_count": 1,
+        "primitive_count_with_material": 4,
+        "primitive_count_without_material": 2,
+        "primitive_count_with_vertex_color": 2,
+        "used_material_count_with_base_color_factor": 1,
+        "used_material_count_with_base_color_texture": 1,
+        "default_white_risk": True,
+        "default_white_material_indices": [2],
+        "primitive_count_at_default_white_risk": 2,
+        "materialless_primitive_count_at_default_white_risk": 1,
+        "declared_base_color_palette": [
+            {
+                "base_color_factor": [0.7, 0.1, 0.05, 1.0],
+                "material_indices": [0],
+                "primitive_usage_count": 1,
+            }
+        ],
+    }
+    assert any(
+        "2 of 6 primitives can render with glTF's implicit white base color" in warning
+        for warning in report["warnings"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("pbr", "message"),
+    [
+        ({"baseColorFactor": [1.0, 1.0, 1.0]}, "must contain four numbers"),
+        ({"baseColorTexture": {"index": 1}}, "missing texture 1"),
+    ],
+)
+def test_probe_rejects_malformed_pbr_materials(
+    tmp_path: Path,
+    pbr: dict,
+    message: str,
+) -> None:
+    source = _triangle_glb(tmp_path)
+    document, binary, _ = parse_glb(source)
+    document["materials"] = [{"pbrMetallicRoughness": pbr}]
+    document["textures"] = [{}]
+    declared_length = document["buffers"][0]["byteLength"]
+    glb = _write_glb(tmp_path / "malformed-material.glb", document, binary[:declared_length])
+
+    with pytest.raises(GLBProbeError, match=message):
+        probe_glb(glb)
+
+
 def test_parent_and_child_rotations_are_composed(tmp_path: Path) -> None:
     glb = _triangle_glb(tmp_path, include_bounds=True)
     document, binary, _ = parse_glb(glb)

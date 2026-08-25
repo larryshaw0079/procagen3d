@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .granularity import DEFAULT_GRANULARITY, validate_granularity
+from .quality import QualityProfile, quality_profile_from_mapping
 from .reconstruction import DEFAULT_RECONSTRUCTION_MODE, validate_reconstruction_mode
 
 
@@ -73,9 +74,15 @@ class Workspace:
         backend: str,
         reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE,
         granularity: str = DEFAULT_GRANULARITY,
+        quality_profile: dict[str, Any] | QualityProfile | None = None,
     ) -> "Workspace":
         reconstruction_mode = validate_reconstruction_mode(reconstruction_mode)
         granularity = validate_granularity(granularity)
+        resolved_quality = (
+            quality_profile
+            if isinstance(quality_profile, QualityProfile)
+            else quality_profile_from_mapping(quality_profile, granularity=granularity)
+        )
         if not _SLUG_RE.fullmatch(slug):
             raise ValueError(f"invalid slug {slug!r}; use lowercase letters, digits, '-' or '_'")
         image = image.expanduser().resolve()
@@ -108,6 +115,7 @@ class Workspace:
             "backend": backend,
             "reconstruction_mode": reconstruction_mode,
             "granularity": granularity,
+            "quality_profile": resolved_quality.as_dict(),
             "inputs": {
                 "image": {
                     "path": str(image_target.relative_to(root)),

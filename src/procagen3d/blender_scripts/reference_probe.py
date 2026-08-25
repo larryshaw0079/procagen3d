@@ -53,9 +53,14 @@ def main():
     report["pose_policy"] = "frame-0, armatures-in-rest-position"
     report["source"] = str(args.glb)
     contract = camera_contract(args.size, points=world_vertices())
-    write_json(args.evidence_dir / "reference_scene.json", report)
     write_json(args.evidence_dir / "camera_contract.json", contract)
-    render_views(args.evidence_dir / "reference_views", contract)
+    masks = render_views(args.evidence_dir / "reference_views", contract)
+    report["canonical_evidence"] = {
+        "renders": "evidence/reference_views",
+        "masks": "evidence/reference_views/masks.json",
+        "diagnostics": "evidence/reference_views/" + masks["diagnostics"]["manifest"],
+    }
+    write_json(args.evidence_dir / "reference_scene.json", report)
     print("PROCAGEN3D_REFERENCE_READY")
 
 

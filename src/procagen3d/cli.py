@@ -32,6 +32,16 @@ from .pipeline import (
 )
 from .process import run_process
 from .progress import progress_step
+from .quality import (
+    DETAIL_RICHNESS_LEVELS,
+    MATERIAL_FIDELITY_LEVELS,
+    STRUCTURAL_COHERENCE_LEVELS,
+    SURFACE_FIDELITY_LEVELS,
+    QUALITY_PROFILE_FIELDS,
+    QualityProfile,
+    quality_profile_from_mapping,
+    resolve_quality_profile,
+)
 from .reconstruction import (
     DEFAULT_RECONSTRUCTION_MODE,
     RECONSTRUCTION_MODES,
@@ -60,6 +70,52 @@ def _score(value: str) -> float:
     if not 0.0 <= converted <= 1.0:
         raise argparse.ArgumentTypeError("must be between 0 and 1")
     return converted
+
+
+def _add_quality_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--surface-fidelity",
+        choices=SURFACE_FIDELITY_LEVELS,
+        default=None,
+        help="override surface-distance/normal validation independently of granularity",
+    )
+    parser.add_argument(
+        "--detail-richness",
+        choices=DETAIL_RICHNESS_LEVELS,
+        default=None,
+        help="override semantic/geometric detail acceptance",
+    )
+    parser.add_argument(
+        "--material-fidelity",
+        choices=MATERIAL_FIDELITY_LEVELS,
+        default=None,
+        help="override color, palette, and exported-material acceptance",
+    )
+    parser.add_argument(
+        "--structural-coherence",
+        choices=STRUCTURAL_COHERENCE_LEVELS,
+        default=None,
+        help="override topology, contact, and attachment acceptance",
+    )
+
+
+def _resolved_quality(args: argparse.Namespace, *, granularity: str) -> QualityProfile:
+    return resolve_quality_profile(
+        granularity,
+        surface_fidelity=getattr(args, "surface_fidelity", None),
+        detail_richness=getattr(args, "detail_richness", None),
+        material_fidelity=getattr(args, "material_fidelity", None),
+        structural_coherence=getattr(args, "structural_coherence", None),
+    )
+
+
+def _inherit_quality(args: argparse.Namespace, manifest: dict[str, Any]) -> None:
+    stored = quality_profile_from_mapping(
+        manifest.get("quality_profile"), granularity=args.granularity
+    )
+    for name in QUALITY_PROFILE_FIELDS:
+        if getattr(args, name, None) is None:
+            setattr(args, name, getattr(stored, name))
 
 
 def _add_runtime_options(
@@ -100,7 +156,14 @@ def _add_runtime_options(
         type=int,
         choices=range(1, 11),
         default=1,
-        help="post-render/surface LLM repairs; at least one fidelity repair is always attempted",
+        help="adaptive post-render repairs, stopping on pass, stall, or budget exhaustion",
+    )
+    parser.add_argument(
+        "--max-initial-agent-retries",
+        type=int,
+        choices=range(0, 4),
+        default=1,
+        help="fresh retries when the initial agent produces no safely salvageable source",
     )
     parser.add_argument("--min-score", type=_score, default=0.35)
     parser.add_argument("--render-size", type=_render_size, default=256)
@@ -111,6 +174,7 @@ def _add_runtime_options(
         action="store_true",
         help="disable Rich stage progress on stderr",
     )
+    _add_quality_options(parser)
 
 
 def _config(args: argparse.Namespace, *, backend: str) -> PipelineConfig:
@@ -125,6 +189,11 @@ def _config(args: argparse.Namespace, *, backend: str) -> PipelineConfig:
         render_size=args.render_size,
         llm_timeout_s=args.llm_timeout,
         blender_timeout_s=args.blender_timeout,
+        max_initial_agent_retries=args.max_initial_agent_retries,
+        surface_fidelity=args.surface_fidelity,
+        detail_richness=args.detail_richness,
+        material_fidelity=args.material_fidelity,
+        structural_coherence=args.structural_coherence,
     )
 
 
@@ -166,6 +235,7 @@ def _progress_context(args: argparse.Namespace):
 
 
 def _command_make(args: argparse.Namespace) -> int:
+    quality_profile = _resolved_quality(args, granularity=args.granularity)
     slug = workspace_slug(
         args.name or slugify(args.glb.expanduser().resolve().parent.name),
         reconstruction_mode=args.reconstruction_mode,
@@ -185,6 +255,7 @@ def _command_make(args: argparse.Namespace) -> int:
                 backend=args.backend,
                 reconstruction_mode=args.reconstruction_mode,
                 granularity=args.granularity,
+                quality_profile=quality_profile,
             )
             stage.complete(f"Workspace created — {workspace.root}")
         report = run_pipeline(
@@ -216,6 +287,7 @@ def _command_run(args: argparse.Namespace) -> int:
                 args.granularity
                 or str(manifest.get("granularity") or DEFAULT_GRANULARITY)
             )
+            _inherit_quality(args, manifest)
             stage.complete(f"Workspace ready — {workspace.root}")
         report = run_pipeline(
             workspace,
@@ -232,6 +304,7 @@ def _command_build(args: argparse.Namespace) -> int:
     workspace: Workspace | None = None
     reconstruction_mode: str | None = None
     granularity: str | None = None
+    quality_profile: QualityProfile | None = None
     try:
         with _progress_context(args) as progress:
             with progress_step(
@@ -249,6 +322,9 @@ def _command_build(args: argparse.Namespace) -> int:
                     args.granularity
                     or str(manifest.get("granularity") or DEFAULT_GRANULARITY)
                 )
+                args.granularity = granularity
+                _inherit_quality(args, manifest)
+                quality_profile = _resolved_quality(args, granularity=granularity)
                 stage.complete(f"Workspace ready — {workspace.root}")
             with progress_step(progress, "runtime", "Locating Blender") as stage:
                 runtime = BlenderRuntime.discover(args.blender)
@@ -267,6 +343,7 @@ def _command_build(args: argparse.Namespace) -> int:
                 min_score=args.min_score,
                 reconstruction_mode=reconstruction_mode,
                 granularity=granularity,
+                quality_profile=quality_profile,
                 timeout_s=args.blender_timeout,
                 trajectory_dir=matching_source_trajectory(workspace),
                 progress=progress,
@@ -283,12 +360,16 @@ def _command_build(args: argparse.Namespace) -> int:
                     "backend": None,
                     "reconstruction_mode": reconstruction_mode,
                     "granularity": granularity,
+                    "quality_profile": (
+                        quality_profile.as_dict() if quality_profile is not None else None
+                    ),
                     "stage": "build",
                     "error": str(exc),
                 },
             )
         raise
     assert workspace is not None
+    assert quality_profile is not None
     status = "complete" if report["passed"] else "needs-review"
     deliverables = {
         "program": "src/program.py",
@@ -300,11 +381,14 @@ def _command_build(args: argparse.Namespace) -> int:
     }
     if (workspace.artifacts_dir / "surface_comparison.json").is_file():
         deliverables["surface_comparison"] = "artifacts/surface_comparison.json"
+    if (workspace.artifacts_dir / "surface_residuals" / "manifest.json").is_file():
+        deliverables["surface_residuals"] = "artifacts/surface_residuals/manifest.json"
     workspace.update_manifest(
         status=status,
         score=report["score"],
         reconstruction_mode=reconstruction_mode,
         granularity=granularity,
+        quality_profile=quality_profile.as_dict(),
         deliverables=deliverables,
     )
     write_json(
@@ -316,6 +400,7 @@ def _command_build(args: argparse.Namespace) -> int:
             "backend": None,
             "reconstruction_mode": reconstruction_mode,
             "granularity": granularity,
+            "quality_profile": quality_profile.as_dict(),
             "score": report["score"],
             "passed": report["passed"],
             "deliverables": deliverables,
@@ -490,6 +575,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the workspace's recorded granularity for this build",
     )
+    _add_quality_options(build)
     build.add_argument("--min-score", type=_score, default=0.35)
     build.add_argument("--render-size", type=_render_size, default=256)
     build.add_argument("--blender-timeout", type=_positive_int, default=900)

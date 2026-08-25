@@ -4,6 +4,7 @@ from pathlib import Path
 
 from procagen3d.plan_schema import plan_schema_text
 from procagen3d.prompts import initial_prompt, repair_prompt
+from procagen3d.quality import QualityProfile
 
 
 def test_initial_prompt_routes_characters_through_anatomy_analysis(tmp_path: Path) -> None:
@@ -44,6 +45,29 @@ def test_repair_prompt_rechecks_character_identity_structure(tmp_path: Path) -> 
     assert "`granularity` to `medium`" in prompt
 
 
+def test_initial_and_repair_prompts_require_gltf_safe_materials(tmp_path: Path) -> None:
+    image = tmp_path / "inputs" / "reference.png"
+    image.parent.mkdir()
+    image.write_bytes(b"image")
+    prompts = (
+        initial_prompt(root=tmp_path, image=image, user_prompt="Build this scene"),
+        repair_prompt(
+            root=tmp_path,
+            user_prompt="Build this scene",
+            failure="colors became white after export",
+            comparison={"summary": {"mean_spatial_rgb_similarity": 0.2}},
+            iteration=1,
+        ),
+    )
+
+    for prompt in prompts:
+        assert "exports `model.glb` without baking Blender procedural shader graphs" in prompt
+        assert "glTF-safe direct constants on unlinked Principled BSDF" in prompt
+        assert "unless `build()` explicitly converts or bakes" in prompt
+        assert "Setting only `Material.diffuse_color` does not preserve" in prompt
+        assert "additional direct-constant materials, vertex colors, or geometry" in prompt
+
+
 def test_fine_and_surface_prompts_require_surface_conforming_geometry(
     tmp_path: Path,
 ) -> None:
@@ -73,3 +97,35 @@ def test_fine_and_surface_prompts_require_surface_conforming_geometry(
         assert "large reference vertex/index dump" in prompt
     assert "maximum surface fit" in surface
     assert "best-effort authored approximation" in surface
+
+
+def test_prompts_bind_typed_attachments_diagnostics_and_independent_quality(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "inputs" / "reference.png"
+    image.parent.mkdir()
+    image.write_bytes(b"image")
+    profile = QualityProfile("balanced", "maximum", "strict", "coherent")
+    prompts = (
+        initial_prompt(
+            root=tmp_path,
+            image=image,
+            user_prompt="Build it",
+            quality_profile=profile,
+        ),
+        repair_prompt(
+            root=tmp_path,
+            user_prompt="Build it",
+            failure="attachments failed",
+            comparison={},
+            iteration=1,
+            quality_profile=profile,
+        ),
+    )
+    for prompt in prompts:
+        assert '"surface_fidelity": "balanced"' in prompt
+        assert '"detail_richness": "maximum"' in prompt
+        assert "exact Blender `object_names`" in prompt or "exact Blender objects" in prompt
+        assert "contact region" in prompt
+        assert "gap/penetration" in prompt
+        assert "depth" in prompt and "world-normal" in prompt and "object-ID" in prompt

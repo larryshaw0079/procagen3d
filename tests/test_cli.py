@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import procagen3d.cli as cli
+from procagen3d import __version__
 from procagen3d.backends import create_backend
 from procagen3d.cli import _command_examples, build_parser
 from procagen3d.progress import emit_progress
@@ -15,11 +16,20 @@ def test_make_defaults_to_requested_codex_configuration() -> None:
     assert args.backend == "codex"
     assert args.max_repairs == 2
     assert args.max_fidelity_repairs == 1
+    assert args.max_initial_agent_retries == 1
     assert args.reconstruction_mode == "procedural"
     assert args.granularity == "medium"
+    assert args.surface_fidelity is None
+    assert args.detail_richness is None
+    assert args.material_fidelity is None
+    assert args.structural_coherence is None
     backend = create_backend(args.backend)
     assert backend.model == "gpt-5.6-sol"
     assert backend.reasoning_effort == "xhigh"
+
+
+def test_release_version_is_ongoing_0_1_1() -> None:
+    assert __version__ == "0.1.1"
 
 
 def test_run_uses_manifest_backend_when_override_is_absent() -> None:
@@ -49,6 +59,35 @@ def test_commands_accept_all_granularity_levels_and_detail_alias() -> None:
         ["build", "workspace", "--detail-level", "surface"]
     )
     assert alias.granularity == "surface"
+
+
+def test_quality_axes_are_independent_cli_overrides() -> None:
+    args = build_parser().parse_args(
+        [
+            "make",
+            "image.png",
+            "model.glb",
+            "--granularity",
+            "surface",
+            "--surface-fidelity",
+            "off",
+            "--detail-richness",
+            "rich",
+            "--material-fidelity",
+            "basic",
+            "--structural-coherence",
+            "coherent",
+            "--max-initial-agent-retries",
+            "2",
+        ]
+    )
+    config = cli._config(args, backend="codex")
+    assert config.granularity == "surface"
+    assert config.surface_fidelity == "off"
+    assert config.detail_richness == "rich"
+    assert config.material_fidelity == "basic"
+    assert config.structural_coherence == "coherent"
+    assert config.max_initial_agent_retries == 2
 
 
 def test_long_running_commands_accept_no_progress() -> None:
