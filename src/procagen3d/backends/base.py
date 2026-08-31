@@ -9,6 +9,7 @@ specific envelopes are normalized into one result type.
 from __future__ import annotations
 
 import json
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -22,7 +23,6 @@ ExitReason = Literal["completed", "timeout", "quota", "error"]
 ActivityCallback = Callable[[str], None]
 
 _QUOTA_MARKERS = (
-    "429",
     "capacity",
     "credit balance",
     "insufficient quota",
@@ -463,7 +463,19 @@ def _classify_exit(process: ProcessResult, parsed: ParsedOutput) -> ExitReason:
 
 def _has_quota_marker(text: str) -> bool:
     lowered = text.lower()
-    return any(marker in lowered for marker in _QUOTA_MARKERS)
+    if any(marker in lowered for marker in _QUOTA_MARKERS):
+        return True
+    # Do not classify an arbitrary filename containing the digits 429 as a
+    # provider quota response. Accept the numeric code only as a standalone
+    # response line or alongside an HTTP/status/error-code label.
+    return bool(
+        re.search(r"(?im)^\s*429(?:\s|:|-|$)", text)
+        or re.search(
+            r"(?i)\b(?:http(?:\s+status)?|status(?:\s+code)?|error(?:\s+code)?|code)"
+            r"\s*[:=]?\s*429\b",
+            text,
+        )
+    )
 
 
 def _snapshot_workspace(root: Path, *, excluded: Path) -> dict[Path, tuple[int, int]]:

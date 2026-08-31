@@ -122,6 +122,73 @@ def test_parse_and_probe_interleaved_geometry_in_world_space(tmp_path: Path) -> 
     assert report["semantic_decomposition"]["reliable_boundary"] == "merged-single-drawable"
 
 
+def test_primitive_geometry_hashes_are_logical_and_material_independent(
+    tmp_path: Path,
+) -> None:
+    source = _triangle_glb(tmp_path, include_bounds=True)
+    document, binary, _ = parse_glb(source)
+    declared = int(document["buffers"][0]["byteLength"])
+    binary = binary[:declared]
+
+    def hashes(path: Path) -> tuple[str, str, str]:
+        primitive = probe_glb(path)["meshes"][0]["primitives"][0]
+        return (
+            primitive["position_sha256"],
+            primitive["indices_sha256"],
+            primitive["geometry_sha256"],
+        )
+
+    baseline = hashes(source)
+    assert all(len(value) == 64 for value in baseline)
+
+    material_document = json.loads(json.dumps(document))
+    material_document["materials"][0] = {
+        "pbrMetallicRoughness": {
+            "baseColorFactor": [0.2, 0.4, 0.8, 1.0],
+            "metallicFactor": 0.7,
+        }
+    }
+    material_only = _write_glb(
+        tmp_path / "material-only.glb", material_document, binary
+    )
+    assert hashes(material_only) == baseline
+
+    # POSITION uses a 16-byte stride for 12 bytes of data. Changing only the
+    # interleaved padding must not alter its logical content hash.
+    padding_bytes = bytearray(binary)
+    struct.pack_into("<I", padding_bytes, 12, 0x12345678)
+    padding_only = _write_glb(
+        tmp_path / "padding-only.glb", document, bytes(padding_bytes)
+    )
+    assert hashes(padding_only) == baseline
+
+    moved_bytes = bytearray(binary)
+    struct.pack_into("<f", moved_bytes, 20, 0.25)
+    moved = hashes(_write_glb(tmp_path / "moved.glb", document, bytes(moved_bytes)))
+    assert moved[0] != baseline[0]
+    assert moved[1] == baseline[1]
+    assert moved[2] != baseline[2]
+
+    rewound_bytes = bytearray(binary)
+    struct.pack_into("<3H", rewound_bytes, 48, 0, 2, 1)
+    rewound = hashes(
+        _write_glb(tmp_path / "rewound.glb", document, bytes(rewound_bytes))
+    )
+    assert rewound[0] == baseline[0]
+    assert rewound[1] != baseline[1]
+    assert rewound[2] != baseline[2]
+
+
+def test_probe_instances_record_world_parent_identity(tmp_path: Path) -> None:
+    report = probe_glb(_triangle_glb(tmp_path))
+    instance = report["instances"][0]
+
+    assert instance["node_name"] == "geometry_0"
+    assert instance["parent_node"] == 0
+    assert instance["parent_name"] == "world"
+    assert instance["world_matrix"] != report["nodes"][1]["local_matrix"]
+
+
 def test_probe_reports_exported_pbr_palette_usage_and_default_white_risk(
     tmp_path: Path,
 ) -> None:
@@ -307,6 +374,45 @@ def test_sparse_position_accessor_is_decoded(tmp_path: Path) -> None:
     report = probe_glb(glb)
     assert report["bounds"]["min"] == pytest.approx([0.0, 0.0, 0.0])
     assert report["bounds"]["max"] == pytest.approx([2.0, 3.0, 4.0])
+
+    dense_binary = struct.pack(
+        "<9f",
+        0.0,
+        0.0,
+        0.0,
+        2.0,
+        3.0,
+        4.0,
+        0.0,
+        0.0,
+        0.0,
+    )
+    dense_document = {
+        "asset": {"version": "2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+        "buffers": [{"byteLength": len(dense_binary)}],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": len(dense_binary)}
+        ],
+        "accessors": [
+            {
+                "bufferView": 0,
+                "componentType": 5126,
+                "count": 3,
+                "type": "VEC3",
+            }
+        ],
+    }
+    dense = probe_glb(
+        _write_glb(tmp_path / "dense-equivalent.glb", dense_document, dense_binary)
+    )
+    sparse_primitive = report["meshes"][0]["primitives"][0]
+    dense_primitive = dense["meshes"][0]["primitives"][0]
+    assert sparse_primitive["position_sha256"] == dense_primitive["position_sha256"]
+    assert sparse_primitive["geometry_sha256"] == dense_primitive["geometry_sha256"]
 
 
 def test_invalid_sparse_indices_fail_closed(tmp_path: Path) -> None:

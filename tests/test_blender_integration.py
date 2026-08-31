@@ -19,6 +19,48 @@ pytestmark = pytest.mark.integration
     os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
     reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",
 )
+def test_build_restores_active_collection_for_context_linking(tmp_path: Path) -> None:
+    runtime = BlenderRuntime.discover()
+    artifacts = tmp_path / "artifacts"
+    program = tmp_path / "program.py"
+    source = '''
+import bpy
+
+def build():
+    collection = bpy.context.collection
+    if collection is None:
+        raise RuntimeError("build host did not provide an active collection")
+    if collection.name != "PROCAGEN3D_OUTPUT":
+        raise RuntimeError("build host activated the wrong collection")
+    mesh = bpy.data.meshes.new("ContextLinkedTriangleMesh")
+    mesh.from_pydata(
+        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+        [],
+        [(0, 1, 2)],
+    )
+    mesh.update()
+    obj = bpy.data.objects.new("ContextLinkedTriangle", mesh)
+    bpy.context.collection.objects.link(obj)
+'''
+    assert_safe_source(source)
+    program.write_text(source, encoding="utf-8")
+
+    result = runtime.run_stage(
+        "build_asset",
+        ["--program", program, "--artifacts-dir", artifacts],
+        cwd=tmp_path,
+        timeout_s=180,
+    )
+    require_success(result, stage="active-collection integration build")
+
+    assert (artifacts / "model.glb").is_file()
+    assert (artifacts / "scene.blend").is_file()
+
+
+@pytest.mark.skipif(
+    os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
+    reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",
+)
 def test_surface_comparison_is_deterministic_and_bidirectional(tmp_path: Path) -> None:
     runtime = BlenderRuntime.discover()
     reference_artifacts = tmp_path / "reference-artifacts"
@@ -296,6 +338,132 @@ def build():
         } == set(CANONICAL_VIEWS)
 
 
+@pytest.mark.skipif(
+    os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
+    reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",
+)
+def test_host_solved_build_and_urdf_split_preserve_part_local_meshes(
+    tmp_path: Path,
+) -> None:
+    runtime = BlenderRuntime.discover()
+    artifacts = tmp_path / "artifacts"
+    program = tmp_path / "program.py"
+    program.write_text(
+        '''
+import bpy
+
+def build():
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.5))
+    bpy.context.object.name = "Base"
+    bpy.ops.mesh.primitive_cube_add(size=0.5, location=(0.25, 0.0, 0.5))
+    bpy.context.object.name = "Arm"
+''',
+        encoding="utf-8",
+    )
+    identity = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+    arm_world = [
+        [0.0, -1.0, 0.0, 2.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+    assembly = tmp_path / "assembly_transforms.json"
+    write_json(
+        assembly,
+        {
+            "schema_version": 1,
+            "placement": "host-solved",
+            "parts": [
+                {"id": "base", "object_names": ["Base"], "world_matrix": identity},
+                {"id": "arm", "object_names": ["Arm"], "world_matrix": arm_world},
+            ],
+        },
+    )
+
+    built = runtime.run_stage(
+        "build_asset",
+        [
+            "--program",
+            program,
+            "--artifacts-dir",
+            artifacts,
+            "--assembly-transforms",
+            assembly,
+        ],
+        cwd=tmp_path,
+        timeout_s=180,
+    )
+    require_success(built, stage="host-solved integration build")
+
+    urdf_parts = tmp_path / "urdf_parts"
+    split = runtime.run_stage(
+        "export_urdf_parts",
+        [
+            "--glb",
+            artifacts / "model.glb",
+            "--assembly-transforms",
+            assembly,
+            "--output-dir",
+            urdf_parts,
+        ],
+        cwd=tmp_path,
+        timeout_s=180,
+    )
+    require_success(split, stage="host-solved URDF split")
+    manifest = json.loads((urdf_parts / "manifest.json").read_text(encoding="utf-8"))
+    assert [part["part_id"] for part in manifest["parts"]] == ["base", "arm"]
+
+    contract = tmp_path / "camera_contract.json"
+    write_json(
+        contract,
+        {
+            "projection": "ORTHO",
+            "resolution": [32, 32],
+            "views": [
+                {
+                    "name": name,
+                    "location": [0.0, -5.0, 1.0],
+                    "target": [0.0, 0.0, 0.5],
+                    "ortho_scale": 4.0,
+                }
+                for name in CANONICAL_VIEWS
+            ],
+        },
+    )
+    expected_centers = {
+        "base": [0.0, 0.0, 0.5],
+        "arm": [0.25, 0.0, 0.5],
+    }
+    for part_id, object_name in (("base", "Base"), ("arm", "Arm")):
+        probe_dir = tmp_path / f"probe-{part_id}"
+        probed = runtime.run_stage(
+            "compiled_probe",
+            [
+                "--glb",
+                urdf_parts / f"{part_id}.glb",
+                "--artifacts-dir",
+                probe_dir,
+                "--camera-contract",
+                contract,
+            ],
+            cwd=tmp_path,
+            timeout_s=180,
+        )
+        require_success(probed, stage=f"URDF link-local probe {part_id}")
+        report = json.loads((probe_dir / "scene_report.json").read_text(encoding="utf-8"))
+        item = next(value for value in report["objects"] if value["name"] == object_name)
+        center = [
+            (low + high) * 0.5
+            for low, high in zip(
+                item["bounds"]["min"], item["bounds"]["max"], strict=True
+            )
+        ]
+        assert center == pytest.approx(expected_centers[part_id], abs=1.0e-5)
 @pytest.mark.skipif(
     os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
     reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",

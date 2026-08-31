@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
+import struct
 from pathlib import Path
 
 import bmesh
@@ -27,6 +29,7 @@ CONTACT_RECORD_LIMIT = 512
 CONTACT_VERTEX_SAMPLE_LIMIT = 96
 SELF_INTERSECTION_TRIANGLE_LIMIT = 50_000
 INTER_OBJECT_OVERLAP_PRODUCT_LIMIT = 25_000_000
+OUTPUT_COLLECTION_NAME = "PROCAGEN3D_OUTPUT"
 _FACTORY_VIEW_SETTINGS = {
     name: getattr(bpy.context.scene.view_settings, name)
     for name in ("view_transform", "look", "exposure", "gamma", "use_curve_mapping")
@@ -40,9 +43,24 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _find_layer_collection(layer_collection, collection):
+    if layer_collection.collection == collection:
+        return layer_collection
+    for child in layer_collection.children:
+        match = _find_layer_collection(child, collection)
+        if match is not None:
+            return match
+    return None
+
+
 def reset_scene():
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete(use_global=False)
+    # Move the active pointer to the scene root before deleting child
+    # collections; otherwise Blender may retain a dangling LayerCollection.
+    bpy.context.view_layer.active_layer_collection = (
+        bpy.context.view_layer.layer_collection
+    )
     for collection in list(bpy.data.collections):
         bpy.data.collections.remove(collection)
     for datablocks in (
@@ -58,6 +76,17 @@ def reset_scene():
         for datablock in list(datablocks):
             if datablock.users == 0:
                 datablocks.remove(datablock)
+    output_collection = bpy.data.collections.new(OUTPUT_COLLECTION_NAME)
+    bpy.context.scene.collection.children.link(output_collection)
+    bpy.context.view_layer.update()
+    output_layer_collection = _find_layer_collection(
+        bpy.context.view_layer.layer_collection,
+        output_collection,
+    )
+    if output_layer_collection is None:
+        raise RuntimeError("failed to create the active ProcAgen3D output collection")
+    bpy.context.view_layer.active_layer_collection = output_layer_collection
+    return output_collection
 
 
 def mesh_objects():
@@ -405,6 +434,86 @@ def object_report(obj):
         evaluated.to_mesh_clear()
 
 
+def material_geometry_fingerprint(objects=None):
+    """Hash oriented world-space triangles independent of material primitives.
+
+    glTF exporters may split or duplicate vertices at material boundaries.  A
+    multiset of oriented triangle coordinates preserves actual geometry and
+    winding while remaining invariant to those representation-only changes.
+    Three commutative 256-bit accumulators make the result order-independent
+    and duplicate-sensitive without retaining every triangle in memory.
+    """
+
+    mask = (1 << 256) - 1
+    records = []
+    for obj in sorted(objects or geometry_objects(), key=lambda item: item.name):
+        evaluated, mesh = _evaluated_mesh(obj)
+        try:
+            matrix = evaluated.matrix_world
+            points = [matrix @ vertex.co for vertex in mesh.vertices]
+            mesh.calc_loop_triangles()
+            digest_xor = 0
+            digest_sum = 0
+            digest_square_sum = 0
+            for triangle in mesh.loop_triangles:
+                vertices = []
+                for vertex_index in triangle.vertices:
+                    point = points[vertex_index]
+                    values = []
+                    for axis in range(3):
+                        value = float(point[axis])
+                        if not math.isfinite(value):
+                            raise RuntimeError(
+                                f"geometry object {obj.name!r} has non-finite coordinates"
+                            )
+                        values.append(0.0 if value == 0.0 else value)
+                    vertices.append(tuple(values))
+                oriented = min(
+                    (
+                        tuple(vertices),
+                        tuple(vertices[1:] + vertices[:1]),
+                        tuple(vertices[2:] + vertices[:2]),
+                    )
+                )
+                encoded = b"".join(
+                    struct.pack("<d", coordinate)
+                    for vertex in oriented
+                    for coordinate in vertex
+                )
+                integer = int.from_bytes(hashlib.sha256(encoded).digest(), "big")
+                digest_xor ^= integer
+                digest_sum = (digest_sum + integer) & mask
+                digest_square_sum = (
+                    digest_square_sum + integer * integer
+                ) & mask
+            records.append(
+                {
+                    "name": obj.name,
+                    "type": obj.type,
+                    "triangles": len(mesh.loop_triangles),
+                    "triangle_multiset": {
+                        "xor": f"{digest_xor:064x}",
+                        "sum": f"{digest_sum:064x}",
+                        "square_sum": f"{digest_square_sum:064x}",
+                    },
+                }
+            )
+        finally:
+            evaluated.to_mesh_clear()
+    encoded_records = json.dumps(
+        records,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return {
+        "schema_version": 1,
+        "algorithm": "oriented-world-triangle-multiset-sha256-v1",
+        "objects": records,
+        "digest": hashlib.sha256(encoded_records).hexdigest(),
+    }
+
+
 def welded_components(obj, merge_distance=1.0e-5, limit=32):
     evaluated, mesh = _evaluated_mesh(obj)
     bm = bmesh.new()
@@ -736,6 +845,7 @@ def geometry_report(*, include_components=True):
         "geometry_object_count": len(objects),
         "mesh_count": sum(obj.type == "MESH" for obj in objects),
         "objects": object_reports,
+        "material_geometry_fingerprint": material_geometry_fingerprint(objects),
         "cross_sections_x": section_report(points, axis=0),
         "cross_sections_y": section_report(points, axis=1),
         "cross_sections_z": section_report(points, axis=2),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import runpy
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bpy
+from mathutils import Matrix
 
 from common import geometry_objects, normalize_objects, reset_scene, validate_drawable_scene
 
@@ -32,6 +34,7 @@ def arguments():
         default="medium",
     )
     parser.add_argument("--reference-glb", type=Path)
+    parser.add_argument("--assembly-transforms", type=Path)
     raw = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     return parser.parse_args(raw)
 
@@ -121,6 +124,79 @@ def remove_reference(reference_objects, candidates):
     return [obj for obj in candidates if obj in candidate_set and obj.name in bpy.data.objects]
 
 
+def apply_assembly_transforms(path, candidates):
+    """Apply trusted host-solved part matrices to locally authored objects."""
+
+    if path is None:
+        return
+    if not path.is_file():
+        raise RuntimeError("--assembly-transforms must reference a regular JSON file")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("schema_version") != 1 or document.get("placement") != "host-solved":
+        raise RuntimeError("assembly transform document has an unsupported schema")
+    parts = document.get("parts")
+    if not isinstance(parts, list) or not parts:
+        raise RuntimeError("assembly transform document must declare parts")
+    candidate_by_name = {obj.name: obj for obj in candidates}
+    originals = {obj: obj.matrix_world.copy() for obj in candidates}
+    claimed = set()
+    operations = []
+    for index, part in enumerate(parts):
+        if not isinstance(part, dict):
+            raise RuntimeError(f"assembly part {index} must be an object")
+        part_id = part.get("id")
+        names = part.get("object_names")
+        matrix_value = part.get("world_matrix")
+        if not isinstance(part_id, str) or not part_id:
+            raise RuntimeError(f"assembly part {index} has an invalid id")
+        if not isinstance(names, list) or not names or not all(
+            isinstance(name, str) and name for name in names
+        ):
+            raise RuntimeError(f"assembly part {part_id!r} has invalid object_names")
+        if (
+            not isinstance(matrix_value, list)
+            or len(matrix_value) != 4
+            or any(not isinstance(row, list) or len(row) != 4 for row in matrix_value)
+        ):
+            raise RuntimeError(f"assembly part {part_id!r} has an invalid world matrix")
+        try:
+            transform = Matrix(matrix_value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"assembly part {part_id!r} has a non-numeric world matrix"
+            ) from exc
+        for name in names:
+            obj = candidate_by_name.get(name)
+            if obj is None:
+                raise RuntimeError(
+                    f"assembly part {part_id!r} expected candidate object {name!r}"
+                )
+            if obj in claimed:
+                raise RuntimeError(f"candidate object {name!r} belongs to multiple parts")
+            claimed.add(obj)
+            operations.append((obj, part_id, transform))
+    unclaimed = sorted(obj.name for obj in candidates if obj not in claimed)
+    if unclaimed:
+        raise RuntimeError(
+            "host-solved assembly contains undeclared candidate geometry: "
+            + ", ".join(unclaimed)
+        )
+    def hierarchy_depth(obj):
+        depth = 0
+        parent = obj.parent
+        while parent is not None:
+            depth += 1
+            parent = parent.parent
+        return depth
+
+    operations.sort(key=lambda operation: (hierarchy_depth(operation[0]), operation[0].name))
+    for obj, part_id, transform in operations:
+        obj.matrix_world = transform @ originals[obj]
+        obj["procagen3d_part_id"] = part_id
+        obj["procagen3d_placement"] = "host-solved"
+    bpy.context.view_layer.update()
+
+
 def main():
     args = arguments()
     args.artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -144,6 +220,7 @@ def main():
             "glb-ref build() must create candidate geometry; "
             "the host reference collection is evidence, not the output"
         )
+    apply_assembly_transforms(args.assembly_transforms, objects)
     if reference_objects:
         objects = remove_reference(reference_objects, objects)
     objects = validate_drawable_scene(objects)

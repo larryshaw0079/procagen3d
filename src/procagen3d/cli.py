@@ -48,6 +48,7 @@ from .reconstruction import (
     validate_reconstruction_mode,
 )
 from .rich_ui import RichProgressReporter, print_comparison, print_workspace_summary
+from .stages import PIPELINE_MODES, validate_pipeline_mode
 from .workspace import Workspace, slugify, workspace_slug, write_json
 
 
@@ -124,6 +125,7 @@ def _add_runtime_options(
     backend_default: str | None,
     mode_default: str | None,
     granularity_default: str | None,
+    pipeline_mode_default: str | None,
 ) -> None:
     parser.add_argument("--backend", choices=BACKEND_NAMES, default=backend_default)
     parser.add_argument("--blender", type=Path, help="path to the Blender executable")
@@ -149,14 +151,14 @@ def _add_runtime_options(
         type=int,
         choices=range(0, 11),
         default=2,
-        help="LLM repairs reserved for schema, source-guard, or Blender build failures",
+        help="legacy repairs for schema, source-guard, or Blender build failures",
     )
     parser.add_argument(
         "--max-fidelity-repairs",
         type=int,
         choices=range(1, 11),
         default=1,
-        help="adaptive post-render repairs, stopping on pass, stall, or budget exhaustion",
+        help="legacy adaptive post-render repairs, stopping on pass, stall, or exhaustion",
     )
     parser.add_argument(
         "--max-initial-agent-retries",
@@ -164,6 +166,51 @@ def _add_runtime_options(
         choices=range(0, 4),
         default=1,
         help="fresh retries when the initial agent produces no safely salvageable source",
+    )
+    parser.add_argument(
+        "--pipeline-mode",
+        choices=PIPELINE_MODES,
+        default=pipeline_mode_default,
+        help="structured adds part graphs, connector frames, checkpoints, and PBR staging",
+    )
+    parser.add_argument(
+        "--max-part-repairs",
+        type=int,
+        choices=range(0, 6),
+        default=1,
+        help="retries allowed for each incremental part checkpoint",
+    )
+    parser.add_argument(
+        "--max-geometry-repairs",
+        type=int,
+        choices=range(0, 6),
+        default=1,
+        help="targeted geometry repairs before the dedicated material pass",
+    )
+    parser.add_argument(
+        "--max-material-repairs",
+        type=int,
+        choices=range(0, 6),
+        default=1,
+        help="retries for invalid, geometry-changing, or gate-failing PBR passes",
+    )
+    parser.add_argument(
+        "--min-structured-parts",
+        type=_positive_int,
+        default=2,
+        help="minimum semantic part count accepted from structured planning",
+    )
+    parser.add_argument(
+        "--dedicated-materials",
+        action=argparse.BooleanOptionalAction,
+        default=(True if pipeline_mode_default is not None else None),
+        help="run the geometry-guarded PBR extraction and assignment pass",
+    )
+    parser.add_argument(
+        "--export-urdf",
+        action=argparse.BooleanOptionalAction,
+        default=(False if pipeline_mode_default is not None else None),
+        help="export URDF for a plan that explicitly declares mechanical articulation",
     )
     parser.add_argument("--min-score", type=_score, default=0.35)
     parser.add_argument("--render-size", type=_render_size, default=256)
@@ -194,6 +241,13 @@ def _config(args: argparse.Namespace, *, backend: str) -> PipelineConfig:
         detail_richness=args.detail_richness,
         material_fidelity=args.material_fidelity,
         structural_coherence=args.structural_coherence,
+        pipeline_mode=validate_pipeline_mode(args.pipeline_mode),
+        max_part_repairs=args.max_part_repairs,
+        max_geometry_repairs=args.max_geometry_repairs,
+        max_material_repairs=args.max_material_repairs,
+        dedicated_materials=bool(args.dedicated_materials),
+        export_urdf=bool(args.export_urdf),
+        min_structured_parts=args.min_structured_parts,
     )
 
 
@@ -287,6 +341,16 @@ def _command_run(args: argparse.Namespace) -> int:
                 args.granularity
                 or str(manifest.get("granularity") or DEFAULT_GRANULARITY)
             )
+            args.pipeline_mode = (
+                args.pipeline_mode
+                or str(manifest.get("pipeline_mode") or "structured")
+            )
+            if args.dedicated_materials is None:
+                args.dedicated_materials = bool(
+                    manifest.get("dedicated_materials", True)
+                )
+            if args.export_urdf is None:
+                args.export_urdf = bool(manifest.get("export_urdf", False))
             _inherit_quality(args, manifest)
             stage.complete(f"Workspace ready — {workspace.root}")
         report = run_pipeline(
@@ -439,6 +503,14 @@ def _command_inspect(args: argparse.Namespace) -> int:
             "surface_comparison": (
                 workspace.artifacts_dir / "surface_comparison.json"
             ).is_file(),
+            "material_guard": (
+                workspace.artifacts_dir / "material_guard.json"
+            ).is_file(),
+            "urdf": (workspace.artifacts_dir / "model.urdf").is_file(),
+            "urdf_parts": (
+                workspace.artifacts_dir / "urdf_parts" / "manifest.json"
+            ).is_file(),
+            "structured_state": (workspace.root / "structured_state.json").is_file(),
         },
         "run_report": json.loads(run_report_path.read_text(encoding="utf-8"))
         if run_report_path.is_file()
@@ -541,6 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
         backend_default="codex",
         mode_default=DEFAULT_RECONSTRUCTION_MODE,
         granularity_default=DEFAULT_GRANULARITY,
+        pipeline_mode_default="structured",
     )
     make.set_defaults(handler=_command_make)
 
@@ -554,6 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
         backend_default=None,
         mode_default=None,
         granularity_default=None,
+        pipeline_mode_default=None,
     )
     run.set_defaults(handler=_command_run)
 

@@ -2,18 +2,35 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
 
 from .granularity import DEFAULT_GRANULARITY, validate_granularity
-from .plan_schema import plan_schema_text
+from .plan_schema import PLAN_SCHEMA, plan_schema_text
 from .quality import QualityProfile, resolve_quality_profile
 from .reconstruction import DEFAULT_RECONSTRUCTION_MODE, validate_reconstruction_mode
+from .stages import RepairTarget
+
+
+_SAFE_COLLECTION_LINKING_CONTRACT = (
+    "Link every data-created Blender object to `bpy.context.scene.collection` or an "
+    "explicitly scene-linked collection; never assume `bpy.context.collection` is non-null."
+)
 
 
 def _relative(path: Path, root: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
+
+
+def _assembly_planning_schema_text() -> str:
+    """Return the planning-only schema without the later PBR-stage field."""
+
+    schema = copy.deepcopy(PLAN_SCHEMA)
+    schema["properties"].pop("material_plan", None)
+    schema["additionalProperties"] = False
+    return json.dumps(schema, indent=2, sort_keys=True, ensure_ascii=False)
 
 
 def _mode_contract(reconstruction_mode: str) -> str:
@@ -141,6 +158,276 @@ Program contract:
 - Do not read files, import/link external assets, access the network, start processes, render, save a .blend, or export a GLB. The application owns those operations.
 - Do not invoke Blender during this agent turn. Limit local validation to JSON parsing and Python syntax/static checks; the host pipeline runs Blender after source promotion.
 - Do not merely explain or paste code into chat. Inspect the evidence and write both files directly. Finish only after `python -m py_compile src/program.py` would succeed.
+"""
+
+
+def assembly_planning_prompt(
+    *,
+    root: Path,
+    image: Path,
+    user_prompt: str,
+    reconstruction_mode: str = DEFAULT_RECONSTRUCTION_MODE,
+    granularity: str = DEFAULT_GRANULARITY,
+    quality_profile: QualityProfile | None = None,
+    export_urdf: bool = False,
+    failure: str | None = None,
+) -> str:
+    """Plan a Procedura-style assembly and create a geometry-free build scaffold."""
+
+    image_name = _relative(image, root)
+    mode_contract = _mode_contract(reconstruction_mode)
+    granularity_contract = _granularity_contract(granularity)
+    quality_profile = quality_profile or resolve_quality_profile(granularity)
+    quality_contract = _quality_contract(quality_profile)
+    schema_text = _assembly_planning_schema_text()
+    articulation_contract = (
+        "The user requested URDF output. If and only if this is an explicit mechanical "
+        "subject, add `articulation` with `enabled: true`, `mechanical: true`, and a safe "
+        "robot name. Make the assembly mates themselves one connected link tree and omit "
+        "`articulation.joints` so the host derives URDF origins, axes, rest offsets, and "
+        "limits from the same connector solution. Otherwise set both `enabled: false` "
+        "and `mechanical: false`, and explain the reason in limitations."
+        if export_urdf
+        else "Include `articulation` only when the reference clearly depicts an explicit mechanical joint; otherwise omit it."
+    )
+    repair_contract = (
+        f"""Strict planning repair: the preserved candidate was rejected by the host for the
+exact reasons below. Treat every reported item as authoritative, correct all of them in
+`src/plan.json`, and do not spend the retry changing unrelated subject identity or valid fields.
+
+<prior-plan-rejection>
+{failure}
+</prior-plan-rejection>
+"""
+        if failure is not None
+        else ""
+    )
+    return f"""You are the planning agent for ProcAgen3D's structured Blender pipeline.
+
+Goal from the user:
+{user_prompt or 'Reconstruct the reference subject faithfully as a programmable Blender asset.'}
+
+Evidence:
+- Original image: `{image_name}`
+- Verified reference: `inputs/reference.glb`
+- Container/material evidence: `evidence/glb_probe.json`
+- Normalized geometry and cross-sections: `evidence/reference_scene.json`
+- Six RGB/depth/normal/object-ID views: `evidence/reference_views/`
+
+{mode_contract}
+
+{granularity_contract}
+
+{quality_contract}
+
+This turn is planning only. Create exactly `src/plan.json` and `src/program.py`.
+
+{repair_contract}
+
+`src/plan.json` must conform to the schema below and must contain a version-1
+`assembly` object with these operational fields:
+- `placement`: exactly `host-solved`. Part builders author local geometry and the trusted host
+  applies the solved connector transform after `build()`.
+- `part_order`: every part ID exactly once, in parent-before-child construction order.
+- `connectors`: explicit part-local connector frames. Each frame has an origin and
+  right-handed orthonormal X/Y/Z axes, an interface class, and shared nominal dimensions.
+- `mates`: pair parent and child connectors with a rigid, revolute, prismatic, or spherical
+  mate; state fit/clearance and shared nominal dimensions. A rigid mate must omit `rest` and
+  `limits` entirely. A revolute or prismatic mate requires a finite scalar `rest`; when it has
+  `limits`, their finite scalar `lower` and `upper` values must contain `rest`. A spherical mate
+  requires a three-number `rest`; when it has `limits`, `lower` and `upper` must each be three
+  numbers and contain `rest` component by component.
+- Declare exactly one root part. Its `attachment.type` is `root` and its
+  `attachment.parent_id` is the literal sentinel `__root__`, not `world`, an empty string, the
+  root part's own ID, or any other alias.
+- Every non-root part must be placed by one declared mate. Put receiving holes, sockets,
+  windows, and seats in the earlier parent part so later steps never mutate accepted geometry.
+- Decompose the visible subject into real semantic parts. Do not use one catch-all part for a
+  multi-component object. Every `object_names` entry must be an exact future Blender object name.
+- Omit `material_plan` from `src/plan.json` in this planning turn, even though it is an optional
+  field in the general schema. Populate only the required legacy `materials` summary array. The
+  dedicated material stage is the only stage allowed to create final PBR records and assignments.
+
+{articulation_contract}
+
+Authoritative schema:
+```json
+{schema_text}
+```
+
+`src/program.py` is a safe scaffold, not the complete asset. It must:
+- define `PROCAGEN3D_PART_ORDER` from the plan, `PROCAGEN3D_COMPLETED_PARTS = []`,
+  and `PROCAGEN3D_PART_BUILDERS = {{}}`;
+- define `build()` that calls only the registered builders in completed-part order;
+- contain reusable deterministic helpers if useful, but create no geometry yet;
+- obey the selected reconstruction mode and define no file/network/process/render/save/export operations.
+
+Use neutral glTF-safe materials during geometry construction. Do not perform final material
+extraction or assignment now; a dedicated PBR pass runs after geometry acceptance. Do not invoke
+Blender. Write both files directly and finish only after JSON and Python syntax are valid.
+"""
+
+
+def incremental_part_prompt(
+    *,
+    part: dict[str, Any],
+    assembly: dict[str, Any],
+    completed_part_ids: list[str],
+    part_index: int,
+    part_count: int,
+    solved_world_transform: list[list[float]] | None = None,
+    checkpoint_failure: str | None = None,
+) -> str:
+    """Author exactly one part while freezing all accepted predecessors."""
+
+    transform_text = (
+        json.dumps(solved_world_transform, indent=2)
+        if solved_world_transform is not None
+        else "No solved matrix is available; use the declared bounds and connector frames exactly."
+    )
+    related_connectors = [
+        item
+        for item in assembly.get("connectors", [])
+        if isinstance(item, dict) and item.get("part_id") == part.get("id")
+    ]
+    connector_ids = {item.get("id") for item in related_connectors}
+    related_mates = [
+        item
+        for item in assembly.get("mates", [])
+        if isinstance(item, dict)
+        and (
+            item.get("parent_connector_id") in connector_ids
+            or item.get("child_connector_id") in connector_ids
+        )
+    ]
+    return f"""Incremental geometry step {part_index + 1} of {part_count}.
+
+Implement exactly this planned part in `src/program.py`:
+```json
+{json.dumps(part, indent=2, ensure_ascii=False)}
+```
+
+Its connectors and mates are:
+```json
+{json.dumps({'connectors': related_connectors, 'mates': related_mates}, indent=2, ensure_ascii=False)}
+```
+
+Host-solved world transform for this part, when available:
+```json
+{transform_text}
+```
+
+Previously accepted part IDs are `{json.dumps(completed_part_ids)}`. Their builder functions,
+object names, geometry, transforms, connector features, and registration order are frozen. Do not
+edit them. Add one deterministic builder for `{part.get('id')}`, register it in
+`PROCAGEN3D_PART_BUILDERS`, and append only this ID to `PROCAGEN3D_COMPLETED_PARTS`.
+
+Construction contract:
+- Create every exact `object_names` entry declared for this part and no future part objects.
+- Model all receiving and projecting connector features assigned to this part now.
+- Author this part around its own local origin and connector frames. Do not bake the supplied world
+  matrix into vertices or Blender object transforms: the trusted build host applies it after
+  `build()`. Use the matrix only to understand the resulting world location and orientation.
+- Keep geometry semantically editable and deterministic. Use neutral, direct-constant Principled
+  materials only; final PBR extraction and assignment happen later.
+- {_SAFE_COLLECTION_LINKING_CONTRACT}
+- Do not edit `src/plan.json`: its parts, object ownership, connectors, mates, and articulation
+  are frozen planning outputs. Never collapse or merge accepted semantic parts.
+- Do not read files, invoke Blender, access the network, launch processes, render, save, or export.
+
+{('The previous checkpoint failed: ' + checkpoint_failure + '. Correct only this part and its registration.') if checkpoint_failure else ''}
+
+Write the source directly. Do not provide a tutorial.
+"""
+
+
+def dedicated_material_prompt(
+    *,
+    plan: dict[str, Any],
+    geometry_signature: dict[str, Any],
+    failure: str | None = None,
+) -> str:
+    """Run the isolated PBR extraction and assignment pass."""
+
+    return f"""Dedicated PBR extraction and assignment pass for an accepted Blender assembly.
+
+Use the original image, `evidence/glb_probe.json`, all reference views, and the current compiled
+views under `artifacts/renders/`. Build a compact PBR library, then assign it by semantic part and,
+where needed, stable subpart/material-slot rules. Update `src/plan.json` field `material_plan` as
+`{{"schema_version": 1, "materials": [...], "assignments": [...]}}`. Material records contain
+stable IDs, direct glTF-safe base-color RGBA, metallic, roughness, and optional emissive/alpha
+values. Assignment records contain `part_id`, `material_id`, and optional stable subpart targeting.
+Each assignment target is the pair (`part_id`, `subpart_id`) and must occur exactly once. For any
+part, at most one assignment may omit `subpart_id`; that record is the whole-part default. Never
+create several whole-part assignments for one part merely by giving them different `object_names`.
+Every additional material region must have a unique semantic `subpart_id` and at least one exact,
+part-owned `object_names` entry or a bounded visual `selector`. A subpart may override the
+whole-part default, but two subpart rules must not claim the same object. Assign every declared
+part at least once and reference no object owned by another part.
+Keep the legacy required `materials` array as a compact mirror of the library for compatibility.
+
+Edit `src/program.py` only to create and assign these materials after geometry construction.
+Do not change vertices, faces, modifiers, transforms, object hierarchy, object names, part builders,
+connector geometry, or `PROCAGEN3D_COMPLETED_PARTS`. Unsupported procedural shader graphs are not
+allowed unless explicitly baked into an embedded texture; prefer direct Principled constants.
+{_SAFE_COLLECTION_LINKING_CONTRACT}
+
+The host will reject any geometry change against this pre-material signature:
+```json
+{json.dumps(geometry_signature, indent=2, ensure_ascii=False)}
+```
+
+Current normalized plan:
+```json
+{json.dumps(plan, indent=2, ensure_ascii=False)}
+```
+
+{('The previous material attempt was rejected: ' + failure + '. Fix only the material code and assignments.') if failure else ''}
+
+Do not invoke Blender or perform file/network/process/render/save/export operations. Write both
+source files directly and finish only after syntax and JSON validity checks.
+"""
+
+
+def targeted_repair_prompt(
+    *,
+    user_prompt: str,
+    target: RepairTarget,
+    iteration: int,
+    reconstruction_mode: str,
+    granularity: str,
+    quality_profile: QualityProfile,
+    geometry_only: bool = False,
+) -> str:
+    """Create a one-diagnosis/one-edit repair transaction."""
+
+    material_rule = (
+        "This is a geometry/assembly repair. Preserve neutral materials and do not perform the PBR pass."
+        if geometry_only
+        else "Preserve every unrelated material and geometry detail."
+    )
+    return f"""Targeted repair transaction {iteration}.
+
+Original goal:
+{user_prompt or 'Reconstruct the reference subject faithfully as a programmable Blender asset.'}
+
+The deterministic critic selected exactly one problem:
+```json
+{json.dumps(target.as_dict(), indent=2, ensure_ascii=False)}
+```
+
+Repair only that diagnosis in `src/program.py`. The only permitted structured-plan edits are tuning
+an existing connector frame or an existing mate's `fit_offset` for the selected placement fix.
+Part ownership, bounds, attachment tolerances, dimensions, interface/fit semantics, rest values,
+limits, quality settings, connector IDs, and the mate graph are frozen. Use `artifacts/renders/`,
+their diagnostics, and surface residuals to localize the selected failure. Do not opportunistically
+redesign unrelated regions. {material_rule}
+
+Mode: `{reconstruction_mode}`. Granularity: `{granularity}`.
+Quality profile: `{json.dumps(quality_profile.as_dict(), sort_keys=True)}`.
+
+Retain the no-file-I/O, no-self-import, no-network, no-process, no-render/save/export source
+contract. Do not invoke Blender during this agent turn. Write the edits directly.
 """
 
 

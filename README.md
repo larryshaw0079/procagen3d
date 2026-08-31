@@ -8,22 +8,63 @@ linked deliverables:
 
 The reconstruction mode makes the source-of-truth claim explicit:
 
-- `procedural` (default): `program.py` is standalone replay source; the GLB is
-  measurement/visual evidence only.
+- `procedural` (default): geometry is authored in `program.py`; the GLB is
+  measurement/visual evidence only. Legacy plans are standalone Python replay.
+  Structured plans replay from `program.py` plus `plan.json#assembly` and the
+  versioned host connector-placement contract.
 - `glb-ref`: the provenance-locked GLB is normalized and host-loaded
   into `PROCAGEN3D_REFERENCE`. The program creates new derived objects, and the
   originals are removed before save/export. Replay truth is the program plus
   the recorded GLB and preload contract—not the Python file alone.
 
-Generated programs cannot read/import files themselves in either mode.
+Generated programs cannot read/import files themselves in either mode. The
+build manifest states the exact replay-source set rather than treating a
+host-solved structured program as standalone.
 
-Version: **0.1.1 (ongoing)**. The previous baseline is **0.1.0**.
+Version: **0.2.0**. The previous quality-gated release is **0.1.1**.
 
 ![ProcAgen3D teaser](assets/teaser.png)
 
 ## Changelog
 
-### 0.1.1 (ongoing)
+### 0.2.0
+
+This release replaces monolithic first-pass authoring with a structured,
+Procedura-inspired pipeline while keeping Blender Python as the source of
+truth:
+
+1. **Ordered part graphs.** The planning pass emits semantic parts in a stable
+   parent-before-child order. Each later agent turn may add exactly one part;
+   clean GLB checkpoints reject missing declared objects, future-part leakage,
+   or changes to already accepted geometry.
+2. **Host-solved connectors.** Right-handed part-local connector frames and
+   rigid, revolute, prismatic, or spherical mates carry interface type, role,
+   shared nominal dimensions, fit, clearance, rest values, and limits. The
+   trusted host solves and applies part transforms after `build()`; generated
+   code authors local geometry instead of improvising assembly transforms.
+3. **Dedicated PBR pass.** Geometry is accepted before a separate material
+   agent extracts a compact glTF-safe PBR library and part/subpart assignments.
+   A bound pre/post world-triangle fingerprint rejects any material edit that
+   changes object identity, hierarchy, transforms, bounds, winding, or the
+   evaluated triangle surface while allowing harmless GLB primitive/vertex
+   splits at material boundaries. The final clean rebuild is guarded again
+   before publication.
+4. **One-diagnosis repairs.** Deterministic gates select one highest-priority
+   failure for each repair transaction. Geometry repair precedes materials;
+   material-quality retries stay inside the geometry-guarded PBR phase. The
+   structured final build certifies and publishes but never bypasses either
+   guard with an unscoped edit. Legacy mode retains adaptive best-candidate
+   rollback.
+5. **Optional mechanical URDF.** `--export-urdf` requires an explicit mechanical
+   articulation. Host-solved assemblies are split into link-local GLBs and
+   exported as a structurally validated visual/kinematic URDF tree; characters
+   are never inferred as robots.
+
+The compatibility path remains available with `--pipeline-mode legacy`, and
+existing workspaces without an explicit assembly graph continue to build
+without migration.
+
+### 0.1.1
 
 This update implements the six reconstruction-quality fixes identified by the
 procedural-output audit, in the recommended order:
@@ -100,6 +141,39 @@ are written to `outputs/<name>-<mode>` by default. Use `--name` or `--output` to
 change that location; `--name` still receives the `-<mode>` suffix unless it
 already ends with the selected mode.
 
+New workspaces use the `structured` pipeline by default:
+
+```sh
+uv run procagen3d make IMAGE GLB \
+  --pipeline-mode structured \
+  --max-part-repairs 1 \
+  --max-geometry-repairs 1 \
+  --max-material-repairs 1
+```
+
+The host requires at least two semantic parts by default; use
+`--min-structured-parts` for a stricter subject-specific contract. Disable the
+separate PBR pass with `--no-dedicated-materials`. To reproduce the 0.1.x
+single-turn authoring behavior, pass `--pipeline-mode legacy`.
+
+For an explicitly articulated mechanical asset:
+
+```sh
+uv run procagen3d make IMAGE GLB --export-urdf \
+  --prompt "Build the mechanism with explicit links, connector frames, and joint limits"
+```
+
+URDF is opt-in twice: the command enables export, and the validated plan must
+independently declare `articulation.enabled=true` and `mechanical=true`; its
+host-solved assembly must contain at least one movable mate. A successful
+structured export writes link-local GLBs under `artifacts/urdf_parts/` as well
+as `artifacts/model.urdf`.
+
+The URDF deliverable is intentionally visual/kinematic, not simulation-ready.
+It does not infer engineering scale, collision geometry, mass or inertia,
+transmissions, actuators, or simulator parameters. Those omissions are also
+recorded in `urdf_report.json`.
+
 For an explicitly glb-ref reconstruction:
 
 ```sh
@@ -146,17 +220,17 @@ missing form. Normal-aware and point-to-plane statistics catch wrong-facing or
 incoherent surfaces, visible-coverage gates focus canonical exterior evidence,
 and area-ratio gates catch missing or inflated shells. Per-object residuals,
 worst identities, and six-view heatmaps drive the repair loop. In `procedural`
-mode this is necessarily a best-effort authored
-approximation from images and measurements; use `glb-ref` when reference-derived
-geometry is acceptable. Increase `--max-fidelity-repairs` for difficult fine or
-surface assets.
+mode this is necessarily a best-effort authored approximation from images and
+measurements; use `glb-ref` when reference-derived geometry is acceptable. For
+difficult structured assets, increase the relevant part/geometry/material
+budget. `--max-fidelity-repairs` is the legacy-mode rendered-candidate budget.
 
-To upgrade an existing medium workspace such as a local mecha run, resume it
-with an explicit profile; the plan/profile mismatch intentionally triggers an
-authoring repair before the fine candidate is accepted:
+To upgrade an existing legacy medium workspace such as a local mecha run,
+resume it explicitly in legacy mode with the finer profile:
 
 ```sh
 uv run procagen3d run outputs/strike-style-mecha \
+  --pipeline-mode legacy \
   --granularity fine \
   --max-fidelity-repairs 3
 ```
@@ -182,13 +256,15 @@ uv run procagen3d run outputs/my-asset-procedural \
   --max-fidelity-repairs 1
 ```
 
-These are independent budgets: schema/source-guard/Blender failures use
-`--max-repairs`; only successful rendered candidates use
-`--max-fidelity-repairs`. Fidelity repair is adaptive: the pipeline stops when
-a candidate passes, when the first valid repair fails to improve the retained
-best candidate, or when the budget is exhausted. The default initial-authoring
-retry is one and can be set with `--max-initial-agent-retries`; safely complete
-source left by an agent timeout is validated and salvaged before retrying.
+The budgets are independent. Structured runs use `--max-part-repairs` for each
+frozen checkpoint, `--max-geometry-repairs` for one-diagnosis geometry fixes,
+and `--max-material-repairs` for PBR schema, geometry-guard, and material-gate
+failures. Their final build is certification-only. `--max-repairs` and
+`--max-fidelity-repairs` remain the schema/build and adaptive rendered-candidate
+budgets for legacy runs. Legacy repair stops on pass, first non-improvement, or
+budget exhaustion. The default planning retry is one and can be changed with
+`--max-initial-agent-retries`; safely complete source left by an agent timeout
+is validated and salvaged before retrying.
 
 Long operations now report their intermediate stages: reference inspection,
 canonical rendering, each agent author/repair pass, the clean Blender build,
@@ -236,20 +312,29 @@ image + offline GLB
              └─ canonical beauty, silhouette/RGB, depth, normal, and object-ID evidence
                          │
                          ▼
-               Codex / Grok / Cursor CLI
+             assembly planning agent
+         plan.json + geometry-free program scaffold
                          │
-                 plan.json + program.py
+          part graph + connector frames + mates
                          │
-             AST source contract and clean build
+          parent-before-child part authoring loop
                          │
-        Blender calls build() → editable .blend → exported GLB
+       host-solved transform → clean build → GLB re-import
+       → object/future/frozen-geometry checkpoint per part
                          │
-             re-import exact GLB + same-camera renders
+            deterministic geometry gates
                          │
-        color/material + detail + structural diagnostics
-        optional normal-aware bidirectional surface distance + heatmaps
+              one-diagnosis repair loop
                          │
-        non-compensating gates → adaptive repair → best-candidate rollback
+         dedicated PBR extraction + assignment
+                         │
+          material-only geometry guard + PBR gates
+                         │
+          final clean GLB re-import and all gates
+                         │
+             deterministic certification/publication
+                         │
+       optional link-local GLBs + validated visual/kinematic URDF
 ```
 
 The sample GLBs are deliberately handled as semantically weak evidence: most
@@ -273,6 +358,42 @@ numeric contact bounds, `max_gap`, `max_penetration`, and `min_contact_area`.
 Structural scoring resolves those names against the re-imported GLB and reports
 missing semantic objects, unjoined parts, and intersections not authorized by a
 `fused` or `embedded` relationship.
+
+Structured plans additionally contain:
+
+- `assembly.placement = "host-solved"`;
+- `assembly.part_order`, containing every part exactly once;
+- part-local `connectors` with origin and orthonormal X/Y/Z axes, interface
+  class, male/female/neutral role, and named nominal dimensions; and
+- `mates` pairing connectors with fit, clearance, fit offset, rest value, and
+  optional motion limits.
+
+Every non-root part—including an intentional visual gap—has a mate. A gap uses
+a rigid spatial constraint rather than falling back to an implicit identity
+transform, so all local part geometry receives deterministic placement.
+
+For each mate the host computes
+`T_child = T_parent · F_parent · fit · joint(rest) · inverse(F_child)`.
+Part builders therefore create geometry in local part coordinates. The clean
+Blender host applies the solved matrices and tags exported objects with their
+part IDs. This is a stronger contract than asking the coding agent to write an
+unverified placement statement.
+
+Final materials live in `material_plan`: a compact PBR library plus whole-part
+and optional subpart assignments. The generated program creates direct
+Principled constants after geometry construction. The dedicated pass is
+accepted only when both its checkpoint and final clean rebuild preserve the
+material-independent oriented-triangle fingerprint. Scene reports, checkpoint
+manifests, source snapshots, trajectory GLBs, and published GLBs are hash-bound
+to the resumable structured state.
+
+`articulation` is separate from ordinary visual attachment. In a structured
+host-solved plan it supplies explicit mechanical opt-in metadata; the URDF link
+tree, joint origins, axes, and limits are derived from the same assembly mates
+and connector-frame solution used to place the GLB parts. Explicit joint arrays
+are rejected in that mode so a second, inconsistent kinematic model cannot
+override the assembly. The CLI rejects spherical mates because standard URDF
+has no spherical joint type.
 
 The generated `program.py` must define a synchronous, zero-argument `build()`.
 It may use `bpy`, `bmesh`, `mathutils`, `math`, and `random`, but it may not read
@@ -315,9 +436,18 @@ outputs/<name>-<mode>/
 ├── src/
 │   ├── plan.json
 │   └── program.py
+├── structured_state.json          # exact-program/plan-bound resumable state
+├── checkpoints/
+│   ├── 001-<part>/                # accepted incremental GLB + reports
+│   ├── pre-material/              # rollback point
+│   └── materials/                 # guarded PBR checkpoint
 ├── artifacts/
 │   ├── scene.blend
 │   ├── model.glb
+│   ├── material_guard.json        # structured PBR runs
+│   ├── model.urdf                 # explicit mechanical opt-in
+│   ├── urdf_report.json
+│   ├── urdf_parts/manifest.json   # link-local GLBs
 │   ├── scene_report.json
 │   ├── model_probe.json
 │   ├── build_manifest.json
@@ -343,12 +473,13 @@ distance-and-normal coverage, and surface-area ratio. These gates are
 non-compensating, so good dimensions or silhouette cannot hide white materials,
 floating windows, fragmented body shells, or missing detail.
 
-`needs-review` still contains a valid program, BLEND, and GLB, but exhausted or
-stalled its fidelity-repair loop without passing. The published source and
-artifact directory are restored from the deterministic best valid candidate,
-while rejected iterations and their GLBs remain under `trajectories/`. Build or
-static failures never ship as valid artifacts. Commands return exit code 2 for
-`needs-review`, so CI can distinguish it from a passing result.
+`needs-review` still contains a valid program, BLEND, and GLB, but exhausted a
+structured part/geometry/material gate or stalled the legacy fidelity loop.
+The published source and artifact directory are restored from the deterministic
+best valid candidate, while rejected iterations and their GLBs remain under
+`trajectories/`. Build or static failures never ship as valid artifacts.
+Commands return exit code 2 for `needs-review`, so CI can distinguish it from a
+passing result.
 
 Reference evidence and build artifacts are assembled in same-filesystem staging
 directories and promoted as complete directory transactions. A failed probe or
@@ -379,25 +510,33 @@ running an installed wheel elsewhere, pass `--root /path/to/your/examples`.
 ```sh
 uv sync --group dev
 uv run pytest -q
-PROCAGEN3D_RUN_BLENDER_TESTS=1 uv run pytest -q tests/test_blender_integration.py
+PROCAGEN3D_RUN_BLENDER_TESTS=1 uv run pytest -q -m integration
 ```
 
 Tests cover GLB parsing/accessor transforms and material survivability,
-semantic-boundary detection, generated-source policy, typed attachment-plan
-validation, independent quality profiles, initial retry/source salvage,
-adaptive best-candidate repair, workspace provenance, color/detail/material/
-structural/surface hard gates, finite scene validation, atomic host-pipeline
-behavior, and portable build provenance. The opt-in Blender
+semantic-boundary detection, generated-source policy, typed attachment and
+connector-assembly solving, frozen incremental checkpoints, strict PBR plans
+and material-partition-invariant geometry guards, exact-source/artifact resume
+binding, URDF trees/link coverage,
+independent quality profiles, initial retry/source salvage, adaptive legacy
+best-candidate repair, workspace provenance, color/detail/material/structural/
+surface hard gates, finite scene validation, atomic host-pipeline behavior, and
+portable build provenance. The opt-in Blender
 integration tests save and export in one process, re-import in a second factory
 process, verify custom-mesh transforms through translated parent empties, and
 verify topology/contact reports, depth/normal/object-ID evidence, deterministic
 normal-aware bidirectional surface distance and heatmaps, reversed-normal
-detection, and that glb-ref export contains only newly created candidates.
+detection, that glb-ref export contains only newly created candidates, and that
+host-solved compiled parts split back into exact-name, part-local URDF GLBs.
 
 ## Design lineage
 
 The application adopts the code-as-truth workspace and stateless Blender ideas
 from [OpenTopos](https://github.com/gaoypeng/opentopos), and the principle of
 using a GLB as measured multi-view evidence from
-[img2threejs](https://github.com/img2threejs/img2threejs). Neither project nor the
-retired ProcAgen3D skill is a runtime dependency.
+[img2threejs](https://github.com/img2threejs/img2threejs). Version 0.2.0 adapts
+the ordered structure/assembly and dedicated PBR-stage ideas from
+[Agentic 3D Modeling with Procedural Control](https://arxiv.org/pdf/2608.26238)
+and its [Procedura reference code](https://github.com/SpatiaOS/Procedura), while
+reimplementing the contracts around ProcAgen3D's Python/Blender trust boundary.
+These projects and the retired ProcAgen3D skill are not runtime dependencies.

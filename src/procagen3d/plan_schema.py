@@ -8,7 +8,17 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Sequence
 
+from .assembly import (
+    ASSEMBLY_VERSION,
+    CONNECTOR_INTERFACES,
+    CONNECTOR_ROLES,
+    FIT_TYPES,
+    MATE_TYPES,
+    normalize_assembly,
+    validate_assembly,
+)
 from .granularity import DEFAULT_GRANULARITY, GRANULARITY_LEVELS
+from .materials import MaterialPlanError, material_plan_from_document
 from .quality import (
     DETAIL_RICHNESS_LEVELS,
     MATERIAL_FIDELITY_LEVELS,
@@ -51,6 +61,311 @@ _BOUNDS3: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+_CONNECTOR_FRAME_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["origin", "x_axis", "y_axis", "z_axis"],
+    "properties": {
+        "origin": _VECTOR3,
+        "x_axis": _VECTOR3,
+        "y_axis": _VECTOR3,
+        "z_axis": _VECTOR3,
+    },
+    "additionalProperties": False,
+    "description": (
+        "A right-handed orthonormal connector frame in owning-part local coordinates."
+    ),
+}
+
+_NOMINAL_DIMENSIONS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": {"type": "number", "exclusiveMinimum": 0},
+}
+
+_CONNECTOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "id",
+        "part_id",
+        "interface",
+        "role",
+        "frame",
+        "nominal_dimensions",
+    ],
+    "properties": {
+        "id": _NON_EMPTY_STRING,
+        "part_id": _NON_EMPTY_STRING,
+        "interface": {"type": "string", "enum": list(CONNECTOR_INTERFACES)},
+        "role": {"type": "string", "enum": list(CONNECTOR_ROLES)},
+        "frame": _CONNECTOR_FRAME_SCHEMA,
+        "nominal_dimensions": _NOMINAL_DIMENSIONS_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+_JOINT_LIMIT_VALUE_SCHEMA: dict[str, Any] = {
+    "type": ["number", "array"],
+    "minItems": 3,
+    "maxItems": 3,
+    "items": {"type": "number"},
+}
+
+_JOINT_LIMITS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["lower", "upper"],
+    "properties": {
+        "lower": _JOINT_LIMIT_VALUE_SCHEMA,
+        "upper": _JOINT_LIMIT_VALUE_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+_SCALAR_JOINT_LIMITS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["lower", "upper"],
+    "properties": {
+        "lower": {"type": "number"},
+        "upper": {"type": "number"},
+    },
+    "additionalProperties": False,
+}
+
+_SPHERICAL_JOINT_LIMITS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["lower", "upper"],
+    "properties": {
+        "lower": _VECTOR3,
+        "upper": _VECTOR3,
+    },
+    "additionalProperties": False,
+}
+
+_MATE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "id",
+        "type",
+        "parent_connector_id",
+        "child_connector_id",
+        "fit",
+        "clearance",
+        "fit_offset",
+        "nominal_dimensions",
+    ],
+    "properties": {
+        "id": _NON_EMPTY_STRING,
+        "type": {
+            "type": "string",
+            "enum": list(MATE_TYPES),
+            "description": (
+                "Rigid mates omit rest and limits. Revolute and prismatic mates use a "
+                "scalar rest value and optional scalar limits. Spherical mates use a "
+                "three-angle rest vector and optional three-vector limits."
+            ),
+        },
+        "parent_connector_id": _NON_EMPTY_STRING,
+        "child_connector_id": _NON_EMPTY_STRING,
+        "fit": {"type": "string", "enum": list(FIT_TYPES)},
+        "clearance": {"type": "number", "minimum": 0},
+        "fit_offset": _VECTOR3,
+        "nominal_dimensions": _NOMINAL_DIMENSIONS_SCHEMA,
+        "rest": {
+            "type": ["number", "array"],
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {"type": "number"},
+            "description": (
+                "Joint rest state. Omit for rigid mates; use a scalar for revolute or "
+                "prismatic mates and a three-angle vector for spherical mates."
+            ),
+        },
+        "limits": {
+            **_JOINT_LIMITS_SCHEMA,
+            "description": (
+                "Optional lower and upper joint limits matching the rest-state shape. "
+                "Rigid mates must omit this property."
+            ),
+        },
+    },
+    "additionalProperties": False,
+    "allOf": [
+        {
+            "if": {
+                "required": ["type"],
+                "properties": {"type": {"enum": ["rigid"]}},
+            },
+            "then": {
+                "properties": {
+                    "rest": {
+                        "not": {},
+                        "description": "Rigid mates must omit rest entirely.",
+                    },
+                    "limits": {
+                        "not": {},
+                        "description": "Rigid mates must omit limits entirely.",
+                    },
+                }
+            },
+        },
+        {
+            "if": {
+                "required": ["type"],
+                "properties": {
+                    "type": {"enum": ["revolute", "prismatic"]},
+                },
+            },
+            "then": {
+                "required": ["rest"],
+                "properties": {
+                    "rest": {"type": "number"},
+                    "limits": _SCALAR_JOINT_LIMITS_SCHEMA,
+                },
+            },
+        },
+        {
+            "if": {
+                "required": ["type"],
+                "properties": {"type": {"enum": ["spherical"]}},
+            },
+            "then": {
+                "required": ["rest"],
+                "properties": {
+                    "rest": _VECTOR3,
+                    "limits": _SPHERICAL_JOINT_LIMITS_SCHEMA,
+                },
+            },
+        },
+    ],
+}
+
+_ASSEMBLY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["version", "part_order", "connectors", "mates"],
+    "properties": {
+        "version": {"type": "integer", "enum": [ASSEMBLY_VERSION]},
+        "placement": {
+            "type": "string",
+            "enum": ["host-solved", "authored"],
+            "description": (
+                "host-solved keeps each part in local coordinates and applies connector "
+                "transforms in the trusted Blender build stage"
+            ),
+        },
+        "part_order": {
+            "type": "array",
+            "minItems": 1,
+            "items": _NON_EMPTY_STRING,
+        },
+        "connectors": {"type": "array", "items": _CONNECTOR_SCHEMA},
+        "mates": {"type": "array", "items": _MATE_SCHEMA},
+    },
+    "additionalProperties": False,
+    "description": (
+        "Ordered part graph and host-solved connector mates. The parts array remains "
+        "the source of semantic and acceptance attachment data."
+    ),
+}
+
+_COLOR4: dict[str, Any] = {
+    "type": "array",
+    "minItems": 4,
+    "maxItems": 4,
+    "items": {"type": "number", "minimum": 0, "maximum": 1},
+}
+
+_COLOR3_UNIT: dict[str, Any] = {
+    "type": "array",
+    "minItems": 3,
+    "maxItems": 3,
+    "items": {"type": "number", "minimum": 0, "maximum": 1},
+}
+
+_PBR_MATERIAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["id", "base_color_rgba", "metallic", "roughness"],
+    "properties": {
+        "id": _NON_EMPTY_STRING,
+        "name": _NON_EMPTY_STRING,
+        "base_color_rgba": _COLOR4,
+        "metallic": {"type": "number", "minimum": 0, "maximum": 1},
+        "roughness": {"type": "number", "minimum": 0, "maximum": 1},
+        "emissive_rgb": _COLOR3_UNIT,
+        "alpha_mode": {"type": "string", "enum": ["OPAQUE", "MASK", "BLEND"]},
+        "alpha_cutoff": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "additionalProperties": False,
+}
+
+_MATERIAL_ASSIGNMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["part_id", "material_id"],
+    "properties": {
+        "part_id": _NON_EMPTY_STRING,
+        "material_id": _NON_EMPTY_STRING,
+        "subpart_id": _NON_EMPTY_STRING,
+        "object_names": {"type": "array", "items": _NON_EMPTY_STRING},
+        "selector": _NON_EMPTY_STRING,
+    },
+    "additionalProperties": False,
+}
+
+_MATERIAL_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["schema_version", "materials", "assignments"],
+    "properties": {
+        "schema_version": {"type": "integer", "enum": [1]},
+        "materials": {"type": "array", "items": _PBR_MATERIAL_SCHEMA},
+        "assignments": {"type": "array", "items": _MATERIAL_ASSIGNMENT_SCHEMA},
+    },
+    "additionalProperties": False,
+    "description": "Dedicated glTF-safe PBR library and semantic assignment rules.",
+}
+
+_ARTICULATION_LIMIT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "lower": {"type": "number"},
+        "upper": {"type": "number"},
+        "effort": {"type": "number", "exclusiveMinimum": 0},
+        "velocity": {"type": "number", "exclusiveMinimum": 0},
+    },
+    "additionalProperties": False,
+}
+
+_ARTICULATION_JOINT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["name", "parent", "child", "type", "origin"],
+    "properties": {
+        "name": _NON_EMPTY_STRING,
+        "parent": _NON_EMPTY_STRING,
+        "child": _NON_EMPTY_STRING,
+        "type": {
+            "type": "string",
+            "enum": ["fixed", "rigid", "revolute", "continuous", "prismatic", "spherical"],
+        },
+        "origin": {
+            "type": "object",
+            "required": ["xyz", "rpy"],
+            "properties": {"xyz": _VECTOR3, "rpy": _VECTOR3},
+            "additionalProperties": False,
+        },
+        "axis": _VECTOR3,
+        "limit": _ARTICULATION_LIMIT_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+
+_ARTICULATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["enabled", "mechanical"],
+    "properties": {
+        "enabled": {"type": "boolean"},
+        "mechanical": {"type": "boolean"},
+        "robot_name": _NON_EMPTY_STRING,
+        "joints": {"type": "array", "items": _ARTICULATION_JOINT_SCHEMA},
+    },
+    "additionalProperties": False,
+}
+
 _ATTACHMENT_TYPES = (
     "root",
     "fused",
@@ -71,14 +386,55 @@ _ATTACHMENT_SCHEMA: dict[str, Any] = {
         "min_contact_area",
     ],
     "properties": {
-        "parent_id": _NON_EMPTY_STRING,
-        "type": {"type": "string", "enum": list(_ATTACHMENT_TYPES)},
+        "parent_id": {
+            **_NON_EMPTY_STRING,
+            "description": (
+                "Declared parent part ID. A root attachment must use the reserved "
+                "sentinel '__root__'; non-root attachments name another declared part."
+            ),
+        },
+        "type": {
+            "type": "string",
+            "enum": list(_ATTACHMENT_TYPES),
+            "description": (
+                "Only the single root part uses type 'root'; its parent_id is '__root__'."
+            ),
+        },
         "contact_region": _BOUNDS3,
         "max_gap": {"type": "number", "minimum": 0},
         "max_penetration": {"type": "number", "minimum": 0},
         "min_contact_area": {"type": "number", "minimum": 0},
     },
     "additionalProperties": False,
+    "allOf": [
+        {
+            "if": {
+                "required": ["type"],
+                "properties": {"type": {"enum": ["root"]}},
+            },
+            "then": {
+                "properties": {
+                    "parent_id": {
+                        "enum": ["__root__"],
+                        "description": (
+                            "The reserved root attachment parent sentinel is '__root__'."
+                        ),
+                    }
+                }
+            },
+            "else": {
+                "properties": {
+                    "parent_id": {
+                        "not": {"enum": ["__root__"]},
+                        "description": (
+                            "Non-root attachments must name another declared part, not "
+                            "the reserved '__root__' sentinel."
+                        ),
+                    }
+                }
+            },
+        }
+    ],
 }
 
 _PART_SCHEMA: dict[str, Any] = {
@@ -214,7 +570,10 @@ PLAN_SCHEMA: dict[str, Any] = {
             ),
             "items": _PART_SCHEMA,
         },
+        "assembly": _ASSEMBLY_SCHEMA,
         "materials": {"type": "array"},
+        "material_plan": _MATERIAL_PLAN_SCHEMA,
+        "articulation": _ARTICULATION_SCHEMA,
         "construction_strategy": {
             **_NON_EMPTY_STRING,
             "description": "How program.py will construct and organize the asset.",
@@ -254,11 +613,12 @@ def plan_schema_text() -> str:
 
 @dataclass(frozen=True)
 class PlanSchemaViolation:
-    """One validation failure with a stable JSON-path-like location."""
+    """One schema or semantic-contract failure with a stable JSON path."""
 
     path: tuple[str | int, ...]
     keyword: str
     message: str
+    contract: str = "schema"
 
     @property
     def location(self) -> str:
@@ -273,17 +633,34 @@ class PlanSchemaViolation:
         return value
 
     def __str__(self) -> str:
-        return f"{self.location}: {self.message}"
+        return f"[{self.contract}] {self.location}: {self.message}"
 
 
 class PlanSchemaError(ValueError):
-    """Raised after collecting every violation in a plan document."""
+    """Raised after collecting every schema and semantic plan violation."""
 
     def __init__(self, violations: Sequence[PlanSchemaViolation]):
         self.violations = tuple(violations)
         count = len(self.violations)
+        schema_count = sum(violation.contract == "schema" for violation in self.violations)
+        semantic_count = sum(
+            violation.contract == "semantic" for violation in self.violations
+        )
+        if schema_count and semantic_count:
+            contract = "the JSON Schema and semantic contract"
+            breakdown = f": {schema_count} schema, {semantic_count} semantic"
+        elif semantic_count:
+            contract = "the semantic contract"
+            breakdown = ""
+        else:
+            contract = "the JSON Schema"
+            breakdown = ""
         details = "\n".join(f"- {violation}" for violation in self.violations)
-        super().__init__(f"plan violates the JSON Schema ({count} error{'s' if count != 1 else ''}):\n{details}")
+        super().__init__(
+            f"plan violates {contract} "
+            f"({count} error{'s' if count != 1 else ''}{breakdown}):\n"
+            f"{details}"
+        )
 
 
 def _counted(value: int, singular: str) -> str:
@@ -324,6 +701,12 @@ def _iter_violations(
     *,
     path: tuple[str | int, ...] = (),
 ) -> Iterator[PlanSchemaViolation]:
+    forbidden = schema.get("not")
+    if isinstance(forbidden, Mapping) and not tuple(
+        _iter_violations(value, forbidden, path=path)
+    ):
+        yield PlanSchemaViolation(path, "not", "is not allowed in this context")
+
     expected_type = schema.get("type")
     if expected_type is not None:
         expected_types = [expected_type] if isinstance(expected_type, str) else expected_type
@@ -645,6 +1028,7 @@ def _semantic_plan_violations(value: Mapping[str, Any]) -> tuple[PlanSchemaViola
                     ("parts", index, "id"),
                     "uniquePartId",
                     f"part id {identifier!r} must be unique",
+                    contract="semantic",
                 )
             )
         bounds = part.get("approximate_bounds")
@@ -663,6 +1047,7 @@ def _semantic_plan_violations(value: Mapping[str, Any]) -> tuple[PlanSchemaViola
                                 ("parts", index, "approximate_bounds", "min", axis),
                                 "orderedBounds",
                                 "must not exceed the matching maximum",
+                                contract="semantic",
                             )
                         )
         attachment = part.get("attachment")
@@ -678,6 +1063,7 @@ def _semantic_plan_violations(value: Mapping[str, Any]) -> tuple[PlanSchemaViola
                         ("parts", index, "attachment", "parent_id"),
                         "rootParent",
                         "a root attachment must use '__root__'",
+                        contract="semantic",
                     )
                 )
         elif kind in _ATTACHMENT_TYPES and isinstance(parent_id, str):
@@ -687,6 +1073,7 @@ def _semantic_plan_violations(value: Mapping[str, Any]) -> tuple[PlanSchemaViola
                         ("parts", index, "attachment", "parent_id"),
                         "selfParent",
                         "a part cannot attach to itself",
+                        contract="semantic",
                     )
                 )
             elif parent_id not in known:
@@ -695,6 +1082,7 @@ def _semantic_plan_violations(value: Mapping[str, Any]) -> tuple[PlanSchemaViola
                         ("parts", index, "attachment", "parent_id"),
                         "knownParent",
                         "must reference another declared part id",
+                        contract="semantic",
                     )
                 )
             elif identifier is not None:
@@ -723,6 +1111,7 @@ def _semantic_plan_violations(value: Mapping[str, Any]) -> tuple[PlanSchemaViola
                                 ),
                                 "orderedBounds",
                                 "must not exceed the matching maximum",
+                                contract="semantic",
                             )
                         )
 
@@ -732,6 +1121,7 @@ def _semantic_plan_violations(value: Mapping[str, Any]) -> tuple[PlanSchemaViola
                 ("parts",),
                 "singleRoot",
                 "attachment graph must contain exactly one root part",
+                contract="semantic",
             )
         )
 
@@ -753,6 +1143,31 @@ def _semantic_plan_violations(value: Mapping[str, Any]) -> tuple[PlanSchemaViola
                     ("parts", index, "attachment", "parent_id"),
                     "acyclicAttachment",
                     "attachment parent references must not form a cycle",
+                    contract="semantic",
+                )
+            )
+    for issue in validate_assembly(value).issues:
+        violations.append(
+            PlanSchemaViolation(
+                issue.path,
+                issue.keyword,
+                issue.message,
+                contract="semantic",
+            )
+        )
+    if "material_plan" in value:
+        try:
+            material_plan = material_plan_from_document(value.get("material_plan"))
+            material_plan.validate_part_ids(
+                identifier for identifier in ids if identifier is not None
+            )
+        except MaterialPlanError as exc:
+            violations.append(
+                PlanSchemaViolation(
+                    ("material_plan",),
+                    "materialPlan",
+                    str(exc),
+                    contract="semantic",
                 )
             )
     return tuple(violations)
@@ -786,6 +1201,9 @@ def validate_plan_document(value: Any) -> dict[str, Any]:
         normalized["quality_profile"] = profile
         normalized["parts"] = _normalize_parts(
             normalized.get("parts"), dimensions=normalized.get("dimensions")
+        )
+        normalized["assembly"] = normalize_assembly(
+            normalized.get("parts"), normalized.get("assembly")
         )
 
     violations = list(plan_schema_violations(normalized))

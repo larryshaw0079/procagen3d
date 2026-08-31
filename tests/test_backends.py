@@ -458,7 +458,9 @@ class BackendFactoryAndRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory).resolve()
             trajectory = workspace / "trajectories" / "iter_00"
-            missing_cli = workspace / "does-not-exist" / "codex"
+            # Incidental HTTP-like digits in a filesystem path must not turn
+            # an ordinary spawn error into a provider quota result.
+            missing_cli = workspace / "incidental-429-does-not-exist" / "codex"
             result = CodexBackend(cli=str(missing_cli)).run(
                 prompt="write both deliverables",
                 workspace=workspace,

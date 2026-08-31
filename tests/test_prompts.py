@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from procagen3d.plan_schema import plan_schema_text
-from procagen3d.prompts import initial_prompt, repair_prompt
+from procagen3d.plan_schema import PLAN_SCHEMA, plan_schema_text
+from procagen3d.prompts import (
+    assembly_planning_prompt,
+    dedicated_material_prompt,
+    incremental_part_prompt,
+    initial_prompt,
+    repair_prompt,
+)
 from procagen3d.quality import QualityProfile
 
 
@@ -129,3 +136,93 @@ def test_prompts_bind_typed_attachments_diagnostics_and_independent_quality(
         assert "contact region" in prompt
         assert "gap/penetration" in prompt
         assert "depth" in prompt and "world-normal" in prompt and "object-ID" in prompt
+
+
+def test_assembly_planning_prompt_states_semantic_plan_constraints(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "inputs" / "reference.png"
+    image.parent.mkdir()
+    image.write_bytes(b"image")
+
+    prompt = assembly_planning_prompt(
+        root=tmp_path,
+        image=image,
+        user_prompt="Build this articulated machine",
+        export_urdf=True,
+    )
+    flat_prompt = " ".join(prompt.split())
+
+    assert "rigid mate must omit `rest` and `limits` entirely" in flat_prompt
+    assert "revolute or prismatic mate requires a finite scalar `rest`" in flat_prompt
+    assert "spherical mate" in flat_prompt and "three-number `rest`" in flat_prompt
+    assert "`attachment.parent_id` is the literal sentinel `__root__`" in flat_prompt
+    assert "not `world`" in flat_prompt
+    assert "Omit `material_plan` from `src/plan.json`" in flat_prompt
+    assert "dedicated material stage is the only stage allowed" in flat_prompt
+    schema_payload = prompt.split("Authoritative schema:\n```json\n", 1)[1].split(
+        "\n```", 1
+    )[0]
+    planning_schema = json.loads(schema_payload)
+    assert "material_plan" not in planning_schema["properties"]
+    assert planning_schema["additionalProperties"] is False
+    assert "material_plan" in PLAN_SCHEMA["properties"]
+
+
+def test_assembly_planning_retry_includes_exact_host_rejection(tmp_path: Path) -> None:
+    image = tmp_path / "inputs" / "reference.png"
+    image.parent.mkdir()
+    image.write_bytes(b"image")
+    rejection = (
+        "src/plan.json plan violates the JSON Schema (2 errors):\n"
+        "- $.assembly.mates[0]: rigid mates must not declare rest or limits\n"
+        "- $.parts[0].attachment.parent_id: a root attachment must use '__root__'"
+    )
+
+    prompt = assembly_planning_prompt(
+        root=tmp_path,
+        image=image,
+        user_prompt="Repair the plan",
+        failure=rejection,
+    )
+
+    assert "Strict planning repair" in prompt
+    assert rejection in prompt
+    assert "correct all of them" in prompt
+    assert "do not spend the retry changing unrelated subject identity" in prompt
+
+
+def test_dedicated_material_prompt_disambiguates_assignment_targets() -> None:
+    prompt = dedicated_material_prompt(
+        plan={"parts": [{"id": "body", "object_names": ["Body", "Trim"]}]},
+        geometry_signature={"object_count": 2},
+    )
+    flat_prompt = " ".join(prompt.split())
+
+    assert "pair (`part_id`, `subpart_id`) and must occur exactly once" in flat_prompt
+    assert "at most one assignment may omit `subpart_id`" in flat_prompt
+    assert "Never create several whole-part assignments" in flat_prompt
+    assert "unique semantic `subpart_id`" in flat_prompt
+    assert "two subpart rules must not claim the same object" in flat_prompt
+    assert "Assign every declared part at least once" in flat_prompt
+
+
+def test_incremental_and_material_prompts_require_scene_linked_objects() -> None:
+    guidance = (
+        "Link every data-created Blender object to `bpy.context.scene.collection` or an "
+        "explicitly scene-linked collection; never assume `bpy.context.collection` is non-null."
+    )
+    incremental = incremental_part_prompt(
+        part={"id": "body", "object_names": ["Body"]},
+        assembly={"connectors": [], "mates": []},
+        completed_part_ids=[],
+        part_index=0,
+        part_count=1,
+    )
+    materials = dedicated_material_prompt(
+        plan={"parts": [{"id": "body", "object_names": ["Body"]}]},
+        geometry_signature={"object_count": 1},
+    )
+
+    assert guidance in incremental
+    assert guidance in materials

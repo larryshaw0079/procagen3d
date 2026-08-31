@@ -30,6 +30,8 @@ GLB_VERSION = 2
 JSON_CHUNK = 0x4E4F534A
 BIN_CHUNK = 0x004E4942
 MAX_DECODED_POSITION_COUNT = 2_000_000
+MAX_HASHED_ACCESSOR_ELEMENTS = 10_000_000
+MAX_HASHED_ACCESSOR_BYTES = 256 * 1024 * 1024
 GLTF_DEFAULT_BASE_COLOR_FACTOR = (1.0, 1.0, 1.0, 1.0)
 
 _COMPONENTS: dict[int, tuple[str, int]] = {
@@ -525,6 +527,178 @@ def _validate_accessor_layout(
         element_bytes=component[1] * component_count,
         label=f"accessor {accessor_index} sparse values",
     )
+
+
+def _accessor_content_sha256(
+    document: dict[str, Any],
+    buffer_payloads: dict[int, bytes],
+    accessor_index: int,
+) -> str:
+    """Hash the logical accessor elements, excluding stride/padding bytes.
+
+    The small canonical header binds component and shape metadata. Dense and
+    sparse encodings of the same values hash identically, while interleaved
+    attributes do not contaminate each other's content hashes. Limits keep a
+    malformed or unexpectedly large file from turning a metadata probe into an
+    unbounded CPU or memory operation.
+    """
+
+    accessors = _as_list(document, "accessors")
+    accessor = _record_at(accessors, accessor_index, "accessor")
+    _validate_accessor_layout(document, buffer_payloads, accessor_index)
+    try:
+        count = int(accessor.get("count", 0))
+        component_type = int(accessor.get("componentType", 0))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise GLBProbeError(
+            f"accessor {accessor_index} has invalid count or componentType"
+        ) from exc
+    component = _COMPONENTS.get(component_type)
+    type_name = str(accessor.get("type"))
+    component_count = _TYPE_COMPONENTS.get(type_name)
+    if component is None or component_count is None:
+        raise GLBProbeError(f"accessor {accessor_index} has unsupported element format")
+    if count > MAX_HASHED_ACCESSOR_ELEMENTS:
+        raise GLBProbeError(
+            f"accessor {accessor_index} has {count} elements; content hashing is "
+            f"limited to {MAX_HASHED_ACCESSOR_ELEMENTS}"
+        )
+    _, component_bytes = component
+    element_bytes = component_bytes * component_count
+    logical_bytes = count * element_bytes
+    if logical_bytes > MAX_HASHED_ACCESSOR_BYTES:
+        raise GLBProbeError(
+            f"accessor {accessor_index} has {logical_bytes} logical bytes; content "
+            f"hashing is limited to {MAX_HASHED_ACCESSOR_BYTES}"
+        )
+
+    digest = hashlib.sha256()
+    digest.update(b"procagen3d-logical-accessor-v1\x00")
+    digest.update(
+        json.dumps(
+            {
+                "component_type": component_type,
+                "count": count,
+                "normalized": bool(accessor.get("normalized", False)),
+                "type": type_name,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    )
+    digest.update(b"\x00")
+
+    view_index = accessor.get("bufferView")
+    base_payload: bytes | None = None
+    base_offset = 0
+    base_stride = element_bytes
+    if view_index is not None:
+        base_payload, view_start, _, view = _view_range(
+            document, buffer_payloads, int(view_index)
+        )
+        base_offset = view_start + int(accessor.get("byteOffset", 0))
+        base_stride = int(view.get("byteStride", element_bytes))
+
+    sparse = accessor.get("sparse")
+    if sparse is None:
+        if count and base_payload is None:
+            raise GLBProbeError(
+                f"accessor {accessor_index} has no dense or sparse content"
+            )
+        if base_payload is not None and base_stride == element_bytes:
+            digest.update(
+                memoryview(base_payload)[
+                    base_offset : base_offset + count * element_bytes
+                ]
+            )
+        elif base_payload is not None:
+            view = memoryview(base_payload)
+            for item_index in range(count):
+                start = base_offset + item_index * base_stride
+                digest.update(view[start : start + element_bytes])
+        return digest.hexdigest()
+
+    assert isinstance(sparse, dict)  # validated by _validate_accessor_layout
+    sparse_count = int(sparse.get("count", 0))
+    sparse_indices = sparse["indices"]
+    sparse_values = sparse["values"]
+    assert isinstance(sparse_indices, dict) and isinstance(sparse_values, dict)
+    sparse_index_type = int(sparse_indices["componentType"])
+    sparse_index_format, sparse_index_bytes = _COMPONENTS[sparse_index_type]
+    index_payload, index_view_start, _, _ = _view_range(
+        document, buffer_payloads, int(sparse_indices["bufferView"])
+    )
+    index_offset = index_view_start + int(sparse_indices.get("byteOffset", 0))
+    value_payload, value_view_start, _, _ = _view_range(
+        document, buffer_payloads, int(sparse_values["bufferView"])
+    )
+    value_offset = value_view_start + int(sparse_values.get("byteOffset", 0))
+    unpack_index = struct.Struct("<" + sparse_index_format).unpack_from
+
+    sparse_cursor = 0
+    previous_target = -1
+
+    def sparse_target(cursor: int) -> int:
+        target = int(
+            unpack_index(index_payload, index_offset + cursor * sparse_index_bytes)[0]
+        )
+        if not 0 <= target < count:
+            raise GLBProbeError(
+                f"accessor {accessor_index} sparse index {target} is out of range"
+            )
+        return target
+
+    next_target = sparse_target(0) if sparse_count else None
+    base_view = memoryview(base_payload) if base_payload is not None else None
+    value_view = memoryview(value_payload)
+    zero = bytes(element_bytes)
+    for item_index in range(count):
+        if next_target == item_index:
+            if next_target <= previous_target:
+                raise GLBProbeError(
+                    f"accessor {accessor_index} sparse indices must be strictly increasing"
+                )
+            start = value_offset + sparse_cursor * element_bytes
+            digest.update(value_view[start : start + element_bytes])
+            previous_target = next_target
+            sparse_cursor += 1
+            next_target = (
+                sparse_target(sparse_cursor)
+                if sparse_cursor < sparse_count
+                else None
+            )
+        elif base_view is not None:
+            start = base_offset + item_index * base_stride
+            digest.update(base_view[start : start + element_bytes])
+        else:
+            digest.update(zero)
+    if sparse_cursor != sparse_count:
+        raise GLBProbeError(
+            f"accessor {accessor_index} sparse indices must be strictly increasing"
+        )
+    return digest.hexdigest()
+
+
+def _implicit_indices_sha256(vertex_count: int) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"procagen3d-implicit-indices-v1\x00")
+    digest.update(str(vertex_count).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _primitive_geometry_sha256(
+    *, mode: int, position_sha256: str, indices_sha256: str
+) -> str:
+    encoded = json.dumps(
+        {
+            "indices_sha256": indices_sha256,
+            "mode": mode,
+            "position_sha256": position_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(b"procagen3d-primitive-geometry-v1\x00" + encoded).hexdigest()
 
 
 def _validate_tightly_packed_range(
@@ -1025,6 +1199,18 @@ def probe_glb(path: Path) -> dict[str, Any]:
     material_vertex_color_usage = [0] * len(materials)
     primitives_without_material = 0
     materialless_vertex_color_primitives = 0
+    accessor_content_hashes: dict[int, str] = {}
+
+    def accessor_content_sha256(accessor_index: int) -> str | None:
+        accessor = _record_at(accessors, accessor_index, "accessor")
+        if geometry_extensions or accessor_uses_external_buffer(accessor):
+            return None
+        if accessor_index not in accessor_content_hashes:
+            accessor_content_hashes[accessor_index] = _accessor_content_sha256(
+                document, buffer_payloads, accessor_index
+            )
+        return accessor_content_hashes[accessor_index]
+
     for mesh_index, mesh_value in enumerate(meshes):
         mesh = _record_at(meshes, mesh_index, "mesh")
         primitives = mesh.get("primitives", [])
@@ -1066,6 +1252,7 @@ def probe_glb(path: Path) -> dict[str, Any]:
                 if has_vertex_color:
                     materialless_vertex_color_primitives += 1
             position_bounds: dict[str, Any] | None = None
+            position_sha256: str | None = None
             vertex_count = 0
             if position_index is None:
                 warnings.append(
@@ -1080,6 +1267,7 @@ def probe_glb(path: Path) -> dict[str, Any]:
                     accessors, int(position_index), "POSITION accessor"
                 )
                 vertex_count = int(position_accessor.get("count", 0))
+                position_sha256 = accessor_content_sha256(int(position_index))
                 minimum, maximum, source = _position_bounds(
                     document, buffer_payloads, int(position_index)
                 )
@@ -1090,9 +1278,13 @@ def probe_glb(path: Path) -> dict[str, Any]:
                 primitives_with_normals += 1
             index_accessor = primitive.get("indices")
             element_count = vertex_count
+            indices_sha256: str | None = None
             if index_accessor is not None:
                 record = _record_at(accessors, int(index_accessor), "index accessor")
                 element_count = int(record.get("count", 0))
+                indices_sha256 = accessor_content_sha256(int(index_accessor))
+            elif position_sha256 is not None:
+                indices_sha256 = _implicit_indices_sha256(vertex_count)
             mode = int(primitive.get("mode", 4))
             triangles = _triangle_count(mode, element_count)
             total_triangles += triangles
@@ -1110,6 +1302,16 @@ def probe_glb(path: Path) -> dict[str, Any]:
             }
             if position_bounds is not None:
                 primitive_record["position_bounds"] = position_bounds
+            if position_sha256 is not None:
+                primitive_record["position_sha256"] = position_sha256
+            if indices_sha256 is not None:
+                primitive_record["indices_sha256"] = indices_sha256
+            if position_sha256 is not None and indices_sha256 is not None:
+                primitive_record["geometry_sha256"] = _primitive_geometry_sha256(
+                    mode=mode,
+                    position_sha256=position_sha256,
+                    indices_sha256=indices_sha256,
+                )
             if primitive.get("targets"):
                 primitive_record["morph_target_count"] = len(primitive["targets"])
                 warnings.append(
@@ -1220,12 +1422,19 @@ def probe_glb(path: Path) -> dict[str, Any]:
         world = _multiply(parent, node_record["local_matrix"])
         mesh_index = node_record.get("mesh")
         if mesh_index is not None:
+            parent_node = path_stack[-1] if path_stack else None
             instance: dict[str, Any] = {
                 "node": node_index,
                 "node_name": node_record.get("name"),
                 "mesh": int(mesh_index),
                 "world_matrix": world,
                 "path": [*path_stack, node_index],
+                "parent_node": parent_node,
+                "parent_name": (
+                    node_records[parent_node].get("name")
+                    if parent_node is not None
+                    else None
+                ),
             }
             local = mesh_local_bounds.get(int(mesh_index))
             if local is not None:

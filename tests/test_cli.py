@@ -17,6 +17,12 @@ def test_make_defaults_to_requested_codex_configuration() -> None:
     assert args.max_repairs == 2
     assert args.max_fidelity_repairs == 1
     assert args.max_initial_agent_retries == 1
+    assert args.pipeline_mode == "structured"
+    assert args.max_part_repairs == 1
+    assert args.max_geometry_repairs == 1
+    assert args.max_material_repairs == 1
+    assert args.dedicated_materials is True
+    assert args.export_urdf is False
     assert args.reconstruction_mode == "procedural"
     assert args.granularity == "medium"
     assert args.surface_fidelity is None
@@ -28,8 +34,8 @@ def test_make_defaults_to_requested_codex_configuration() -> None:
     assert backend.reasoning_effort == "xhigh"
 
 
-def test_release_version_is_ongoing_0_1_1() -> None:
-    assert __version__ == "0.1.1"
+def test_release_version_is_0_2_0() -> None:
+    assert __version__ == "0.2.0"
 
 
 def test_run_uses_manifest_backend_when_override_is_absent() -> None:
@@ -38,6 +44,9 @@ def test_run_uses_manifest_backend_when_override_is_absent() -> None:
     assert args.backend is None
     assert args.reconstruction_mode is None
     assert args.granularity is None
+    assert args.pipeline_mode is None
+    assert args.dedicated_materials is None
+    assert args.export_urdf is None
 
 
 def test_make_accepts_glb_ref_mode() -> None:

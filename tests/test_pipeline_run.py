@@ -302,7 +302,11 @@ def test_initial_agent_failure_retries_in_a_new_trajectory(
 
     report = pipeline.run_pipeline(
         workspace,
-        PipelineConfig(max_initial_agent_retries=1, max_repairs=0),
+        PipelineConfig(
+            pipeline_mode="legacy",
+            max_initial_agent_retries=1,
+            max_repairs=0,
+        ),
     )
 
     assert invocations == [0, 1]
@@ -310,6 +314,132 @@ def test_initial_agent_failure_retries_in_a_new_trajectory(
     assert report["agent_runs"][0]["error"] == "initial provider timeout"
     assert report["retry_budget"]["initial_agent"] == {"used": 1, "maximum": 1}
     assert report["status"] == "complete"
+
+
+def test_structured_initial_retry_receives_exact_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.plan_path.unlink()
+    workspace.program_path.unlink()
+    monkeypatch.setattr(pipeline.BlenderRuntime, "discover", lambda explicit=None: object())
+    monkeypatch.setattr(pipeline, "prepare_reference", lambda *args, **kwargs: _prepared_probe())
+
+    prompts: list[str] = []
+    invocation_modes: list[tuple[bool, bool]] = []
+
+    def fake_agent(*args, **kwargs):
+        prompts.append(kwargs["prompt"])
+        invocation_modes.append(
+            (kwargs["is_repair"], kwargs["include_candidate"])
+        )
+        workspace.program_path.write_text("def build():\n    pass\n", encoding="utf-8")
+        write_json(workspace.plan_path, {"assembly": {}})
+        return {
+            "backend": "fake",
+            "model": "fake",
+            "provider_success": True,
+            "files_modified": ["src/plan.json", "src/program.py"],
+        }
+
+    validation_failure = (
+        "HOST-VALIDATION-42: $.assembly.mates[0]: "
+        "rigid mates must not declare rest or limits"
+    )
+    validation_calls = 0
+
+    def fake_validate(path: Path) -> dict:
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 1:
+            raise PipelineError(validation_failure)
+        return {"assembly": {}, "parts": []}
+
+    def stop_after_planning(*args, **kwargs):
+        raise PipelineError("stop after structured planning")
+
+    monkeypatch.setattr(pipeline, "_invoke_agent", fake_agent)
+    monkeypatch.setattr(pipeline, "_validate_plan", fake_validate)
+    monkeypatch.setattr(
+        pipeline,
+        "_validate_explicit_assembly_contract",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(pipeline, "_load_structured_state", stop_after_planning)
+
+    with pytest.raises(PipelineError, match="stop after structured planning"):
+        pipeline.run_pipeline(
+            workspace,
+            PipelineConfig(
+                pipeline_mode="structured",
+                max_initial_agent_retries=1,
+            ),
+        )
+
+    assert len(prompts) == 2
+    assert validation_failure not in prompts[0]
+    assert validation_failure in prompts[1]
+    assert prompts[1] != prompts[0]
+    assert invocation_modes == [(False, False), (True, True)]
+
+
+def test_run_repairs_preserved_invalid_structured_plan_before_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    write_json(workspace.plan_path, {"assembly": {}})
+    monkeypatch.setattr(pipeline.BlenderRuntime, "discover", lambda explicit=None: object())
+    monkeypatch.setattr(pipeline, "prepare_reference", lambda *args, **kwargs: _prepared_probe())
+
+    validation_failure = (
+        "src/plan.json plan violates the validation contract (1 error):\n"
+        "- $.parts[0].attachment.parent_id: a root attachment must use '__root__'"
+    )
+    validation_calls = 0
+
+    def fake_validate(path: Path) -> dict:
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 1:
+            raise PipelineError(validation_failure)
+        return {"assembly": {}, "parts": []}
+
+    invocations: list[dict] = []
+
+    def fake_agent(*args, **kwargs):
+        invocations.append(kwargs)
+        return {
+            "backend": "fake",
+            "model": "fake",
+            "provider_success": True,
+            "files_modified": ["src/plan.json", "src/program.py"],
+        }
+
+    def stop_after_planning(*args, **kwargs):
+        raise PipelineError("stop after preserved planning repair")
+
+    monkeypatch.setattr(pipeline, "_validate_plan", fake_validate)
+    monkeypatch.setattr(
+        pipeline,
+        "_validate_explicit_assembly_contract",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(pipeline, "_invoke_agent", fake_agent)
+    monkeypatch.setattr(pipeline, "_load_structured_state", stop_after_planning)
+
+    with pytest.raises(PipelineError, match="stop after preserved planning repair"):
+        pipeline.run_pipeline(
+            workspace,
+            PipelineConfig(
+                pipeline_mode="structured",
+                max_initial_agent_retries=1,
+            ),
+        )
+
+    assert len(invocations) == 1
+    assert validation_failure in invocations[0]["prompt"]
+    assert invocations[0]["is_repair"] is True
+    assert invocations[0]["include_candidate"] is True
 
 
 def test_post_render_repairs_stop_on_stall_and_restore_best_candidate(
