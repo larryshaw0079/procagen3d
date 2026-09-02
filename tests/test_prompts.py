@@ -226,3 +226,22 @@ def test_incremental_and_material_prompts_require_scene_linked_objects() -> None
 
     assert guidance in incremental
     assert guidance in materials
+
+
+def test_incremental_prompt_requires_call_free_literal_registries() -> None:
+    prompt = incremental_part_prompt(
+        part={"id": "body", "object_names": ["Body"]},
+        assembly={"connectors": [], "mates": []},
+        completed_part_ids=[],
+        part_index=0,
+        part_count=1,
+    )
+
+    assert '`PROCAGEN3D_PART_BUILDERS = {..., "body": build_function}`' in prompt
+    assert '`PROCAGEN3D_COMPLETED_PARTS = [..., "body"]`' in prompt
+    assert '`PROCAGEN3D_PART_BUILDERS["body"] = ...`' in prompt
+    assert "never use\n`.append()`, `.extend()`, `.insert()`, or `.update()`" in prompt
+    assert "Preserve exactly one undecorated, synchronous, no-argument" in prompt
+    assert "Do not use module-level classes, decorators, function or method calls" in prompt
+    assert "attribute or subscript assignments, or control flow" in prompt
+    assert "dynamic introspection such as\n  `getattr`" in prompt

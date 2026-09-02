@@ -319,8 +319,13 @@ Host-solved world transform for this part, when available:
 
 Previously accepted part IDs are `{json.dumps(completed_part_ids)}`. Their builder functions,
 object names, geometry, transforms, connector features, and registration order are frozen. Do not
-edit them. Add one deterministic builder for `{part.get('id')}`, register it in
-`PROCAGEN3D_PART_BUILDERS`, and append only this ID to `PROCAGEN3D_COMPLETED_PARTS`.
+edit them. Add one deterministic builder for `{part.get('id')}` and add only this ID to the two
+existing registry bindings. Keep both registries as complete, call-free module-level container
+assignments, preserving every accepted entry, for example
+`PROCAGEN3D_PART_BUILDERS = {{..., "{part.get('id')}": build_function}}` and
+`PROCAGEN3D_COMPLETED_PARTS = [..., "{part.get('id')}"]`. Never register with a module-level
+subscript assignment such as `PROCAGEN3D_PART_BUILDERS["{part.get('id')}"] = ...`, and never use
+`.append()`, `.extend()`, `.insert()`, or `.update()` at module scope.
 
 Construction contract:
 - Create every exact `object_names` entry declared for this part and no future part objects.
@@ -330,6 +335,11 @@ Construction contract:
   `build()`. Use the matrix only to understand the resulting world location and orientation.
 - Keep geometry semantically editable and deterministic. Use neutral, direct-constant Principled
   materials only; final PBR extraction and assignment happen later.
+- At module scope use only imports, call-free plain-name assignments, and helper function
+  definitions. Preserve exactly one undecorated, synchronous, no-argument top-level `def build():`;
+  the host calls it. Do not use module-level classes, decorators, function or method calls,
+  attribute or subscript assignments, or control flow. Do not use dynamic introspection such as
+  `getattr`; access known Blender attributes directly.
 - {_SAFE_COLLECTION_LINKING_CONTRACT}
 - Do not edit `src/plan.json`: its parts, object ownership, connectors, mates, and articulation
   are frozen planning outputs. Never collapse or merge accepted semantic parts.

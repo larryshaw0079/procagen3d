@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,8 @@ from procagen3d.urdf import (
     export_urdf,
     plan_to_urdf,
     render_urdf,
+    resolve_urdf_link_frames,
+    resolve_urdf_motion_probes,
 )
 from procagen3d.workspace import Workspace, sha256, write_json
 
@@ -97,6 +100,10 @@ def test_render_and_atomic_export_are_deterministic(tmp_path: Path) -> None:
     mesh = root.find("./link[@name='base']/visual/geometry/mesh")
     assert mesh is not None
     assert mesh.attrib["filename"] == "model.glb"
+    visual_origin = root.find("./link[@name='base']/visual/origin")
+    assert visual_origin is not None
+    assert visual_origin.attrib["xyz"] == "0 0 0"
+    assert visual_origin.attrib["rpy"] == "1.57079632679 0 0"
     assert root.find("./link[@name='arm']/visual") is None
     axis = root.find("./joint[@name='extension']/axis")
     assert axis is not None
@@ -159,6 +166,9 @@ def test_per_link_meshes_emit_real_articulated_visuals_and_report_mapping(
         mesh = root.find(f"./link[@name='{link_name}']/visual/geometry/mesh")
         assert mesh is not None
         assert mesh.attrib["filename"] == expected_uri
+        origin = root.find(f"./link[@name='{link_name}']/visual/origin")
+        assert origin is not None
+        assert origin.attrib["rpy"] == "1.57079632679 0 0"
 
     destination = tmp_path / "robot.urdf"
     report = export_urdf(
@@ -174,6 +184,31 @@ def test_per_link_meshes_emit_real_articulated_visuals_and_report_mapping(
         "base": "meshes/base.glb",
         "slider": "package://mechanism/meshes/slider.glb",
     }
+
+
+def test_visual_axis_conversion_uses_uri_path_suffix_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    document = render_urdf(
+        _plan(),
+        _model(tmp_path),
+        link_meshes={
+            "base": "package://mechanism/meshes/base.GLB?revision=7",
+            "arm": "meshes/arm.gLtF#primary",
+            "slider": "meshes/slider.dae?source=slider.glb",
+        },
+    )
+    root = ET.fromstring(document.xml)
+
+    expected = {
+        "base": "1.57079632679 0 0",
+        "arm": "1.57079632679 0 0",
+        "slider": "0 0 0",
+    }
+    for link_name, expected_rpy in expected.items():
+        origin = root.find(f"./link[@name='{link_name}']/visual/origin")
+        assert origin is not None
+        assert origin.attrib["rpy"] == expected_rpy
 
 
 @pytest.mark.parametrize(
@@ -384,9 +419,9 @@ def test_procedura_assembly_connectors_and_mates_are_supported(tmp_path: Path) -
     assert joint.attrib["type"] == "revolute"
     assert joint.find("parent").attrib["link"] == "base"  # type: ignore[union-attr]
     assert joint.find("child").attrib["link"] == "door"  # type: ignore[union-attr]
-    # Link meshes use part-local coordinates, so the URDF joint origin is the
-    # complete solved parent-part -> child-part transform at the mate rest pose.
-    assert joint.find("origin").attrib["xyz"] == "0.2 0 0.4"  # type: ignore[union-attr]
+    # The child URDF link lives at its incoming connector, so the joint origin
+    # preserves the declared hinge pivot instead of collapsing to the part origin.
+    assert joint.find("origin").attrib["xyz"] == "0.25 0 0.5"  # type: ignore[union-attr]
     assert joint.find("axis").attrib["xyz"] == "0 0 1"  # type: ignore[union-attr]
 
     plan["assembly"]["mates"][0]["rest"] = 0.5  # type: ignore[index]
@@ -411,6 +446,59 @@ def test_procedura_assembly_connectors_and_mates_are_supported(tmp_path: Path) -
     )
     assert per_part_joint is not None
     assert per_part_joint.find("origin").attrib["rpy"] == "0 0 0.5"  # type: ignore[union-attr]
+
+
+def test_connector_centred_link_frame_preserves_an_offset_rotation_pivot(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    plan["parts"] = [{"id": "base"}, {"id": "wheel"}]
+    plan["articulation"]["joints"] = []  # type: ignore[index]
+    frame = {
+        "origin": [2.0, 0.0, 0.0],
+        "x_axis": [1.0, 0.0, 0.0],
+        "y_axis": [0.0, 1.0, 0.0],
+        "z_axis": [0.0, 0.0, 1.0],
+    }
+    plan["assembly"] = {
+        "version": 1,
+        "part_order": ["base", "wheel"],
+        "connectors": [
+            {"id": "base_axle", "part_id": "base", "frame": frame},
+            {"id": "wheel_bore", "part_id": "wheel", "frame": frame},
+        ],
+        "mates": [
+            {
+                "id": "wheel_spin",
+                "type": "revolute",
+                "parent_connector_id": "base_axle",
+                "child_connector_id": "wheel_bore",
+                "rest": 0.0,
+                "limits": {"lower": -3.141592653589793, "upper": 3.141592653589793},
+            }
+        ],
+    }
+
+    frames = resolve_urdf_link_frames(plan)
+    assert frames["wheel"].part_from_link[0][3] == pytest.approx(2.0)
+    assert frames["wheel"].link_world[0][3] == pytest.approx(2.0)
+
+    probes = resolve_urdf_motion_probes(plan)
+    assert len(probes) == 1
+    assert probes[0].mate_id == "wheel_spin"
+    assert probes[0].urdf_position == pytest.approx(3.141592653589793 / 2.0)
+    expected = dict(probes[0].link_world)["wheel"]
+    # The link origin stays on the axle while its basis rotates by 90 degrees.
+    assert [expected[row][3] for row in range(3)] == pytest.approx([2.0, 0.0, 0.0])
+    assert expected[0][0] == pytest.approx(0.0, abs=1.0e-12)
+    assert expected[1][0] == pytest.approx(1.0, abs=1.0e-12)
+
+    joint = ET.fromstring(render_urdf(plan, _model(tmp_path)).xml).find(
+        "./joint[@name='wheel_spin']"
+    )
+    assert joint is not None
+    assert joint.find("origin").attrib["xyz"] == "2 0 0"  # type: ignore[union-attr]
+    assert joint.find("axis").attrib["xyz"] == "0 0 1"  # type: ignore[union-attr]
 
 
 def test_host_solved_assembly_rejects_explicit_joint_overrides(tmp_path: Path) -> None:
@@ -551,29 +639,72 @@ def test_pipeline_exports_host_solved_per_link_meshes(tmp_path: Path) -> None:
 
         def run_stage(self, stage, arguments, *, cwd, timeout_s):
             self.stages.append(stage)
-            assert stage == "export_urdf_parts"
-            output = Path(arguments[arguments.index("--output-dir") + 1])
-            output.mkdir(parents=True)
-            records = []
-            for part_id in ("base", "arm"):
-                path = output / f"{part_id}.glb"
-                path.write_bytes(f"mesh:{part_id}".encode())
-                records.append(
+                if stage == "export_urdf_parts":
+                    output = Path(arguments[arguments.index("--output-dir") + 1])
+                    assembly_path = Path(
+                        arguments[arguments.index("--assembly-transforms") + 1]
+                    )
+                    assembly_document = json.loads(
+                        assembly_path.read_text(encoding="utf-8")
+                    )
+                    assert assembly_document["schema_version"] == 2
+                    assert assembly_document["placement"] == "urdf-link"
+                    assert len(assembly_document["motion_probes"]) == 1
+                    output.mkdir(parents=True)
+                records = []
+                for part_id in ("base", "arm"):
+                    path = output / f"{part_id}.glb"
+                    path.write_bytes(f"mesh:{part_id}".encode())
+                    records.append(
+                        {
+                            "part_id": part_id,
+                            "path": path.name,
+                            "sha256": sha256(path),
+                        }
+                    )
+                write_json(
+                    output / "manifest.json",
                     {
-                        "part_id": part_id,
-                        "path": path.name,
-                        "sha256": sha256(path),
-                    }
+                        "schema_version": 2,
+                        "source_sha256": sha256(model),
+                        "parts": records,
+                    },
                 )
+                return SimpleNamespace(ok=True, stdout="ready", stderr="")
+            assert stage == "validate_urdf_zero_pose"
+            urdf_path = Path(arguments[arguments.index("--urdf") + 1])
+            assembly_path = Path(
+                arguments[arguments.index("--assembly-transforms") + 1]
+            )
+            output = Path(arguments[arguments.index("--out") + 1])
             write_json(
-                output / "manifest.json",
+                output,
                 {
                     "schema_version": 1,
-                    "source_sha256": sha256(model),
-                    "parts": records,
+                    "status": "passed",
+                    "model_sha256": sha256(model),
+                    "urdf_sha256": sha256(urdf_path),
+                    "assembly_sha256": sha256(assembly_path),
+                    "part_count": 2,
+                    "object_count": 2,
+                    "source_vertex_count": 100,
+                    "reconstructed_vertex_count": 104,
+                    "source_triangle_count": 50,
+                    "reconstructed_triangle_count": 50,
+                    "vertex_count_changed_object_count": 1,
+                    "relative_tolerance": 1.0e-5,
+                    "absolute_tolerance": 1.0e-5,
+                        "max_bounds_error": 0.0,
+                        "motion_probe_count": 1,
+                        "movable_joint_count": 1,
+                        "max_motion_matrix_error": 0.0,
+                        "max_motion_translation_error": 0.0,
+                        "max_motion_rotation_error_rad": 0.0,
+                        "motion_probes": [{"mate_id": "hinge_joint"}],
+                        "parts": [{"part_id": "base"}, {"part_id": "arm"}],
                 },
             )
-            return SimpleNamespace(ok=True, stdout="ready", stderr="")
+            return SimpleNamespace(ok=True, stdout="validated", stderr="")
 
     runtime = FakeRuntime()
     report = pipeline._export_urdf_artifacts(
@@ -583,12 +714,13 @@ def test_pipeline_exports_host_solved_per_link_meshes(tmp_path: Path) -> None:
         timeout_s=30,
     )
 
-    assert runtime.stages == ["export_urdf_parts"]
+    assert runtime.stages == ["export_urdf_parts", "validate_urdf_zero_pose"]
     assert report["link_meshes"] == {
         "arm": "urdf_parts/arm.glb",
         "base": "urdf_parts/base.glb",
     }
     assert report["parts_manifest"] == "urdf_parts/manifest.json"
+    assert report["zero_pose_validation"]["max_bounds_error"] == 0.0
     assert (workspace.artifacts_dir / "urdf_parts" / "manifest.json").is_file()
     urdf = (workspace.artifacts_dir / "model.urdf").read_text(encoding="utf-8")
     assert 'filename="urdf_parts/base.glb"' in urdf

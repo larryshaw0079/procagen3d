@@ -377,6 +377,62 @@ def _validate_module_execution(tree: ast.Module) -> list[SourceViolation]:
             return plain_binding(target.value)
         return False
 
+    def registry_mutation_message(statement: ast.stmt) -> str | None:
+        """Give structured registry mistakes a directly actionable rewrite."""
+
+        targets: list[ast.AST] = []
+        if isinstance(statement, ast.Assign):
+            targets.extend(statement.targets)
+        elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+            targets.append(statement.target)
+        for target in targets:
+            if not isinstance(target, ast.Subscript) or not isinstance(
+                target.value, ast.Name
+            ):
+                continue
+            name = target.value.id
+            if name == "PROCAGEN3D_PART_BUILDERS":
+                return (
+                    "module-level PROCAGEN3D_PART_BUILDERS[...] mutation is not "
+                    "allowed; replace it with one complete call-free binding "
+                    "`PROCAGEN3D_PART_BUILDERS = {...}`"
+                )
+            if name == "PROCAGEN3D_COMPLETED_PARTS":
+                return (
+                    "module-level PROCAGEN3D_COMPLETED_PARTS[...] mutation is not "
+                    "allowed; replace it with one complete call-free binding "
+                    "`PROCAGEN3D_COMPLETED_PARTS = [...]`"
+                )
+
+        if not isinstance(statement, ast.Expr) or not isinstance(
+            statement.value, ast.Call
+        ):
+            return None
+        function = statement.value.func
+        if not isinstance(function, ast.Attribute) or not isinstance(
+            function.value, ast.Name
+        ):
+            return None
+        name = function.value.id
+        method = function.attr
+        if name == "PROCAGEN3D_PART_BUILDERS" and method == "update":
+            return (
+                "module-level PROCAGEN3D_PART_BUILDERS.update(...) is not allowed; "
+                "replace it with one complete call-free binding "
+                "`PROCAGEN3D_PART_BUILDERS = {...}`"
+            )
+        if name == "PROCAGEN3D_COMPLETED_PARTS" and method in {
+            "append",
+            "extend",
+            "insert",
+        }:
+            return (
+                f"module-level PROCAGEN3D_COMPLETED_PARTS.{method}(...) is not "
+                "allowed; replace it with one complete call-free binding "
+                "`PROCAGEN3D_COMPLETED_PARTS = [...]`"
+            )
+        return None
+
     violations: list[SourceViolation] = []
     for index, statement in enumerate(tree.body):
         if isinstance(statement, (ast.Import, ast.ImportFrom, ast.Pass)):
@@ -440,10 +496,12 @@ def _validate_module_execution(tree: ast.Module) -> list[SourceViolation]:
                 continue
         if _is_main_build_guard(statement):
             continue
+        message = registry_mutation_message(statement)
         violations.append(
             _violation(
                 "module-side-effect",
-                "module-level execution is not allowed; construct the scene inside build()",
+                message
+                or "module-level execution is not allowed; construct the scene inside build()",
                 statement,
             )
         )

@@ -232,6 +232,41 @@ values[0] = 2
 '''
         self.assertIn("module-side-effect", codes(subscript))
 
+    def test_registry_mutations_explain_complete_literal_replacements(self) -> None:
+        unsafe = '''
+def build_body():
+    return []
+PROCAGEN3D_PART_BUILDERS = {}
+PROCAGEN3D_PART_BUILDERS["body"] = build_body
+PROCAGEN3D_COMPLETED_PARTS = []
+PROCAGEN3D_COMPLETED_PARTS.append("body")
+def build():
+    return PROCAGEN3D_PART_BUILDERS["body"]()
+'''
+        messages = [item.message for item in validate_source(unsafe)]
+        self.assertIn(
+            "module-level PROCAGEN3D_PART_BUILDERS[...] mutation is not allowed; "
+            "replace it with one complete call-free binding "
+            "`PROCAGEN3D_PART_BUILDERS = {...}`",
+            messages,
+        )
+        self.assertIn(
+            "module-level PROCAGEN3D_COMPLETED_PARTS.append(...) is not allowed; "
+            "replace it with one complete call-free binding "
+            "`PROCAGEN3D_COMPLETED_PARTS = [...]`",
+            messages,
+        )
+
+        safe = '''
+def build_body():
+    return []
+PROCAGEN3D_PART_BUILDERS = {"body": build_body}
+PROCAGEN3D_COMPLETED_PARTS = ["body"]
+def build():
+    return PROCAGEN3D_PART_BUILDERS["body"]()
+'''
+        self.assertEqual(validate_source(safe), ())
+
     def test_rejects_stale_world_matrix_parenting_pattern(self) -> None:
         unsafe = '''
 import bpy

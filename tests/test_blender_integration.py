@@ -9,6 +9,7 @@ import pytest
 from procagen3d.blender import BlenderRuntime, require_success
 from procagen3d.pipeline import CANONICAL_VIEWS
 from procagen3d.source_guard import assert_safe_source
+from procagen3d.urdf import render_urdf
 from procagen3d.workspace import write_json
 
 
@@ -464,6 +465,107 @@ def build():
             )
         ]
         assert center == pytest.approx(expected_centers[part_id], abs=1.0e-5)
+
+    plan = {
+        "subject": "rotated arm fixture",
+        "subject_kind": "object",
+        "parts": [
+            {"id": "base", "object_names": ["Base"]},
+            {"id": "arm", "object_names": ["Arm"]},
+        ],
+        "assembly": {
+            "version": 1,
+            "placement": "host-solved",
+            "part_order": ["base", "arm"],
+            "connectors": [
+                {
+                    "id": "base_hinge",
+                    "part_id": "base",
+                    "interface": "cylindrical",
+                    "role": "neutral",
+                    "frame": {
+                        "origin": [2.0, 0.0, 0.0],
+                        "x_axis": [0.0, 1.0, 0.0],
+                        "y_axis": [-1.0, 0.0, 0.0],
+                        "z_axis": [0.0, 0.0, 1.0],
+                    },
+                    "nominal_dimensions": {"diameter": 0.1},
+                },
+                {
+                    "id": "arm_hinge",
+                    "part_id": "arm",
+                    "interface": "cylindrical",
+                    "role": "neutral",
+                    "frame": {
+                        "origin": [0.0, 0.0, 0.0],
+                        "x_axis": [1.0, 0.0, 0.0],
+                        "y_axis": [0.0, 1.0, 0.0],
+                        "z_axis": [0.0, 0.0, 1.0],
+                    },
+                    "nominal_dimensions": {"diameter": 0.1},
+                },
+            ],
+            "mates": [
+                {
+                    "id": "arm_joint",
+                    "type": "revolute",
+                    "parent_connector_id": "base_hinge",
+                    "child_connector_id": "arm_hinge",
+                    "fit": "none",
+                    "clearance": 0.0,
+                    "fit_offset": [0.0, 0.0, 0.0],
+                    "nominal_dimensions": {"diameter": 0.1},
+                    "rest": 0.0,
+                    "limits": {"lower": -1.0, "upper": 1.0},
+                }
+            ],
+        },
+        "articulation": {"enabled": True, "mechanical": True, "joints": []},
+    }
+    urdf = tmp_path / "model.urdf"
+    urdf.write_text(
+        render_urdf(
+            plan,
+            artifacts / "model.glb",
+            link_meshes={
+                "base": "urdf_parts/base.glb",
+                "arm": "urdf_parts/arm.glb",
+            },
+        ).xml,
+        encoding="utf-8",
+    )
+    validation = tmp_path / "zero_pose_validation.json"
+    validated = runtime.run_stage(
+        "validate_urdf_zero_pose",
+        [
+            "--model-glb",
+            artifacts / "model.glb",
+            "--urdf",
+            urdf,
+            "--assembly-transforms",
+            assembly,
+            "--parts-dir",
+            urdf_parts,
+            "--out",
+            validation,
+        ],
+        cwd=tmp_path,
+        timeout_s=180,
+    )
+    require_success(validated, stage="URDF zero-pose integration validation")
+    validation_report = json.loads(validation.read_text(encoding="utf-8"))
+    assert validation_report["status"] == "passed"
+    assert validation_report["part_count"] == 2
+    assert validation_report["object_count"] == 2
+    assert (
+        validation_report["source_triangle_count"]
+        == validation_report["reconstructed_triangle_count"]
+    )
+    assert validation_report["source_vertex_count"] > 0
+    assert validation_report["reconstructed_vertex_count"] > 0
+    assert validation_report["max_bounds_error"] <= validation_report["absolute_tolerance"]
+
+
 @pytest.mark.skipif(
     os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
     reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",

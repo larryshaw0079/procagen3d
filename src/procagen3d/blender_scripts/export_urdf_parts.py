@@ -1,4 +1,4 @@
-"""Split a compiled host-solved assembly into link-local GLB meshes for URDF."""
+"""Split a compiled assembly into genuinely link-local GLB meshes for URDF."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def sha256(path):
 def export_part(part, source_by_name, output_dir):
     part_id = part.get("id")
     names = part.get("object_names")
-    rows = part.get("world_matrix")
+    rows = part.get("link_world_matrix", part.get("world_matrix"))
     if not isinstance(part_id, str) or not SAFE_NAME.fullmatch(part_id):
         raise RuntimeError(f"part id {part_id!r} is not a safe URDF link name")
     if not isinstance(names, list) or not names:
@@ -48,7 +48,7 @@ def export_part(part, source_by_name, output_dir):
     try:
         inverse_world = Matrix(rows).inverted_safe()
     except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"part {part_id!r} has an invalid world matrix") from exc
+        raise RuntimeError(f"part {part_id!r} has an invalid link world matrix") from exc
 
     sources = []
     for name in names:
@@ -118,8 +118,12 @@ def main():
     if not args.glb.is_file() or not args.assembly_transforms.is_file():
         raise RuntimeError("URDF split inputs must be regular files")
     document = json.loads(args.assembly_transforms.read_text(encoding="utf-8"))
-    if document.get("schema_version") != 1 or document.get("placement") != "host-solved":
-        raise RuntimeError("URDF split requires a host-solved assembly document")
+    supported = (
+        (document.get("schema_version"), document.get("placement"))
+        in {(1, "host-solved"), (2, "urdf-link")}
+    )
+    if not supported:
+        raise RuntimeError("URDF split requires a supported link-frame document")
     parts = document.get("parts")
     if not isinstance(parts, list) or not parts:
         raise RuntimeError("URDF split assembly has no parts")
@@ -138,6 +142,9 @@ def main():
         args.output_dir / "manifest.json",
         {
             "schema_version": 1,
+            "frame_convention": (
+                "incoming-connector" if document.get("schema_version") == 2 else "part"
+            ),
             "source": args.glb.name,
             "source_sha256": sha256(args.glb),
             "parts": records,

@@ -20,6 +20,9 @@ from xml.sax.saxutils import escape
 
 from .assembly import (
     AssemblyError,
+    Matrix4,
+    frame_matrix,
+    identity_matrix,
     invert_rigid_transform,
     multiply_matrices,
     normalize_assembly,
@@ -34,6 +37,11 @@ _SUPPORTED_JOINTS = frozenset(
 )
 _MOVABLE_JOINTS = frozenset({"revolute", "continuous", "prismatic", "spherical"})
 _EPSILON = 1.0e-12
+_GLTF_MESH_SUFFIXES = frozenset({".glb", ".gltf"})
+# Blender exports glTF in Y-up coordinates.  URDF visual frames are Z-up, so
+# applying Rx(+pi/2) maps Blender-exported (x, z, -y) mesh coordinates back to
+# the same (x, y, z) link frame used by the assembly solver and joint origins.
+_BLENDER_GLTF_TO_URDF_VISUAL_RPY = (math.pi / 2.0, 0.0, 0.0)
 _VISUAL_KINEMATIC_WARNING = (
     "URDF output is visual/kinematic only; collision geometry, inertial properties, "
     "transmissions, and actuators are not exported"
@@ -125,6 +133,40 @@ class _Joint:
     velocity: float | None
 
 
+@dataclass(frozen=True)
+class URDFLinkFrame:
+    """Connector-centred frame used by one host-solved URDF link.
+
+    ``part_from_link`` maps link-local coordinates into the generated part's
+    local coordinates.  ``link_world`` is therefore ``part_world @
+    part_from_link`` at the assembly rest pose.
+    """
+
+    part_world: Matrix4
+    part_from_link: Matrix4
+    link_world: Matrix4
+    incoming_mate: str | None
+
+
+@dataclass(frozen=True)
+class URDFMotionProbe:
+    """One deterministic nonzero joint sample and its expected link poses."""
+
+    mate_id: str
+    joint_type: str
+    assembly_parameter: float
+    urdf_position: float
+    link_world: tuple[tuple[str, Matrix4], ...]
+
+
+@dataclass(frozen=True)
+class _ResolvedAssembly:
+    plan: Mapping[str, Any]
+    connectors: Mapping[str, Mapping[str, Any]]
+    mates: tuple[Mapping[str, Any], ...]
+    link_frames: Mapping[str, URDFLinkFrame]
+
+
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -207,6 +249,17 @@ def _fmt(value: float) -> str:
 
 def _fmt_vector(value: tuple[float, float, float]) -> str:
     return " ".join(_fmt(component) for component in value)
+
+
+def _visual_mesh_rpy(mesh_uri: str) -> tuple[float, float, float]:
+    """Return the URDF visual-frame correction for a mesh URI."""
+
+    # Format detection belongs to the URI path; query strings and fragments do
+    # not change the underlying mesh format.  Matching is case-insensitive.
+    uri_path = mesh_uri.split("#", 1)[0].split("?", 1)[0]
+    if PurePosixPath(uri_path).suffix.lower() in _GLTF_MESH_SUFFIXES:
+        return _BLENDER_GLTF_TO_URDF_VISUAL_RPY
+    return (0.0, 0.0, 0.0)
 
 
 def _default_robot_name(plan: Mapping[str, Any]) -> str:
@@ -377,16 +430,18 @@ def _limits_relative_to_rest(mate: Mapping[str, Any]) -> Any:
     return adjusted
 
 
-def _assembly_joints(
+def _resolve_assembly(
     plan: Mapping[str, Any],
     parts_by_id: Mapping[str, Mapping[str, Any]],
-) -> list[Mapping[str, Any]]:
+) -> _ResolvedAssembly:
+    """Resolve a connector graph into connector-centred URDF link frames."""
+
     assembly_value = plan.get("assembly")
     if not isinstance(assembly_value, Mapping):
-        return []
+        raise URDFExportError("plan.assembly must be an object")
     assembly = normalize_assembly(list(parts_by_id.values()), assembly_value)
     if not isinstance(assembly, Mapping):
-        return []
+        raise URDFExportError("plan.assembly could not be normalized")
     connector_values: list[Any] = []
     raw_connectors = assembly.get("connectors", [])
     connector_values.extend(_require_sequence(raw_connectors, "plan.assembly.connectors"))
@@ -443,9 +498,13 @@ def _assembly_joints(
         connectors[connector_id] = connector
 
     raw_mates = _require_sequence(assembly.get("mates", []), "plan.assembly.mates")
-    joints: list[Mapping[str, Any]] = []
+    mates: list[Mapping[str, Any]] = []
+    incoming: dict[str, tuple[str, Mapping[str, Any]]] = {}
     for index, mate_value in enumerate(raw_mates):
         mate = _require_mapping(mate_value, f"plan.assembly.mates[{index}]")
+        mate_id = _require_name(
+            mate.get("id", f"mate_{index}"), f"plan.assembly.mates[{index}].id"
+        )
         parent_connector_id = _require_text(
             mate.get("parent_connector_id"),
             f"plan.assembly.mates[{index}].parent_connector_id",
@@ -463,20 +522,150 @@ def _assembly_joints(
             ) from exc
         parent_part = str(parent_connector["part_id"])
         child_part = str(child_connector["part_id"])
+        if child_part in incoming:
+            prior = incoming[child_part][0]
+            raise URDFExportError(
+                f"link {child_part!r} has more than one incoming assembly mate "
+                f"({prior!r} and {mate_id!r}); URDF requires one parent joint"
+            )
+        incoming[child_part] = (mate_id, child_connector)
+        mates.append(mate)
+
+    link_frames: dict[str, URDFLinkFrame] = {}
+    for part_id in parts_by_id:
         try:
-            parent_inverse = invert_rigid_transform(solved[parent_part])
-            relative = multiply_matrices(parent_inverse, solved[child_part])
+            part_world = solved[part_id]
+        except KeyError as exc:
+            raise URDFExportError(
+                f"assembly has no solved transform for link {part_id!r}"
+            ) from exc
+        incoming_value = incoming.get(part_id)
+        if incoming_value is None:
+            part_from_link = identity_matrix()
+            incoming_mate = None
+        else:
+            incoming_mate, child_connector = incoming_value
+            try:
+                part_from_link = frame_matrix(child_connector["frame"])
+            except (AssemblyError, KeyError) as exc:
+                raise URDFExportError(
+                    f"incoming connector for link {part_id!r} has an invalid frame: {exc}"
+                ) from exc
+        link_frames[part_id] = URDFLinkFrame(
+            part_world=part_world,
+            part_from_link=part_from_link,
+            link_world=multiply_matrices(part_world, part_from_link),
+            incoming_mate=incoming_mate,
+        )
+
+    return _ResolvedAssembly(
+        plan=normalized_plan,
+        connectors=connectors,
+        mates=tuple(mates),
+        link_frames=link_frames,
+    )
+
+
+def resolve_urdf_link_frames(
+    plan: Mapping[str, Any],
+) -> dict[str, URDFLinkFrame]:
+    """Return the trusted connector-centred frame for every assembly link."""
+
+    _, parts_by_id = _links(plan)
+    return dict(_resolve_assembly(plan, parts_by_id).link_frames)
+
+
+def _probe_parameter(mate: Mapping[str, Any], label: str) -> tuple[float, float]:
+    rest = _number(mate.get("rest", 0.0), f"{label}.rest")
+    limits = _require_mapping(mate.get("limits"), f"{label}.limits")
+    lower = _number(limits.get("lower"), f"{label}.limits.lower")
+    upper = _number(limits.get("upper"), f"{label}.limits.upper")
+    endpoint = max((lower, upper), key=lambda value: (abs(value - rest), value))
+    parameter = rest + 0.5 * (endpoint - rest)
+    delta = parameter - rest
+    if abs(delta) <= _EPSILON:
+        raise URDFExportError(
+            f"{label} has no nonzero in-limit displacement from its rest value"
+        )
+    return parameter, delta
+
+
+def resolve_urdf_motion_probes(
+    plan: Mapping[str, Any],
+) -> tuple[URDFMotionProbe, ...]:
+    """Sample each movable mate and solve its expected nonzero link poses."""
+
+    _, parts_by_id = _links(plan)
+    resolved = _resolve_assembly(plan, parts_by_id)
+    probes: list[URDFMotionProbe] = []
+    for index, mate in enumerate(resolved.mates):
+        joint_type = str(mate.get("type", ""))
+        if joint_type not in {"revolute", "prismatic"}:
+            continue
+        mate_id = _require_name(
+            mate.get("id", f"mate_{index}"), f"plan.assembly.mates[{index}].id"
+        )
+        parameter, delta = _probe_parameter(
+            mate, f"plan.assembly.mates[{index}]"
+        )
+        try:
+            posed_parts = solve_assembly_transforms(
+                resolved.plan, joint_values={mate_id: parameter}
+            )
+        except AssemblyError as exc:
+            raise URDFExportError(
+                f"assembly motion probe for mate {mate_id!r} failed: {exc}"
+            ) from exc
+        probes.append(
+            URDFMotionProbe(
+                mate_id=mate_id,
+                joint_type=joint_type,
+                assembly_parameter=parameter,
+                urdf_position=delta,
+                link_world=tuple(
+                    (
+                        part_id,
+                        multiply_matrices(
+                            posed_parts[part_id], frame.part_from_link
+                        ),
+                    )
+                    for part_id, frame in resolved.link_frames.items()
+                ),
+            )
+        )
+    return tuple(probes)
+
+
+def _assembly_joints(
+    plan: Mapping[str, Any],
+    parts_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    assembly_value = plan.get("assembly")
+    if not isinstance(assembly_value, Mapping):
+        return []
+    resolved = _resolve_assembly(plan, parts_by_id)
+    joints: list[Mapping[str, Any]] = []
+    for index, mate in enumerate(resolved.mates):
+        parent_connector_id = str(mate["parent_connector_id"])
+        child_connector_id = str(mate["child_connector_id"])
+        parent_connector = resolved.connectors[parent_connector_id]
+        child_connector = resolved.connectors[child_connector_id]
+        parent_part = str(parent_connector["part_id"])
+        child_part = str(child_connector["part_id"])
+        try:
+            parent_inverse = invert_rigid_transform(
+                resolved.link_frames[parent_part].link_world
+            )
+            relative = multiply_matrices(
+                parent_inverse, resolved.link_frames[child_part].link_world
+            )
         except (AssemblyError, KeyError) as exc:
             raise URDFExportError(
-                f"assembly mate {index} has no solved parent-to-child transform"
+                f"assembly mate {index} has no solved parent-link to child-link transform"
             ) from exc
         origin = _transform_to_origin(
             relative,
-            f"assembly mate {index} solved transform",
-        )
-        child_axis = _frame_to_origin(
-            child_connector.get("frame"),
-            f"assembly connector {child_connector_id!r}.frame",
+            f"assembly mate {index} solved link transform",
         )
         joint: dict[str, Any] = {
             "name": mate.get("id", f"mate_{index}"),
@@ -484,10 +673,9 @@ def _assembly_joints(
             "child": child_part,
             "type": mate.get("type"),
             "origin": {"xyz": origin["xyz"], "rpy": origin["rpy"]},
-            # URDF axes are expressed in the child/joint frame. The assembly
-            # solver's motion axis is connector-local +Z, transformed into the
-            # child part frame by the child connector basis.
-            "axis": child_axis["axis"],
+            # A non-root link frame is its incoming child connector, so the
+            # assembly motion axis and the URDF motion axis are both local +Z.
+            "axis": [0.0, 0.0, 1.0],
         }
         if "limits" in mate:
             joint["limit"] = _limits_relative_to_rest(mate)
@@ -841,9 +1029,14 @@ def render_urdf(
     lines = ['<?xml version="1.0"?>', f'<robot name="{_xml_attr(robot_name)}">']
     for link_name in sorted(links):
         link_mesh_uri = link_meshes_by_id.get(link_name)
-        if link_mesh_uri is None and link_name == root:
+        combined_model = link_mesh_uri is None and link_name == root
+        if combined_model:
             link_mesh_uri = uri
         if link_mesh_uri is not None:
+            # The combined fallback is known to be the validated model GLB even
+            # when callers give it a package URI without a recognizable suffix.
+            mesh_format_uri = model_path.name if combined_model else link_mesh_uri
+            visual_rpy = _visual_mesh_rpy(mesh_format_uri)
             visual_name = (
                 "procagen3d_link_model"
                 if normalized_link_meshes
@@ -853,7 +1046,7 @@ def render_urdf(
                 [
                     f'  <link name="{_xml_attr(link_name)}">',
                     f'    <visual name="{visual_name}">',
-                    '      <origin xyz="0 0 0" rpy="0 0 0"/>',
+                    f'      <origin xyz="0 0 0" rpy="{_fmt_vector(visual_rpy)}"/>',
                     "      <geometry>",
                     f'        <mesh filename="{_xml_attr(link_mesh_uri)}"/>',
                     "      </geometry>",

@@ -984,6 +984,77 @@ def _assembly_runtime_document(
     }
 
 
+def _urdf_link_runtime_document(plan: dict[str, Any]) -> dict[str, Any] | None:
+    """Build the independent connector-centred link and motion contract.
+
+    Blender scene construction must continue to use part frames from
+    :func:`_assembly_runtime_document`.  URDF meshes instead use their incoming
+    connector as the link frame so revolute and prismatic motion occurs about
+    the declared mechanical interface rather than the modeling origin.
+    """
+
+    assembly = plan.get("assembly")
+    if not isinstance(assembly, dict) or assembly.get("placement") != "host-solved":
+        return None
+    try:
+        from .urdf import resolve_urdf_link_frames, resolve_urdf_motion_probes
+
+        frames = resolve_urdf_link_frames(plan)
+        probes = resolve_urdf_motion_probes(plan)
+    except (ImportError, ValueError) as exc:
+        raise PipelineError(f"URDF link-frame solver rejected the plan: {exc}") from exc
+
+    part_by_id = {
+        str(part.get("id")): part
+        for part in plan.get("parts", [])
+        if isinstance(part, dict) and isinstance(part.get("id"), str)
+    }
+    assembly_order = tuple(assembly.get("part_order", []))
+    if set(assembly_order) != set(frames) or len(assembly_order) != len(frames):
+        raise PipelineError("URDF link frames do not cover the assembly order exactly")
+
+    def rows(matrix: Any) -> list[list[float]]:
+        return [[float(value) for value in row] for row in matrix]
+
+    parts = []
+    for part_id in assembly_order:
+        part = part_by_id.get(part_id)
+        frame = frames.get(part_id)
+        if part is None or frame is None:
+            raise PipelineError(f"URDF link runtime cannot resolve part {part_id!r}")
+        parts.append(
+            {
+                "id": part_id,
+                "object_names": list(part.get("object_names", [])),
+                "part_world_matrix": rows(frame.part_world),
+                "part_from_link_matrix": rows(frame.part_from_link),
+                "link_world_matrix": rows(frame.link_world),
+                "incoming_mate_id": frame.incoming_mate,
+            }
+        )
+
+    motion_probes = []
+    for probe in probes:
+        expected = dict(probe.link_world)
+        motion_probes.append(
+            {
+                "mate_id": probe.mate_id,
+                "joint_type": probe.joint_type,
+                "assembly_parameter": probe.assembly_parameter,
+                "urdf_position": probe.urdf_position,
+                "expected_link_world_matrices": {
+                    part_id: rows(expected[part_id]) for part_id in assembly_order
+                },
+            }
+        )
+    return {
+        "schema_version": 2,
+        "placement": "urdf-link",
+        "parts": parts,
+        "motion_probes": motion_probes,
+    }
+
+
 def build_workspace(
     workspace: Workspace,
     runtime: BlenderRuntime,
@@ -3326,6 +3397,116 @@ def _validated_urdf_link_meshes(
     return dict(sorted(link_meshes.items()))
 
 
+def _validated_urdf_zero_pose_report(
+    report_path: Path,
+    *,
+    model_path: Path,
+    urdf_path: Path,
+    assembly_path: Path,
+) -> dict[str, Any]:
+    """Validate and bind Blender's rest-geometry and motion report."""
+
+    report = _read_regular_json(
+        report_path,
+        label="URDF zero-pose validation report",
+    )
+    if report.get("schema_version") != 2 or report.get("status") != "passed":
+        raise PipelineError("URDF articulation validation did not report a passing result")
+    expected_hashes = {
+        "model_sha256": sha256(model_path),
+        "urdf_sha256": sha256(urdf_path),
+        "assembly_sha256": sha256(assembly_path),
+    }
+    for field, expected in expected_hashes.items():
+        if report.get(field) != expected:
+            raise PipelineError(
+                f"URDF zero-pose validation report has a stale {field} binding"
+            )
+    for field in (
+        "relative_tolerance",
+        "absolute_tolerance",
+        "max_bounds_error",
+    ):
+        value = report.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise PipelineError(
+                f"URDF zero-pose validation report has an invalid {field}"
+            )
+    if float(report["relative_tolerance"]) <= 0.0:
+        raise PipelineError(
+            "URDF zero-pose validation report must use a positive tolerance"
+        )
+    if float(report["absolute_tolerance"]) <= 0.0:
+        raise PipelineError(
+            "URDF zero-pose validation report must use a positive absolute tolerance"
+        )
+    if float(report["max_bounds_error"]) > float(report["absolute_tolerance"]):
+        raise PipelineError("URDF zero-pose validation exceeded its reported tolerance")
+    for field in (
+        "max_motion_matrix_error",
+        "max_motion_translation_error",
+        "max_motion_rotation_error_rad",
+    ):
+        value = report.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise PipelineError(
+                f"URDF articulation validation report has an invalid {field}"
+            )
+    if float(report["max_motion_matrix_error"]) > float(
+        report["relative_tolerance"]
+    ):
+        raise PipelineError("URDF nonzero motion validation exceeded its tolerance")
+    count_fields = (
+        "part_count",
+        "object_count",
+        "source_vertex_count",
+        "reconstructed_vertex_count",
+        "source_triangle_count",
+        "reconstructed_triangle_count",
+        "vertex_count_changed_object_count",
+        "motion_probe_count",
+        "movable_joint_count",
+    )
+    for field in count_fields:
+        value = report.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise PipelineError(
+                f"URDF zero-pose validation report has an invalid {field}"
+            )
+    if report["part_count"] <= 0 or report["object_count"] <= 0:
+        raise PipelineError("URDF zero-pose validation report has empty coverage")
+    if report["motion_probe_count"] <= 0:
+        raise PipelineError("URDF articulation validation has no nonzero motion probes")
+    if report["motion_probe_count"] != report["movable_joint_count"]:
+        raise PipelineError("URDF articulation validation has inconsistent probe coverage")
+    if report["source_triangle_count"] != report["reconstructed_triangle_count"]:
+        raise PipelineError("URDF zero-pose validation changed the triangle count")
+    if report["vertex_count_changed_object_count"] > report["object_count"]:
+        raise PipelineError(
+            "URDF zero-pose validation has an invalid changed-vertex object count"
+        )
+    parts = report.get("parts")
+    if not isinstance(parts, list) or len(parts) != report.get("part_count"):
+        raise PipelineError("URDF zero-pose validation report has invalid part coverage")
+    motion_probes = report.get("motion_probes")
+    if (
+        not isinstance(motion_probes, list)
+        or len(motion_probes) != report["motion_probe_count"]
+    ):
+        raise PipelineError("URDF articulation validation has invalid motion coverage")
+    return report
+
+
 def _export_urdf_artifacts(
     workspace: Workspace,
     runtime: BlenderRuntime,
@@ -3344,8 +3525,9 @@ def _export_urdf_artifacts(
     # Fail before invoking Blender when the plan has not independently opted
     # into a valid mechanical articulation tree.
     render_urdf(plan, model_path)
-    assembly_runtime = _assembly_runtime_document(plan)
+    assembly_runtime = _urdf_link_runtime_document(plan)
     link_meshes: dict[str, str] | None = None
+    zero_pose_validation: dict[str, Any] | None = None
     if assembly_runtime is not None:
         with tempfile.TemporaryDirectory(
             prefix=".procagen3d-urdf-", dir=workspace.root
@@ -3381,7 +3563,40 @@ def _export_urdf_artifacts(
                 model_path=model_path,
             )
             # Validate URI coverage before publishing the split meshes.
-            render_urdf(plan, model_path, link_meshes=link_meshes)
+            rendered = render_urdf(plan, model_path, link_meshes=link_meshes)
+            staged_urdf = staging_root / "model.urdf"
+            staged_urdf.write_text(rendered.xml, encoding="utf-8")
+            validation_path = staged_parts / "zero_pose_validation.json"
+            validation_result = runtime.run_stage(
+                "validate_urdf_zero_pose",
+                [
+                    "--model-glb",
+                    model_path,
+                    "--urdf",
+                    staged_urdf,
+                    "--assembly-transforms",
+                    assembly_path,
+                    "--parts-dir",
+                    staged_parts,
+                    "--out",
+                    validation_path,
+                ],
+                cwd=staging_root,
+                timeout_s=timeout_s,
+            )
+            (staged_parts / "validation.stdout.log").write_text(
+                validation_result.stdout, encoding="utf-8"
+            )
+            (staged_parts / "validation.stderr.log").write_text(
+                validation_result.stderr, encoding="utf-8"
+            )
+            require_success(validation_result, stage="URDF zero-pose validation")
+            zero_pose_validation = _validated_urdf_zero_pose_report(
+                validation_path,
+                model_path=model_path,
+                urdf_path=staged_urdf,
+                assembly_path=assembly_path,
+            )
             _replace_directory(staged_parts, workspace.artifacts_dir / "urdf_parts")
 
     result = export_urdf(
@@ -3394,6 +3609,44 @@ def _export_urdf_artifacts(
     report = result.as_dict()
     if link_meshes is not None:
         report["parts_manifest"] = "urdf_parts/manifest.json"
+    if zero_pose_validation is not None:
+        if result.urdf_sha256 != zero_pose_validation["urdf_sha256"]:
+            raise PipelineError(
+                "published URDF does not match the zero-pose validated document"
+            )
+        validation_path = (
+            workspace.artifacts_dir / "urdf_parts" / "zero_pose_validation.json"
+        )
+        report["zero_pose_validation"] = {
+            "path": "urdf_parts/zero_pose_validation.json",
+            "sha256": sha256(validation_path),
+            "part_count": zero_pose_validation["part_count"],
+            "object_count": zero_pose_validation["object_count"],
+            "source_vertex_count": zero_pose_validation["source_vertex_count"],
+            "reconstructed_vertex_count": zero_pose_validation[
+                "reconstructed_vertex_count"
+            ],
+            "source_triangle_count": zero_pose_validation["source_triangle_count"],
+            "reconstructed_triangle_count": zero_pose_validation[
+                "reconstructed_triangle_count"
+            ],
+            "vertex_count_changed_object_count": zero_pose_validation[
+                "vertex_count_changed_object_count"
+            ],
+            "max_bounds_error": zero_pose_validation["max_bounds_error"],
+            "absolute_tolerance": zero_pose_validation["absolute_tolerance"],
+            "motion_probe_count": zero_pose_validation["motion_probe_count"],
+            "movable_joint_count": zero_pose_validation["movable_joint_count"],
+            "max_motion_matrix_error": zero_pose_validation[
+                "max_motion_matrix_error"
+            ],
+            "max_motion_translation_error": zero_pose_validation[
+                "max_motion_translation_error"
+            ],
+            "max_motion_rotation_error_rad": zero_pose_validation[
+                "max_motion_rotation_error_rad"
+            ],
+        }
     return report
 
 

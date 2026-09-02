@@ -169,6 +169,13 @@ host-solved assembly must contain at least one movable mate. A successful
 structured export writes link-local GLBs under `artifacts/urdf_parts/` as well
 as `artifacts/model.urdf`.
 
+The exporter keeps those GLBs in glTF's Y-up convention and writes the explicit
+mesh-to-link rotation required by URDF's Z-up frames. Before publication, a
+zero-pose gate reassembles every link and checks its joint transform, planned
+object ownership, triangle count, and evaluated bounds against `model.glb`.
+Its hash-bound report is stored at
+`artifacts/urdf_parts/zero_pose_validation.json`.
+
 The URDF deliverable is intentionally visual/kinematic, not simulation-ready.
 It does not infer engineering scale, collision geometry, mass or inertia,
 transmissions, actuators, or simulator parameters. Those omissions are also
@@ -448,6 +455,7 @@ outputs/<name>-<mode>/
 │   ├── model.urdf                 # explicit mechanical opt-in
 │   ├── urdf_report.json
 │   ├── urdf_parts/manifest.json   # link-local GLBs
+│   ├── urdf_parts/zero_pose_validation.json
 │   ├── scene_report.json
 │   ├── model_probe.json
 │   ├── build_manifest.json
