@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from procagen3d.blender import BlenderRuntime, require_success
-from procagen3d.pipeline import CANONICAL_VIEWS
+from procagen3d.pipeline import CANONICAL_VIEWS, _urdf_link_runtime_document
 from procagen3d.source_guard import assert_safe_source
 from procagen3d.urdf import render_urdf
 from procagen3d.workspace import write_json
@@ -343,7 +343,7 @@ def build():
     os.environ.get("PROCAGEN3D_RUN_BLENDER_TESTS") != "1",
     reason="set PROCAGEN3D_RUN_BLENDER_TESTS=1 to launch headless Blender",
 )
-def test_host_solved_build_and_urdf_split_preserve_part_local_meshes(
+def test_host_solved_build_and_urdf_split_preserve_link_local_meshes(
     tmp_path: Path,
 ) -> None:
     runtime = BlenderRuntime.discover()
@@ -401,71 +401,6 @@ def build():
     )
     require_success(built, stage="host-solved integration build")
 
-    urdf_parts = tmp_path / "urdf_parts"
-    split = runtime.run_stage(
-        "export_urdf_parts",
-        [
-            "--glb",
-            artifacts / "model.glb",
-            "--assembly-transforms",
-            assembly,
-            "--output-dir",
-            urdf_parts,
-        ],
-        cwd=tmp_path,
-        timeout_s=180,
-    )
-    require_success(split, stage="host-solved URDF split")
-    manifest = json.loads((urdf_parts / "manifest.json").read_text(encoding="utf-8"))
-    assert [part["part_id"] for part in manifest["parts"]] == ["base", "arm"]
-
-    contract = tmp_path / "camera_contract.json"
-    write_json(
-        contract,
-        {
-            "projection": "ORTHO",
-            "resolution": [32, 32],
-            "views": [
-                {
-                    "name": name,
-                    "location": [0.0, -5.0, 1.0],
-                    "target": [0.0, 0.0, 0.5],
-                    "ortho_scale": 4.0,
-                }
-                for name in CANONICAL_VIEWS
-            ],
-        },
-    )
-    expected_centers = {
-        "base": [0.0, 0.0, 0.5],
-        "arm": [0.25, 0.0, 0.5],
-    }
-    for part_id, object_name in (("base", "Base"), ("arm", "Arm")):
-        probe_dir = tmp_path / f"probe-{part_id}"
-        probed = runtime.run_stage(
-            "compiled_probe",
-            [
-                "--glb",
-                urdf_parts / f"{part_id}.glb",
-                "--artifacts-dir",
-                probe_dir,
-                "--camera-contract",
-                contract,
-            ],
-            cwd=tmp_path,
-            timeout_s=180,
-        )
-        require_success(probed, stage=f"URDF link-local probe {part_id}")
-        report = json.loads((probe_dir / "scene_report.json").read_text(encoding="utf-8"))
-        item = next(value for value in report["objects"] if value["name"] == object_name)
-        center = [
-            (low + high) * 0.5
-            for low, high in zip(
-                item["bounds"]["min"], item["bounds"]["max"], strict=True
-            )
-        ]
-        assert center == pytest.approx(expected_centers[part_id], abs=1.0e-5)
-
     plan = {
         "subject": "rotated arm fixture",
         "subject_kind": "object",
@@ -522,6 +457,75 @@ def build():
         },
         "articulation": {"enabled": True, "mechanical": True, "joints": []},
     }
+    link_assembly = tmp_path / "urdf_link_transforms.json"
+    write_json(link_assembly, _urdf_link_runtime_document(plan))
+
+    urdf_parts = tmp_path / "urdf_parts"
+    split = runtime.run_stage(
+        "export_urdf_parts",
+        [
+            "--glb",
+            artifacts / "model.glb",
+            "--assembly-transforms",
+            link_assembly,
+            "--output-dir",
+            urdf_parts,
+        ],
+        cwd=tmp_path,
+        timeout_s=180,
+    )
+    require_success(split, stage="host-solved URDF split")
+    manifest = json.loads((urdf_parts / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["frame_convention"] == "incoming-connector"
+    assert [part["part_id"] for part in manifest["parts"]] == ["base", "arm"]
+
+    contract = tmp_path / "camera_contract.json"
+    write_json(
+        contract,
+        {
+            "projection": "ORTHO",
+            "resolution": [32, 32],
+            "views": [
+                {
+                    "name": name,
+                    "location": [0.0, -5.0, 1.0],
+                    "target": [0.0, 0.0, 0.5],
+                    "ortho_scale": 4.0,
+                }
+                for name in CANONICAL_VIEWS
+            ],
+        },
+    )
+    expected_centers = {
+        "base": [0.0, 0.0, 0.5],
+        "arm": [0.25, 0.0, 0.5],
+    }
+    for part_id, object_name in (("base", "Base"), ("arm", "Arm")):
+        probe_dir = tmp_path / f"probe-{part_id}"
+        probed = runtime.run_stage(
+            "compiled_probe",
+            [
+                "--glb",
+                urdf_parts / f"{part_id}.glb",
+                "--artifacts-dir",
+                probe_dir,
+                "--camera-contract",
+                contract,
+            ],
+            cwd=tmp_path,
+            timeout_s=180,
+        )
+        require_success(probed, stage=f"URDF link-local probe {part_id}")
+        report = json.loads((probe_dir / "scene_report.json").read_text(encoding="utf-8"))
+        item = next(value for value in report["objects"] if value["name"] == object_name)
+        center = [
+            (low + high) * 0.5
+            for low, high in zip(
+                item["bounds"]["min"], item["bounds"]["max"], strict=True
+            )
+        ]
+        assert center == pytest.approx(expected_centers[part_id], abs=1.0e-5)
+
     urdf = tmp_path / "model.urdf"
     urdf.write_text(
         render_urdf(
@@ -543,7 +547,7 @@ def build():
             "--urdf",
             urdf,
             "--assembly-transforms",
-            assembly,
+            link_assembly,
             "--parts-dir",
             urdf_parts,
             "--out",
@@ -564,6 +568,10 @@ def build():
     assert validation_report["source_vertex_count"] > 0
     assert validation_report["reconstructed_vertex_count"] > 0
     assert validation_report["max_bounds_error"] <= validation_report["absolute_tolerance"]
+    assert validation_report["motion_probe_count"] == 1
+    assert validation_report["max_motion_translation_error"] <= validation_report[
+        "relative_tolerance"
+    ]
 
 
 @pytest.mark.skipif(

@@ -108,8 +108,11 @@ def assembly_parts(path):
         raise RuntimeError(f"assembly transform document is unreadable: {exc}") from exc
     version = document.get("schema_version")
     placement = document.get("placement")
-    if (version, placement) not in {(1, "host-solved"), (2, "urdf-link")}:
-        raise RuntimeError("URDF validation requires a supported link-frame document")
+    if version != 2 or placement != "urdf-link":
+        raise RuntimeError(
+            "URDF validation requires a schema-2 urdf-link document so motion "
+            "is checked about incoming connectors, not part modeling origins"
+        )
     values = document.get("parts")
     if not isinstance(values, list) or not values:
         raise RuntimeError("assembly transform document must contain parts")
@@ -128,30 +131,22 @@ def assembly_parts(path):
             or not all(isinstance(name, str) and name for name in names)
         ):
             raise RuntimeError(f"assembly part {part_id!r} has invalid object_names")
-        if version == 2:
-            part_world = matrix4(
-                value.get("part_world_matrix"),
-                f"assembly part {part_id!r} part_world_matrix",
+        part_world = matrix4(
+            value.get("part_world_matrix"),
+            f"assembly part {part_id!r} part_world_matrix",
+        )
+        part_from_link = matrix4(
+            value.get("part_from_link_matrix"),
+            f"assembly part {part_id!r} part_from_link_matrix",
+        )
+        link_world = matrix4(
+            value.get("link_world_matrix"),
+            f"assembly part {part_id!r} link_world_matrix",
+        )
+        if not matrices_close(part_world @ part_from_link, link_world, 1.0e-8):
+            raise RuntimeError(
+                f"assembly part {part_id!r} has inconsistent part and link frames"
             )
-            part_from_link = matrix4(
-                value.get("part_from_link_matrix"),
-                f"assembly part {part_id!r} part_from_link_matrix",
-            )
-            link_world = matrix4(
-                value.get("link_world_matrix"),
-                f"assembly part {part_id!r} link_world_matrix",
-            )
-            if not matrices_close(part_world @ part_from_link, link_world, 1.0e-8):
-                raise RuntimeError(
-                    f"assembly part {part_id!r} has inconsistent part and link frames"
-                )
-        else:
-            part_world = matrix4(
-                value.get("world_matrix"),
-                f"assembly part {part_id!r} world_matrix",
-            )
-            part_from_link = Matrix.Identity(4)
-            link_world = part_world
         for name in names:
             if name in object_owner:
                 raise RuntimeError(f"object {name!r} belongs to multiple assembly parts")
@@ -164,7 +159,7 @@ def assembly_parts(path):
         }
 
     probes = []
-    raw_probes = document.get("motion_probes", []) if version == 2 else []
+    raw_probes = document.get("motion_probes", [])
     if not isinstance(raw_probes, list):
         raise RuntimeError("URDF link-frame document has invalid motion_probes")
     seen_probe_ids = set()
@@ -214,7 +209,7 @@ def assembly_parts(path):
                 "expected": expected,
             }
         )
-    if version == 2 and not probes:
+    if not probes:
         raise RuntimeError("URDF link-frame document must contain nonzero motion probes")
     return parts, object_owner, probes
 

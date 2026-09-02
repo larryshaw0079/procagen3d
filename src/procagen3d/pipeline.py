@@ -3355,6 +3355,11 @@ def _validated_urdf_link_meshes(
         raise PipelineError(f"URDF part manifest is unreadable: {exc}") from exc
     if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
         raise PipelineError("URDF part manifest has an unsupported schema")
+    if manifest.get("frame_convention") != "incoming-connector":
+        raise PipelineError(
+            "URDF part meshes must be exported in incoming-connector frames so "
+            "revolute children rotate about their mate, not the modeling origin"
+        )
     if manifest.get("source_sha256") != sha256(model_path):
         raise PipelineError("URDF part manifest does not match artifacts/model.glb")
     records = manifest.get("parts")
@@ -3385,6 +3390,12 @@ def _validated_urdf_link_meshes(
             raise PipelineError(f"URDF part mesh is missing: {filename}")
         if record.get("sha256") != sha256(part_path):
             raise PipelineError(f"URDF part mesh hash mismatch: {filename}")
+        try:
+            from .urdf import URDFExportError, assert_link_local_mesh
+
+            assert_link_local_mesh(part_path)
+        except URDFExportError as exc:
+            raise PipelineError(str(exc)) from exc
         seen.add(part_id)
         link_meshes[part_id] = f"urdf_parts/{filename}"
     if seen != expected:

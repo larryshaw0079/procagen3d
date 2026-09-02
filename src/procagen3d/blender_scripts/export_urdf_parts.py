@@ -40,11 +40,13 @@ def sha256(path):
 def export_part(part, source_by_name, output_dir):
     part_id = part.get("id")
     names = part.get("object_names")
-    rows = part.get("link_world_matrix", part.get("world_matrix"))
+    rows = part.get("link_world_matrix")
     if not isinstance(part_id, str) or not SAFE_NAME.fullmatch(part_id):
         raise RuntimeError(f"part id {part_id!r} is not a safe URDF link name")
     if not isinstance(names, list) or not names:
         raise RuntimeError(f"part {part_id!r} has no object names")
+    if rows is None:
+        raise RuntimeError(f"part {part_id!r} is missing link_world_matrix")
     try:
         inverse_world = Matrix(rows).inverted_safe()
     except (TypeError, ValueError) as exc:
@@ -75,6 +77,15 @@ def export_part(part, source_by_name, output_dir):
             duplicate.name = name
             bpy.context.scene.collection.objects.link(duplicate)
             duplicates.append(duplicate)
+        bpy.context.view_layer.update()
+        # Bake the connector-centred pose into vertex data. URDF viewers treat
+        # the mesh vertex space as the link frame and often ignore extra glTF
+        # node transforms, so an unbaked axle pose makes a wheel orbit.
+        for duplicate in duplicates:
+            mesh = duplicate.data
+            mesh.transform(duplicate.matrix_world)
+            mesh.update()
+            duplicate.matrix_world = Matrix.Identity(4)
         bpy.context.view_layer.update()
 
         bpy.ops.object.select_all(action="DESELECT")
@@ -118,12 +129,12 @@ def main():
     if not args.glb.is_file() or not args.assembly_transforms.is_file():
         raise RuntimeError("URDF split inputs must be regular files")
     document = json.loads(args.assembly_transforms.read_text(encoding="utf-8"))
-    supported = (
-        (document.get("schema_version"), document.get("placement"))
-        in {(1, "host-solved"), (2, "urdf-link")}
-    )
-    if not supported:
-        raise RuntimeError("URDF split requires a supported link-frame document")
+    if document.get("schema_version") != 2 or document.get("placement") != "urdf-link":
+        raise RuntimeError(
+            "URDF split requires a schema-2 urdf-link document; part-centred "
+            "host-solved matrices would rotate a child about its modeling origin "
+            "instead of its incoming connector"
+        )
     parts = document.get("parts")
     if not isinstance(parts, list) or not parts:
         raise RuntimeError("URDF split assembly has no parts")
@@ -142,9 +153,7 @@ def main():
         args.output_dir / "manifest.json",
         {
             "schema_version": 1,
-            "frame_convention": (
-                "incoming-connector" if document.get("schema_version") == 2 else "part"
-            ),
+            "frame_convention": "incoming-connector",
             "source": args.glb.name,
             "source_sha256": sha256(args.glb),
             "parts": records,

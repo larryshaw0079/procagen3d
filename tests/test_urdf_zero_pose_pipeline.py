@@ -113,6 +113,7 @@ class _Runtime:
                 output / "manifest.json",
                 {
                     "schema_version": 1,
+                    "frame_convention": "incoming-connector",
                     "source_sha256": sha256(self.model),
                     "parts": records,
                 },
@@ -131,7 +132,7 @@ class _Runtime:
         write_json(
             output,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "status": "passed",
                 "model_sha256": sha256(self.model),
                 "urdf_sha256": sha256(urdf),
@@ -148,7 +149,13 @@ class _Runtime:
                 "relative_tolerance": 1.0e-5,
                 "absolute_tolerance": 2.0e-5,
                 "max_bounds_error": 1.0e-8,
+                "motion_probe_count": 1,
+                "movable_joint_count": 1,
+                "max_motion_matrix_error": 0.0,
+                "max_motion_translation_error": 0.0,
+                "max_motion_rotation_error_rad": 0.0,
                 "visual_rpy": [1.5707963267948966, 0.0, 0.0],
+                "motion_probes": [{"mate_id": "hinge"}],
                 "parts": [{"part_id": "base"}, {"part_id": "arm"}],
             },
         )

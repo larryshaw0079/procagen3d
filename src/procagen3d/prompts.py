@@ -185,8 +185,11 @@ def assembly_planning_prompt(
         "subject, add `articulation` with `enabled: true`, `mechanical: true`, and a safe "
         "robot name. Make the assembly mates themselves one connected link tree and omit "
         "`articulation.joints` so the host derives URDF origins, axes, rest offsets, and "
-        "limits from the same connector solution. Otherwise set both `enabled: false` "
-        "and `mechanical: false`, and explain the reason in limitations."
+        "limits from the same connector solution. Place every revolute or prismatic "
+        "child connector on the true motion axis — a wheel bore, hinge pin, or slide — "
+        "not at the part modeling origin; the child rotates about that connector, not "
+        "about (0,0,0). Otherwise set both `enabled: false` and `mechanical: false`, "
+        "and explain the reason in limitations."
         if export_urdf
         else "Include `articulation` only when the reference clearly depicts an explicit mechanical joint; otherwise omit it."
     )
@@ -333,6 +336,8 @@ Construction contract:
 - Author this part around its own local origin and connector frames. Do not bake the supplied world
   matrix into vertices or Blender object transforms: the trusted build host applies it after
   `build()`. Use the matrix only to understand the resulting world location and orientation.
+  If this part has an incoming revolute or prismatic mate, its child connector is the URDF
+  link origin: keep that frame on the mechanical axis so the part spins or slides in place.
 - Keep geometry semantically editable and deterministic. Use neutral, direct-constant Principled
   materials only; final PBR extraction and assignment happen later.
 - At module scope use only imports, call-free plain-name assignments, and helper function

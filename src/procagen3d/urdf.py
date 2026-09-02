@@ -8,6 +8,7 @@ mapping and receive the conservative combined-model-on-root fallback.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -167,6 +168,16 @@ class _ResolvedAssembly:
     link_frames: Mapping[str, URDFLinkFrame]
 
 
+_GLB_MAGIC = b"glTF"
+_IDENTITY_QUAT = (0.0, 0.0, 0.0, 1.0)
+_IDENTITY_MATRIX = (
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+)
+
+
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -177,6 +188,85 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _close_numbers(left: Sequence[float], right: Sequence[float], tolerance: float) -> bool:
+    if len(left) != len(right):
+        return False
+    return all(abs(a - b) <= tolerance for a, b in zip(left, right))
+
+
+def _glb_json(path: Path) -> Mapping[str, Any] | None:
+    """Return the JSON chunk of a GLB, or None when the file is not a GLB."""
+
+    data = path.read_bytes()
+    if len(data) < 20 or data[:4] != _GLB_MAGIC:
+        return None
+    json_length = int.from_bytes(data[12:16], "little")
+    chunk = data[20 : 20 + json_length]
+    if len(chunk) != json_length:
+        raise URDFExportError(f"{path.name} is a truncated GLB")
+    try:
+        document = json.loads(chunk)
+    except json.JSONDecodeError as exc:
+        raise URDFExportError(f"{path.name} has an unreadable GLB JSON chunk") from exc
+    if not isinstance(document, Mapping):
+        raise URDFExportError(f"{path.name} GLB JSON must be an object")
+    return document
+
+
+def _glb_residual_node_poses(
+    document: Mapping[str, Any], *, tolerance: float = 1.0e-6
+) -> tuple[str, ...]:
+    """Return glTF nodes that still carry a pose instead of baked vertices."""
+
+    nodes = document.get("nodes", [])
+    if not isinstance(nodes, list):
+        raise URDFExportError("GLB nodes must be an array")
+    residual: list[str] = []
+    for index, node in enumerate(nodes):
+        if not isinstance(node, Mapping):
+            raise URDFExportError(f"GLB node {index} must be an object")
+        name = str(node.get("name") or f"node[{index}]")
+        translation = node.get("translation")
+        rotation = node.get("rotation")
+        matrix = node.get("matrix")
+        if isinstance(translation, list) and not _close_numbers(
+            tuple(float(value) for value in translation),
+            (0.0, 0.0, 0.0),
+            tolerance,
+        ):
+            residual.append(name)
+            continue
+        if isinstance(rotation, list) and not _close_numbers(
+            tuple(float(value) for value in rotation),
+            _IDENTITY_QUAT,
+            tolerance,
+        ):
+            residual.append(name)
+            continue
+        if isinstance(matrix, list) and not _close_numbers(
+            tuple(float(value) for value in matrix),
+            _IDENTITY_MATRIX,
+            tolerance,
+        ):
+            residual.append(name)
+    return tuple(residual)
+
+
+def assert_link_local_mesh(path: Path) -> None:
+    """Reject a URDF GLB whose pose still lives on glTF nodes."""
+
+    document = _glb_json(path)
+    if document is None:
+        return
+    residual = _glb_residual_node_poses(document)
+    if residual:
+        raise URDFExportError(
+            f"{path.name} still has glTF node poses {list(residual)}; URDF "
+            "visuals must bake the incoming-connector frame into vertices so "
+            "a wheel spins about its axle"
+        )
 
 
 def _xml_attr(value: str) -> str:
@@ -673,8 +763,12 @@ def _assembly_joints(
             "child": child_part,
             "type": mate.get("type"),
             "origin": {"xyz": origin["xyz"], "rpy": origin["rpy"]},
-            # A non-root link frame is its incoming child connector, so the
-            # assembly motion axis and the URDF motion axis are both local +Z.
+            # The child link lives at its incoming connector.  Shared-world
+            # authoring often leaves every part_world at identity, so this
+            # relative pose is the only thing that keeps a wheel spinning
+            # about its axle instead of orbiting the modeling origin.
+            # Assembly motion is connector-local +Z, which is URDF +Z after
+            # the origin RPY is applied.
             "axis": [0.0, 0.0, 1.0],
         }
         if "limits" in mate:

@@ -535,7 +535,7 @@ process, verify custom-mesh transforms through translated parent empties, and
 verify topology/contact reports, depth/normal/object-ID evidence, deterministic
 normal-aware bidirectional surface distance and heatmaps, reversed-normal
 detection, that glb-ref export contains only newly created candidates, and that
-host-solved compiled parts split back into exact-name, part-local URDF GLBs.
+host-solved compiled parts split back into exact-name, incoming-connector URDF GLBs.
 
 ## Design lineage
 

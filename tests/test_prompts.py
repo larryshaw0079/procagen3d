@@ -153,6 +153,8 @@ def test_assembly_planning_prompt_states_semantic_plan_constraints(
     )
     flat_prompt = " ".join(prompt.split())
 
+    assert "omit `articulation.joints`" in flat_prompt
+    assert "child rotates about that connector" in flat_prompt
     assert "rigid mate must omit `rest` and `limits` entirely" in flat_prompt
     assert "revolute or prismatic mate requires a finite scalar `rest`" in flat_prompt
     assert "spherical mate" in flat_prompt and "three-number `rest`" in flat_prompt
@@ -245,3 +247,4 @@ def test_incremental_prompt_requires_call_free_literal_registries() -> None:
     assert "Do not use module-level classes, decorators, function or method calls" in prompt
     assert "attribute or subscript assignments, or control flow" in prompt
     assert "dynamic introspection such as\n  `getattr`" in prompt
+    assert "child connector is the URDF" in prompt
